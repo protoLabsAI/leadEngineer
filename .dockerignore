@@ -35,6 +35,12 @@ venv/
 # Tests — not needed at runtime; image stays lean
 tests/
 
+# Docs site — VitePress builds to gh-pages, not into the container
+docs/
+node_modules/
+package.json
+package-lock.json
+
 # Seccomp profile — Docker reads this on the host at runtime
 # (via docker-compose security_opt), NOT from inside the image
 seccomp-profile.json

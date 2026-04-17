@@ -14,3 +14,8 @@ build/
 # protoLabs Studio agent workspace (never commit)
 .automaker/
 .claude/
+
+# VitePress build artifacts + node modules
+node_modules/
+docs/.vitepress/dist/
+docs/.vitepress/cache/

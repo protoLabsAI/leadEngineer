@@ -1,0 +1,143 @@
+# Starter tools
+
+Five free, keyless tools ship in `tools/lg_tools.py`. They exist so a fresh template clone can demonstrate real behaviour immediately. Keep them, drop them, or swap them — `get_all_tools()` is the registry.
+
+## `echo`
+
+```python
+@tool
+async def echo(message: str) -> str
+```
+
+Returns `"echo: <message>"`. The template-only sanity tool. Safe to delete once your real tools are wired.
+
+## `current_time`
+
+```python
+@tool
+async def current_time(timezone: str = "UTC") -> str
+```
+
+Returns the current wall-clock time in the given IANA timezone (e.g. `"UTC"`, `"America/New_York"`, `"Asia/Tokyo"`). Defaults to UTC.
+
+Output:
+
+```
+2026-04-17T13:23:42.644606-04:00 (America/New_York)
+Human: Friday, April 17 2026, 13:23:42 EDT
+```
+
+Unknown timezones return `"Error: unknown timezone 'Not/A_Zone'. ..."` — never raises.
+
+## `calculator`
+
+```python
+@tool
+async def calculator(expression: str) -> str
+```
+
+Safely evaluates a numeric expression using AST parsing. **Does not call `eval()`**.
+
+Supported:
+
+| Op | Example |
+|---|---|
+| `+ - * /` | `1 + 2 * 3` |
+| `//` floor div | `10 // 3` |
+| `%` mod | `10 % 3` |
+| `**` power | `2 ** 10` |
+| Unary `-` | `-5 + 3` |
+| Parens | `(1 + 2) * 3` |
+
+Rejected (returns error string):
+
+- Names (`__import__`, any identifier)
+- Function calls (`abs(-5)`)
+- Attribute access (`(1).__class__`)
+- Anything that's not pure arithmetic
+
+Output on success: `"2 ** 10 = 1024"`. Division by zero returns `"Error: division by zero"`.
+
+## `web_search`
+
+```python
+@tool
+async def web_search(query: str, max_results: int = 5) -> str
+```
+
+DuckDuckGo text search via the `ddgs` package. No API key. `max_results` is clamped to 1–10.
+
+Output:
+
+```
+3 result(s) for 'LangGraph tutorial':
+1. LangGraph Introduction — https://langchain.com/langgraph
+   LangGraph is a framework for building...
+2. ...
+```
+
+Failures (network, rate-limit, import error) return `"Error: ..."` strings. The LLM reads the error and retries or degrades gracefully.
+
+## `fetch_url`
+
+```python
+@tool
+async def fetch_url(url: str, max_chars: int = 8000) -> str
+```
+
+Fetches a URL and returns cleaned plain-text content.
+
+Guarantees:
+
+- URL scheme must be `http://` or `https://`. `file://`, `javascript:`, `ftp://`, etc. are rejected.
+- Response body is capped at 2MB before parsing (blast-radius cap).
+- Text output is truncated at `max_chars` with `…[truncated]` marker.
+- HTML pages: scripts, styles, nav, footer, noscript are stripped. Prefers `<main>` / `<article>` over the full body.
+- Non-HTML content (JSON, plain text, CSV) is decoded and returned as-is.
+
+User-Agent is `protoAgent/0.1 (+https://github.com/protoLabsAI/protoAgent)`. Customize in the tool body if your fork hits rate-limited APIs that need something specific.
+
+Output:
+
+```
+[200] https://example.com
+
+Example Domain
+This domain is for use in documentation examples...
+```
+
+## Adding your own
+
+Follow the same pattern:
+
+```python
+from langchain_core.tools import tool
+
+@tool
+async def my_tool(required_arg: str, optional_arg: int = 5) -> str:
+    """First line becomes the LLM's summary of the tool.
+
+    Args:
+        required_arg: What this argument is. LLM reads these docstrings.
+        optional_arg: Optional with a sensible default.
+    """
+    try:
+        result = await do_the_thing(required_arg, optional_arg)
+    except Exception as e:
+        return f"Error: {e}"
+    return f"Success: {result}"
+```
+
+Then append it to the list in `get_all_tools()`:
+
+```python
+def get_all_tools(knowledge_store=None):
+    return [echo, current_time, calculator, web_search, fetch_url, my_tool]
+```
+
+See [Write your first tool](/tutorials/first-tool) for the full walkthrough.
+
+## Related
+
+- [Configure subagents](/guides/subagents) — tools are allowlisted per subagent
+- [Environment variables](/reference/environment-variables) — SSRF allowlist vars affect `fetch_url`
