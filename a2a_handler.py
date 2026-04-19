@@ -32,6 +32,7 @@ REST convenience aliases
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -933,10 +934,67 @@ def register_a2a_routes(
     so FastAPI does not raise on a duplicate route registration.
     """
 
+    # ── Bearer token authentication ───────────────────────────────────────────
+    _raw_a2a_token = os.environ.get("A2A_AUTH_TOKEN", "")
+    _a2a_token: str | None = _raw_a2a_token.strip() or None
+    if not _a2a_token:
+        logger.warning(
+            "[a2a] A2A auth token not configured — endpoint is open"
+        )
+
+    def _check_bearer_auth(request: Request) -> None:
+        """Validate Authorization: Bearer <token> against A2A_AUTH_TOKEN.
+
+        No-ops when A2A_AUTH_TOKEN is unset (open mode).
+        Raises HTTP 401 on missing or invalid token.
+        """
+        if not _a2a_token:
+            return
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            raise HTTPException(
+                status_code=401,
+                detail="Unauthorized: expected 'Authorization: Bearer <token>'",
+            )
+        provided = auth_header[len("Bearer "):]
+        if not hmac.compare_digest(provided, _a2a_token):
+            raise HTTPException(status_code=401, detail="Unauthorized: invalid bearer token")
+
+    # ── Origin verification for SSE/streaming endpoints ───────────────────────
+    _raw_allowed_origins = os.environ.get("A2A_ALLOWED_ORIGINS", "")
+    _allowed_origins_str = _raw_allowed_origins.strip()
+    if not _allowed_origins_str:
+        logger.warning(
+            "[a2a] A2A_ALLOWED_ORIGINS not set — SSE/streaming origin verification disabled"
+        )
+        _allowed_origins: list[str] | None = None
+    elif _allowed_origins_str == "*":
+        _allowed_origins = None  # wildcard: verification disabled
+    else:
+        _allowed_origins = [o.strip().lower() for o in _allowed_origins_str.split(",") if o.strip()]
+
+    def _check_origin(request: Request) -> None:
+        """Validate Origin header against A2A_ALLOWED_ORIGINS.
+
+        No-ops when A2A_ALLOWED_ORIGINS is unset or '*'.
+        Raises HTTP 403 when Origin is not in the allowlist.
+        """
+        if _allowed_origins is None:
+            return
+        origin = request.headers.get("Origin", "").lower()
+        if origin not in _allowed_origins:
+            raise HTTPException(status_code=403, detail="Forbidden: origin not allowed")
+
     # Update agent card capabilities
     agent_card.setdefault("capabilities", {})
     agent_card["capabilities"]["streaming"] = True
     agent_card["capabilities"]["pushNotifications"] = True
+    if _a2a_token:
+        agent_card.setdefault("securitySchemes", {})
+        agent_card["securitySchemes"]["bearer"] = {
+            "type": "http",
+            "scheme": "bearer",
+        }
 
     # ── Agent card ────────────────────────────────────────────────────────────
 
@@ -1114,6 +1172,10 @@ def register_a2a_routes(
     async def _a2a_rpc(request: Request, req: dict):
         if api_key and request.headers.get("x-api-key") != api_key:
             return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+        try:
+            _check_bearer_auth(request)
+        except HTTPException as exc:
+            return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
 
         rpc_id = req.get("id")
         method = req.get("method", "")
@@ -1151,6 +1213,12 @@ def register_a2a_routes(
             # the caller's.
             msg_metadata = params.get("metadata") or {}
             caller_trace = msg_metadata.get("a2a.trace") or {}
+
+            if method in ("message/stream", "message/sendStream"):
+                try:
+                    _check_origin(request)
+                except HTTPException as exc:
+                    return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
 
             if method == "message/send":
                 record = await _submit_task(text, context_id, push_config, caller_trace)
@@ -1206,6 +1274,10 @@ def register_a2a_routes(
                 return _rpc_error(-32602, "Invalid params: id is required")
             if await _store.get(task_id) is None:
                 return _rpc_error(-32001, f"Task not found: {task_id}")
+            try:
+                _check_origin(request)
+            except HTTPException as exc:
+                return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
             return StreamingResponse(
                 _resubscribe_jsonrpc_stream(task_id, rpc_id),
                 media_type="text/event-stream",
@@ -1301,6 +1373,7 @@ def register_a2a_routes(
     @app.post("/message:send", include_in_schema=False)
     async def _rest_send(request: Request, body: dict):
         _check_auth(request, api_key)
+        _check_bearer_auth(request)
         message = body.get("message", {})
         configuration = body.get("configuration", {})
         context_id = body.get("contextId", "")
@@ -1316,6 +1389,8 @@ def register_a2a_routes(
     @app.post("/message:stream", include_in_schema=False)
     async def _rest_stream(request: Request, body: dict):
         _check_auth(request, api_key)
+        _check_bearer_auth(request)
+        _check_origin(request)
         message = body.get("message", {})
         configuration = body.get("configuration", {})
         context_id = body.get("contextId", "")
@@ -1334,6 +1409,7 @@ def register_a2a_routes(
     @app.get("/tasks/{task_id}", include_in_schema=False)
     async def _get_task(task_id: str, request: Request):
         _check_auth(request, api_key)
+        _check_bearer_auth(request)
         record = await _store.get(task_id)
         if record is None:
             raise HTTPException(404, f"Task not found: {task_id}")
@@ -1344,6 +1420,8 @@ def register_a2a_routes(
     @app.get("/tasks/{task_id}:subscribe", include_in_schema=False)
     async def _subscribe_task(task_id: str, request: Request):
         _check_auth(request, api_key)
+        _check_bearer_auth(request)
+        _check_origin(request)
         record = await _store.get(task_id)
         if record is None:
             raise HTTPException(404, f"Task not found: {task_id}")
@@ -1403,6 +1481,7 @@ def register_a2a_routes(
     @app.post("/tasks/{task_id}:cancel", include_in_schema=False)
     async def _cancel_task(task_id: str, request: Request):
         _check_auth(request, api_key)
+        _check_bearer_auth(request)
         # Single atomic read+write under the store lock. The previous
         # get → sleep → cancel → update sequence could race with the
         # background runner and clobber a legitimate COMPLETED state.
@@ -1425,6 +1504,7 @@ def register_a2a_routes(
     @app.post("/tasks/{task_id}/pushNotificationConfigs", include_in_schema=False)
     async def _create_push_config(task_id: str, request: Request, body: dict):
         _check_auth(request, api_key)
+        _check_bearer_auth(request)
         record = await _store.get(task_id)
         if record is None:
             raise HTTPException(404, f"Task not found: {task_id}")
