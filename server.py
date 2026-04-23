@@ -72,6 +72,120 @@ def _init_langgraph_agent():
     log.info("LangGraph agent initialized (model: %s)", _graph_config.model_name)
 
 
+def _reload_langgraph_agent() -> tuple[bool, str]:
+    """Rebuild the compiled graph from the latest config YAML.
+
+    Called by the drawer's Save & Reload action and the
+    ``/api/config/reload`` endpoint. Preserves the existing
+    ``_checkpointer`` so active session threads stay addressable
+    — a fresh MemorySaver would orphan every in-flight thread.
+
+    Rebinding ``_graph`` is atomic in CPython; in-flight
+    ``astream_events`` iterators hold their own reference to the
+    prior graph and finish cleanly on the old instance.
+    """
+    global _graph, _graph_config
+
+    from graph.agent import create_agent_graph
+    from graph.config import LangGraphConfig
+
+    config_path = Path(__file__).parent / "config" / "langgraph-config.yaml"
+    try:
+        new_config = LangGraphConfig.from_yaml(config_path)
+        new_graph = create_agent_graph(new_config)
+    except Exception as e:
+        log.exception("[reload] rebuild failed: %s", e)
+        return False, f"reload failed: {e}"
+
+    _graph_config = new_config
+    _graph = new_graph
+    log.info("LangGraph agent reloaded (model: %s)", _graph_config.model_name)
+    return True, f"reloaded • model={_graph_config.model_name}"
+
+
+def _apply_settings_changes(
+    config: dict | None = None,
+    soul: str | None = None,
+) -> tuple[bool, list[str]]:
+    """Persist config YAML + SOUL.md then reload the graph once.
+
+    Passing ``None`` for either argument skips that write — a bare
+    call with both None acts as a pure reload (useful for picking up
+    external file edits).
+    """
+    from graph.config_io import (
+        apply_updates_to_yaml,
+        load_yaml_doc,
+        save_yaml_doc,
+        validate_config_dict,
+        write_soul,
+    )
+
+    messages: list[str] = []
+
+    if config is not None:
+        ok, err = validate_config_dict(config)
+        if not ok:
+            return False, [f"validation: {err}"]
+        try:
+            doc = load_yaml_doc()
+            apply_updates_to_yaml(doc, config)
+            save_yaml_doc(doc)
+            messages.append("config saved")
+        except Exception as e:
+            log.exception("[config] YAML write failed: %s", e)
+            return False, [f"config write: {e}"]
+
+    if soul is not None:
+        try:
+            paths = write_soul(soul)
+            messages.append(f"SOUL saved ({len(paths)} path{'s' if len(paths) != 1 else ''})")
+        except Exception as e:
+            log.exception("[config] SOUL write failed: %s", e)
+            return False, [f"soul write: {e}"]
+
+    ok, reload_msg = _reload_langgraph_agent()
+    messages.append(reload_msg)
+    return ok, messages
+
+
+def _build_settings_callbacks() -> dict[str, Any]:
+    """Callbacks consumed by the Gradio Configuration drawer."""
+    from graph.config_io import (
+        config_to_dict,
+        list_available_tools,
+        list_gateway_models,
+        read_soul,
+    )
+
+    def get_config() -> dict[str, Any]:
+        return config_to_dict(_graph_config)
+
+    def list_models(api_base: str = "", api_key: str = "") -> tuple[list[str], str]:
+        """UI-friendly model lookup.
+
+        Uses the form-local api_base/api_key when the user is trying a
+        different endpoint before saving; falls back to the currently
+        loaded graph config so the initial render works without
+        arguments.
+        """
+        base = api_base or (_graph_config.api_base if _graph_config else "")
+        key = api_key or (_graph_config.api_key if _graph_config else "")
+        return list_gateway_models(base, key)
+
+    def save_all(config: dict | None, soul: str | None) -> tuple[bool, str]:
+        ok, messages = _apply_settings_changes(config=config, soul=soul)
+        return ok, " • ".join(messages)
+
+    return {
+        "get_config": get_config,
+        "get_soul": read_soul,
+        "list_models": list_models,
+        "list_tools": list_available_tools,
+        "save_all": save_all,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Chat backend — called by the A2A handler + OpenAI-compat endpoint
 # ---------------------------------------------------------------------------
@@ -347,6 +461,7 @@ def _main():
         subtitle="protoAgent",
         placeholder="Send a message...",
         pwa=True,
+        settings=_build_settings_callbacks(),
     )
 
     import gradio as gr
@@ -368,6 +483,36 @@ def _main():
         result = await chat(req.message, req.session_id)
         parts = [m["content"] for m in result if m.get("role") == "assistant" and m.get("content")]
         return {"response": "\n\n".join(parts), "messages": result}
+
+    # --- Live config / SOUL editing ----------------------------------------
+    # GET returns the current config + persona so external clients (the
+    # Gradio drawer is one; curl is another) can mirror what's running.
+    # POST accepts partial edits — pass only the sections you want to
+    # change. Reload is automatic.
+    class ConfigReloadRequest(PydanticBaseModel):
+        config: dict | None = None
+        soul: str | None = None
+
+    @fastapi_app.get("/api/config")
+    async def _api_get_config():
+        from graph.config_io import config_to_dict, read_soul
+        return {
+            "config": config_to_dict(_graph_config),
+            "soul": read_soul(),
+        }
+
+    @fastapi_app.post("/api/config")
+    async def _api_post_config(req: ConfigReloadRequest):
+        ok, messages = _apply_settings_changes(config=req.config, soul=req.soul)
+        return {"ok": ok, "messages": messages}
+
+    @fastapi_app.get("/api/config/models")
+    async def _api_list_models(api_base: str = "", api_key: str = ""):
+        from graph.config_io import list_gateway_models
+        base = api_base or (_graph_config.api_base if _graph_config else "")
+        key = api_key or (_graph_config.api_key if _graph_config else "")
+        models, error = list_gateway_models(base, key)
+        return {"models": models, "error": error}
 
     # --- OpenAI-compatible chat completions --------------------------------
     # Lets this agent be registered as a model in the LiteLLM gateway /

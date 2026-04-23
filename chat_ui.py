@@ -214,60 +214,312 @@ def create_chat_app(
                 gr.HTML(footer_html)
 
             # --- Settings sidebar ---
+            # Each section below is gated on the presence of its callback,
+            # so forks can opt in per panel. The Configuration panel (the
+            # live-editable drawer) renders when "get_config" + "save_all"
+            # are provided by the server.
             if settings:
                 with gr.Sidebar(label="Settings", open=False, position="right"):
-                    with gr.Accordion("Tools", open=False):
-                        tools_display = gr.Markdown("Loading...")
-                        refresh_tools_btn = gr.Button("Refresh", size="sm")
 
-                    with gr.Accordion("Model", open=False):
-                        model_display = gr.Markdown("Loading...")
-                        provider_dropdown = gr.Dropdown(
-                            label="Provider", choices=[], interactive=True,
+                    # === Live configuration drawer ============================
+                    if "get_config" in settings and "save_all" in settings:
+                        gr.Markdown(
+                            "### Configuration\n"
+                            "Edits are written to `config/langgraph-config.yaml` "
+                            "and applied with a live graph rebuild — in-flight "
+                            "turns finish on the previous config.",
                         )
-                        switch_status = gr.Markdown("")
-                        refresh_model_btn = gr.Button("Refresh", size="sm")
+                        config_status = gr.Markdown("")
+
+                        with gr.Accordion("Model", open=True):
+                            api_base_in = gr.Textbox(
+                                label="API Base URL",
+                                placeholder="http://gateway:4000/v1",
+                                interactive=True,
+                            )
+                            api_key_in = gr.Textbox(
+                                label="API Key",
+                                type="password",
+                                placeholder="blank → use $OPENAI_API_KEY env",
+                                interactive=True,
+                            )
+                            with gr.Row():
+                                model_in = gr.Dropdown(
+                                    label="Model",
+                                    choices=[],
+                                    interactive=True,
+                                    allow_custom_value=True,
+                                    scale=4,
+                                )
+                                fetch_models_btn = gr.Button(
+                                    "Fetch", size="sm", scale=1, min_width=60,
+                                )
+                            model_fetch_status = gr.Markdown("")
+                            temperature_in = gr.Slider(
+                                label="Temperature",
+                                minimum=0.0, maximum=2.0, step=0.05,
+                                interactive=True,
+                            )
+                            max_tokens_in = gr.Number(
+                                label="Max Tokens", precision=0,
+                                minimum=1, interactive=True,
+                            )
+                            max_iter_in = gr.Slider(
+                                label="Max Iterations",
+                                minimum=1, maximum=200, step=1,
+                                interactive=True,
+                            )
+
+                        with gr.Accordion("Worker Subagent", open=False):
+                            worker_enabled_in = gr.Checkbox(
+                                label="Enabled", interactive=True,
+                            )
+                            worker_tools_in = gr.CheckboxGroup(
+                                label="Tools", choices=[], interactive=True,
+                            )
+                            worker_max_turns_in = gr.Number(
+                                label="Max Turns", precision=0,
+                                minimum=1, interactive=True,
+                            )
+
+                        with gr.Accordion("Middleware", open=False):
+                            mw_knowledge_in = gr.Checkbox(
+                                label="Knowledge", interactive=True,
+                            )
+                            mw_audit_in = gr.Checkbox(
+                                label="Audit", interactive=True,
+                            )
+                            mw_memory_in = gr.Checkbox(
+                                label="Memory", interactive=True,
+                            )
+
+                        with gr.Accordion("Knowledge Store", open=False):
+                            kb_db_in = gr.Textbox(
+                                label="DB Path", interactive=True,
+                            )
+                            kb_embed_in = gr.Textbox(
+                                label="Embed Model", interactive=True,
+                            )
+                            kb_top_k_in = gr.Number(
+                                label="Top K", precision=0,
+                                minimum=1, interactive=True,
+                            )
+
+                        with gr.Accordion("Persona (SOUL.md)", open=False):
+                            soul_in = gr.Textbox(
+                                label="SOUL.md", lines=16, show_label=False,
+                                interactive=True,
+                                placeholder="Agent persona — loaded into every system prompt.",
+                            )
+
+                        with gr.Row():
+                            save_btn = gr.Button(
+                                "Save & Reload", variant="primary", scale=2,
+                            )
+                            reload_btn = gr.Button(
+                                "Reload from Disk", variant="secondary", scale=1,
+                            )
+
+                        # Ordered tuple used for both load_all outputs and
+                        # save_all inputs — keeps the wiring obvious and the
+                        # two lists from drifting out of sync.
+                        _config_components = [
+                            api_base_in, api_key_in, model_in,
+                            temperature_in, max_tokens_in, max_iter_in,
+                            worker_enabled_in, worker_tools_in, worker_max_turns_in,
+                            mw_knowledge_in, mw_audit_in, mw_memory_in,
+                            kb_db_in, kb_embed_in, kb_top_k_in,
+                            soul_in,
+                        ]
+
+                        def _load_all():
+                            cfg = settings["get_config"]()
+                            soul = settings["get_soul"]() if "get_soul" in settings else ""
+                            tools = settings["list_tools"]() if "list_tools" in settings else []
+
+                            # Best-effort gateway probe. If it fails (offline,
+                            # wrong key) we surface the error but keep the form
+                            # populated with the saved model name — the user
+                            # can still edit everything else.
+                            models, err = ([], "")
+                            if "list_models" in settings:
+                                try:
+                                    models, err = settings["list_models"]("", "")
+                                except Exception as e:
+                                    err = str(e)
+                            current_name = cfg["model"]["name"]
+                            dropdown_choices = models if models else [current_name]
+                            if current_name and current_name not in dropdown_choices:
+                                dropdown_choices = [current_name, *dropdown_choices]
+
+                            fetch_msg = (
+                                f"✓ {len(models)} model(s) from gateway"
+                                if models and not err
+                                else f"⚠ {err}" if err else ""
+                            )
+
+                            worker = cfg["subagents"]["worker"]
+                            return (
+                                cfg["model"]["api_base"],
+                                cfg["model"]["api_key"],
+                                gr.update(choices=dropdown_choices, value=current_name),
+                                cfg["model"]["temperature"],
+                                cfg["model"]["max_tokens"],
+                                cfg["model"]["max_iterations"],
+                                worker["enabled"],
+                                gr.update(choices=tools, value=list(worker["tools"])),
+                                worker["max_turns"],
+                                cfg["middleware"]["knowledge"],
+                                cfg["middleware"]["audit"],
+                                cfg["middleware"]["memory"],
+                                cfg["knowledge"]["db_path"],
+                                cfg["knowledge"]["embed_model"],
+                                cfg["knowledge"]["top_k"],
+                                soul,
+                                fetch_msg,
+                            )
+
+                        def _fetch_models(api_base, api_key):
+                            if "list_models" not in settings:
+                                return gr.update(), "⚠ list_models not wired"
+                            try:
+                                models, err = settings["list_models"](api_base, api_key)
+                            except Exception as e:
+                                return gr.update(), f"⚠ {e}"
+                            if err:
+                                return gr.update(), f"⚠ {err}"
+                            return gr.update(choices=models), f"✓ {len(models)} model(s) from gateway"
+
+                        def _save(
+                            api_base, api_key, model_name,
+                            temperature, max_tokens, max_iter,
+                            worker_enabled, worker_tools, worker_max_turns,
+                            mw_knowledge, mw_audit, mw_memory,
+                            kb_db, kb_embed, kb_top_k,
+                            soul,
+                        ):
+                            new_config = {
+                                "model": {
+                                    "api_base": api_base or "",
+                                    "api_key": api_key or "",
+                                    "name": model_name or "",
+                                    "temperature": float(temperature),
+                                    "max_tokens": int(max_tokens or 0),
+                                    "max_iterations": int(max_iter or 0),
+                                },
+                                "subagents": {
+                                    "worker": {
+                                        "enabled": bool(worker_enabled),
+                                        "tools": list(worker_tools or []),
+                                        "max_turns": int(worker_max_turns or 0),
+                                    },
+                                },
+                                "middleware": {
+                                    "knowledge": bool(mw_knowledge),
+                                    "audit": bool(mw_audit),
+                                    "memory": bool(mw_memory),
+                                },
+                                "knowledge": {
+                                    "db_path": kb_db or "",
+                                    "embed_model": kb_embed or "",
+                                    "top_k": int(kb_top_k or 1),
+                                },
+                            }
+                            try:
+                                ok, msg = settings["save_all"](new_config, soul or "")
+                            except Exception as e:
+                                return f"⚠ save failed: {e}"
+                            return f"{'✓' if ok else '⚠'} {msg}"
+
+                        def _reload_only():
+                            try:
+                                ok, msg = settings["save_all"](None, None)
+                            except Exception as e:
+                                return f"⚠ reload failed: {e}"
+                            return f"{'✓' if ok else '⚠'} {msg}"
+
+                        app.load(
+                            fn=_load_all,
+                            outputs=[*_config_components, model_fetch_status],
+                        )
+                        fetch_models_btn.click(
+                            fn=_fetch_models,
+                            inputs=[api_base_in, api_key_in],
+                            outputs=[model_in, model_fetch_status],
+                        )
+                        save_btn.click(
+                            fn=_save,
+                            inputs=_config_components,
+                            outputs=[config_status],
+                        ).then(
+                            fn=_fetch_models,
+                            inputs=[api_base_in, api_key_in],
+                            outputs=[model_in, model_fetch_status],
+                        )
+                        reload_btn.click(
+                            fn=_reload_only, outputs=[config_status],
+                        ).then(
+                            fn=_load_all,
+                            outputs=[*_config_components, model_fetch_status],
+                        )
+
+                    # === Legacy read-only panels (opt-in via their own keys) ==
+                    if "get_tools_list" in settings:
+                        with gr.Accordion("Tools", open=False):
+                            tools_display = gr.Markdown("Loading...")
+                            refresh_tools_btn = gr.Button("Refresh", size="sm")
+
+                        def load_tools():
+                            return settings["get_tools_list"]()
+
+                        app.load(fn=load_tools, outputs=[tools_display])
+                        refresh_tools_btn.click(fn=load_tools, outputs=[tools_display])
+
+                    if "get_model_info" in settings:
+                        with gr.Accordion("Model Status", open=False):
+                            model_display = gr.Markdown("Loading...")
+                            refresh_model_btn = gr.Button("Refresh", size="sm")
+
+                            provider_dropdown = None
+                            switch_status = None
+                            if "get_provider_choices" in settings:
+                                provider_dropdown = gr.Dropdown(
+                                    label="Provider", choices=[], interactive=True,
+                                )
+                                switch_status = gr.Markdown("")
+
+                        def load_model():
+                            return settings["get_model_info"]()
+
+                        app.load(fn=load_model, outputs=[model_display])
+                        refresh_model_btn.click(fn=load_model, outputs=[model_display])
+
+                        if provider_dropdown is not None:
+                            def load_provider_choices():
+                                choices = settings["get_provider_choices"]()
+                                current = settings["get_current_provider"]()
+                                return gr.update(choices=choices, value=current)
+
+                            def switch_provider(choice):
+                                return settings["switch_provider"](choice)
+
+                            def load_subtitle():
+                                return settings["get_subtitle"]()
+
+                            app.load(fn=load_provider_choices, outputs=[provider_dropdown])
+                            provider_dropdown.change(
+                                fn=switch_provider,
+                                inputs=[provider_dropdown],
+                                outputs=[switch_status],
+                            ).then(fn=load_model, outputs=[model_display]).then(
+                                fn=load_subtitle, outputs=[header_md],
+                            )
 
                     if "get_knowledge_stats" in settings:
                         with gr.Accordion("Knowledge Base", open=False):
                             kb_display = gr.Markdown("Loading...")
                             refresh_kb_btn = gr.Button("Refresh", size="sm")
 
-                    # --- Callbacks ---
-
-                    def load_tools():
-                        return settings["get_tools_list"]()
-
-                    def load_model():
-                        return settings["get_model_info"]()
-
-                    def load_provider_choices():
-                        choices = settings["get_provider_choices"]()
-                        current = settings["get_current_provider"]()
-                        return gr.update(choices=choices, value=current)
-
-                    def switch_provider(choice):
-                        return settings["switch_provider"](choice)
-
-                    def load_subtitle():
-                        return settings["get_subtitle"]()
-
-                    app.load(fn=load_tools, outputs=[tools_display])
-                    app.load(fn=load_model, outputs=[model_display])
-                    app.load(fn=load_provider_choices, outputs=[provider_dropdown])
-
-                    refresh_tools_btn.click(fn=load_tools, outputs=[tools_display])
-                    refresh_model_btn.click(
-                        fn=load_model, outputs=[model_display]
-                    ).then(fn=load_provider_choices, outputs=[provider_dropdown])
-
-                    provider_dropdown.change(
-                        fn=switch_provider, inputs=[provider_dropdown], outputs=[switch_status],
-                    ).then(fn=load_model, outputs=[model_display]).then(
-                        fn=load_subtitle, outputs=[header_md],
-                    )
-
-                    if "get_knowledge_stats" in settings:
                         def load_kb_stats():
                             return settings["get_knowledge_stats"]()
 
