@@ -410,6 +410,25 @@ def test_read_soul_preset_unknown_returns_empty():
     assert read_soul_preset("") == ""
 
 
+@pytest.mark.parametrize("malicious", [
+    "../secret",
+    "../../etc/passwd",
+    "../../../etc/passwd",
+    "subdir/../../../outside",
+    "/etc/hosts",
+    "..",
+    "../../graph/config",  # try to read a real repo file via ../../
+])
+def test_read_soul_preset_rejects_path_traversal(malicious):
+    """CRITICAL: the preset name must not let a caller escape
+    ``config/soul-presets/``. Every ``..`` or absolute path
+    should return empty string, not read an arbitrary .md file
+    elsewhere on disk."""
+    from graph.config_io import read_soul_preset
+
+    assert read_soul_preset(malicious) == ""
+
+
 def test_list_soul_presets_missing_dir_returns_empty(monkeypatch, tmp_path):
     """If a fork accidentally deletes the presets dir, the wizard
     should render an empty dropdown, not crash."""

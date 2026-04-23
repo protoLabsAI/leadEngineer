@@ -108,24 +108,6 @@ def save_yaml_doc(doc: Any, path: Path = CONFIG_YAML_PATH) -> None:
 # Config dict <-> dataclass
 # ---------------------------------------------------------------------------
 
-# Nested dotted path → LangGraphConfig attribute.
-_FIELD_MAP: dict[str, str] = {
-    "model.provider": "model_provider",
-    "model.name": "model_name",
-    "model.api_base": "api_base",
-    "model.api_key": "api_key",
-    "model.temperature": "temperature",
-    "model.max_tokens": "max_tokens",
-    "model.max_iterations": "max_iterations",
-    "middleware.knowledge": "knowledge_middleware",
-    "middleware.audit": "audit_middleware",
-    "middleware.memory": "memory_middleware",
-    "knowledge.db_path": "knowledge_db_path",
-    "knowledge.embed_model": "embed_model",
-    "knowledge.top_k": "knowledge_top_k",
-}
-
-
 def config_to_dict(config: LangGraphConfig) -> dict[str, Any]:
     """Serialize a LangGraphConfig into the nested dict shape the UI
     works with. Mirrors the YAML schema so round-tripping is trivial.
@@ -205,7 +187,7 @@ def validate_config_dict(updates: dict[str, Any]) -> tuple[bool, str]:
         model = updates.get("model", {})
         temp = float(model.get("temperature", 0.2))
         if not 0.0 <= temp <= 2.0:
-            return False, f"temperature must be 0.0–2.0, got {temp}"
+            return False, f"temperature must be 0.0-2.0, got {temp}"
         max_tokens = int(model.get("max_tokens", 4096))
         if max_tokens < 1:
             return False, f"max_tokens must be >= 1, got {max_tokens}"
@@ -401,8 +383,14 @@ def read_soul_preset(name: str) -> str:
 
     Returns empty string for an unknown name rather than raising —
     the wizard treats that as "no preset selected, blank canvas".
+
+    Path-traversal guarded: the resolved target must live inside
+    ``PRESETS_DIR``. A name like ``"../secret"`` would otherwise
+    escape the presets directory and read arbitrary ``.md`` files
+    anywhere the process can reach.
     """
-    path = PRESETS_DIR / f"{name}.md"
-    if not path.exists():
+    presets_root = PRESETS_DIR.resolve()
+    candidate = (PRESETS_DIR / f"{name}.md").resolve()
+    if presets_root not in candidate.parents or not candidate.is_file():
         return ""
-    return path.read_text(encoding="utf-8")
+    return candidate.read_text(encoding="utf-8")

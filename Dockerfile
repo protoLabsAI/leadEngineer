@@ -26,7 +26,7 @@ RUN useradd -m -s /bin/bash -u ${SANDBOX_UID} sandbox
 # auth, add them here. The ddgs + beautifulsoup4 pair powers the
 # starter web_search / fetch_url tools; drop them if you strip those.
 RUN pip install --no-cache-dir \
-    gradio httpx uvicorn langfuse prometheus-client pyyaml ruamel.yaml \
+    gradio httpx uvicorn langfuse prometheus-client pyyaml 'ruamel.yaml>=0.18' \
     langchain langchain-openai langgraph websockets \
     ddgs beautifulsoup4
 
@@ -46,8 +46,19 @@ RUN chown -R sandbox:sandbox /opt/protoagent/config
 
 # Declare config as a volume so setup completion (``.setup-complete``
 # marker + any YAML / SOUL.md edits) survives ``docker run`` without
-# a -v flag. Operators who want cross-host persistence still mount a
-# named volume or host directory at /opt/protoagent/config.
+# a -v flag.
+#
+# Lifecycle note: without an explicit mount, Docker creates an
+# ANONYMOUS volume on every ``docker run``. Those accumulate and the
+# volume is NOT removed when the container is removed unless you pass
+# ``--rm -v``. For long-lived deployments, use a named volume or a
+# host mount so upgrades don't silently carry stale config forward:
+#
+#   docker run -v my-agent-config:/opt/protoagent/config my-agent:latest
+#
+# or a bind mount:
+#
+#   docker run -v /srv/my-agent/config:/opt/protoagent/config my-agent:latest
 VOLUME ["/opt/protoagent/config"]
 
 ENV PYTHONPATH=/opt/protoagent

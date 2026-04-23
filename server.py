@@ -55,6 +55,9 @@ log = logging.getLogger("protoagent.server")
 _graph = None          # LangGraph compiled graph
 _graph_config = None   # LangGraphConfig
 _checkpointer = None   # MemorySaver for session persistence
+_active_port = 7870    # populated by _main() — the port this process is actually bound to.
+                       # Read by the autostart installer so the LaunchAgent reboots
+                       # on the same port the operator launched with, not the default.
 
 
 def _init_langgraph_agent():
@@ -121,6 +124,19 @@ def _reload_langgraph_agent() -> tuple[bool, str]:
         return False, f"config load failed: {e}"
 
     _graph_config = new_config
+
+    # Keep A2A bearer-auth state aligned with YAML on every reload.
+    # ``a2a_handler.set_a2a_token`` mutates the module-level holder the
+    # bearer-check closure reads, so wizard/drawer updates take effect
+    # on the next incoming request without a route re-register.
+    try:
+        from a2a_handler import set_a2a_token
+
+        set_a2a_token(new_config.auth_token or None)
+    except ImportError:
+        # a2a_handler not yet imported (e.g. during early-boot reload
+        # before _main wires routes) — harmless.
+        pass
 
     if not is_setup_complete():
         _graph = None
@@ -282,7 +298,11 @@ def _build_settings_callbacks() -> dict[str, Any]:
                     or "protoagent"
                 )
                 if want_autostart:
-                    ok_as, msg_as = install_autostart(agent_name=as_name)
+                    # Pass the port this process is actually bound to so the
+                    # LaunchAgent reboots on the right port, not the 7870
+                    # default. Operators frequently pick a custom port when
+                    # another agent is already on 7870.
+                    ok_as, msg_as = install_autostart(agent_name=as_name, port=_active_port)
                 else:
                     ok_as, msg_as = uninstall_autostart(agent_name=as_name)
                 messages.append(f"autostart: {msg_as}")
@@ -325,7 +345,7 @@ def _build_settings_callbacks() -> dict[str, Any]:
 
             name = (_graph_config.identity_name if _graph_config else "") or "protoagent"
             if enabled:
-                return install_autostart(agent_name=name)
+                return install_autostart(agent_name=name, port=_active_port)
             return uninstall_autostart(agent_name=name)
         except Exception as e:
             return False, str(e)
@@ -639,10 +659,13 @@ def _build_agent_card(host: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def _main():
+    global _active_port
+
     parser = argparse.ArgumentParser(description=f"{AGENT_NAME_ENV} — protoAgent server")
     parser.add_argument("--port", type=int, default=7870)
     parser.add_argument("--config", type=str, default=None)
     args = parser.parse_args()
+    _active_port = args.port
 
     # Initialize observability
     import tracing
@@ -811,19 +834,24 @@ def _main():
     # JSON-RPC + REST, streaming, polling, cancel, push webhooks.
     from a2a_handler import register_a2a_routes
 
-    # A2A bearer token: YAML ``auth.token`` wins if set, else falls back
-    # to the legacy ``<AGENT>_API_KEY`` env var — so the wizard can set
-    # auth without an env restart.
+    # Two independent A2A auth surfaces:
+    #
+    # 1. **Bearer** (modern) — ``auth.token`` in YAML, captured by the
+    #    wizard as "A2A bearer token". Passed via the ``auth_token``
+    #    argument, with ``A2A_AUTH_TOKEN`` env as fallback. Updates
+    #    from a wizard/drawer-driven reload propagate live through
+    #    ``a2a_handler.set_a2a_token`` — no restart needed.
+    # 2. **X-API-Key** (legacy) — ``<AGENT>_API_KEY`` env var, threaded
+    #    through the ``api_key`` argument. Kept env-driven; forks that
+    #    want it YAML-configurable can add a field later.
+    yaml_bearer = _graph_config.auth_token if _graph_config else ""
     auth_env = f"{AGENT_NAME_ENV.upper()}_API_KEY"
-    auth_key = (
-        (_graph_config.auth_token if _graph_config else "")
-        or os.environ.get(auth_env, "")
-    )
     register_a2a_routes(
         app=fastapi_app,
         chat_stream_fn_factory=_chat_langgraph_stream,
         chat_fn=chat,
-        api_key=auth_key,
+        api_key=os.environ.get(auth_env, ""),
+        auth_token=yaml_bearer,
         agent_card={},
         register_card_route=False,  # card is already served above
     )

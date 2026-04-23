@@ -556,20 +556,25 @@ def create_chat_app(
                             kb_db, kb_embed, kb_top_k,
                             soul,
                         ):
+                            # Numeric fields fall back to sensible minimums
+                            # rather than 0 when the user clears them —
+                            # ``validate_config_dict`` rejects zero values so
+                            # a blank field would otherwise block the save
+                            # with a confusing validation error.
                             new_config = {
                                 "model": {
                                     "api_base": api_base or "",
                                     "api_key": api_key or "",
                                     "name": model_name or "",
                                     "temperature": float(temperature),
-                                    "max_tokens": int(max_tokens or 0),
-                                    "max_iterations": int(max_iter or 0),
+                                    "max_tokens": int(max_tokens or 4096),
+                                    "max_iterations": int(max_iter or 50),
                                 },
                                 "subagents": {
                                     "worker": {
                                         "enabled": bool(worker_enabled),
                                         "tools": list(worker_tools or []),
-                                        "max_turns": int(worker_max_turns or 0),
+                                        "max_turns": int(worker_max_turns or 20),
                                     },
                                 },
                                 "middleware": {
@@ -655,7 +660,12 @@ def create_chat_app(
                         if provider_dropdown is not None:
                             def load_provider_choices():
                                 choices = settings["get_provider_choices"]()
-                                current = settings["get_current_provider"]()
+                                # get_current_provider is optional — older
+                                # forks provided only the choices list.
+                                # Missing key must not raise KeyError; the
+                                # dropdown simply renders with no preselect.
+                                current_fn = settings.get("get_current_provider")
+                                current = current_fn() if current_fn else None
                                 return gr.update(choices=choices, value=current)
 
                             def switch_provider(choice):
@@ -784,28 +794,41 @@ def create_chat_app(
                 # a browser refresh. Without this, Gradio keeps serving
                 # the initial visibility state from when the Blocks
                 # were first rendered.
-                def _sync_visibility():
-                    if "is_setup_complete" not in settings:
-                        return gr.update(), gr.update(), gr.update()
-                    done = bool(settings["is_setup_complete"]())
-                    sidebar_upd = (
-                        gr.update(visible=done)
-                        if sidebar_block is not None
-                        else gr.update()
-                    )
-                    return (
-                        gr.update(visible=not done),  # wizard_pane
-                        gr.update(visible=done),      # chat_pane
-                        sidebar_upd,
-                    )
+                # Sync visibility on every page load. The output list is
+                # either two or three elements depending on whether the
+                # sidebar exists — we used to alias the sidebar slot to
+                # wizard_pane when missing, but that sent a duplicate
+                # gr.update to the same component, which Gradio treats
+                # as two competing writes to wizard_pane.visible.
+                if sidebar_block is not None:
+                    def _sync_visibility_with_sidebar():
+                        if "is_setup_complete" not in settings:
+                            return gr.update(), gr.update(), gr.update()
+                        done = bool(settings["is_setup_complete"]())
+                        return (
+                            gr.update(visible=not done),  # wizard_pane
+                            gr.update(visible=done),      # chat_pane
+                            gr.update(visible=done),      # sidebar_block
+                        )
 
-                app.load(
-                    fn=_sync_visibility,
-                    outputs=[
-                        wizard_pane, chat_pane,
-                        sidebar_block if sidebar_block is not None else wizard_pane,
-                    ],
-                )
+                    app.load(
+                        fn=_sync_visibility_with_sidebar,
+                        outputs=[wizard_pane, chat_pane, sidebar_block],
+                    )
+                else:
+                    def _sync_visibility_no_sidebar():
+                        if "is_setup_complete" not in settings:
+                            return gr.update(), gr.update()
+                        done = bool(settings["is_setup_complete"]())
+                        return (
+                            gr.update(visible=not done),  # wizard_pane
+                            gr.update(visible=done),      # chat_pane
+                        )
+
+                    app.load(
+                        fn=_sync_visibility_no_sidebar,
+                        outputs=[wizard_pane, chat_pane],
+                    )
 
                 # Connection test — fills the model dropdown
                 def _test_connection(api_base, api_key):
@@ -844,7 +867,14 @@ def create_chat_app(
                     fn=_load_preset, inputs=[w_preset], outputs=[w_soul],
                 )
 
-                # Launch button — write everything, mark complete, swap panes
+                # Launch button — write everything, mark complete, then
+                # hard-reload the page. Toggling ``visible=`` on nested
+                # gr.Column + gr.Sidebar via gr.update is unreliable
+                # (children don't always re-mount); a full reload is the
+                # only bulletproof way to guarantee the chat pane appears.
+                # The reload re-enters _build() which reads
+                # is_setup_complete()==True and renders chat + drawer
+                # visible from scratch.
                 def _finish_wizard(
                     api_base, api_key, model_name,
                     agent_name_val, soul, _preset_unused,
@@ -852,20 +882,11 @@ def create_chat_app(
                     operator, auth_token, autostart,
                 ):
                     if not (api_base or "").strip():
-                        return (
-                            "⚠ API base URL is required — go back to step 1",
-                            gr.update(), gr.update(), gr.update(),
-                        )
+                        return "⚠ API base URL is required — go back to step 1"
                     if not (model_name or "").strip():
-                        return (
-                            "⚠ pick a model — use the Test connection button in step 1",
-                            gr.update(), gr.update(), gr.update(),
-                        )
+                        return "⚠ pick a model — use the Test connection button in step 1"
                     if not (agent_name_val or "").strip():
-                        return (
-                            "⚠ agent name is required — step 2",
-                            gr.update(), gr.update(), gr.update(),
-                        )
+                        return "⚠ agent name is required — step 2"
 
                     new_config = {
                         "model": {
@@ -894,55 +915,58 @@ def create_chat_app(
                     try:
                         ok, msg = settings["finish_setup"](new_config, soul or "")
                     except Exception as e:
-                        return (
-                            f"⚠ setup failed: {e}",
-                            gr.update(), gr.update(), gr.update(),
-                        )
+                        return f"⚠ setup failed: {e}"
                     if ok:
-                        return (
-                            f"✓ {msg}",
-                            gr.update(visible=False),  # wizard_pane
-                            gr.update(visible=True),   # chat_pane
-                            gr.update(visible=True),   # sidebar_block
-                        )
-                    return (
-                        f"⚠ {msg}",
-                        gr.update(), gr.update(), gr.update(),
-                    )
+                        return f"✓ {msg} — reloading page…"
+                    return f"⚠ {msg}"
 
+                # 1. Run the save. 2. On the client, if the status message
+                # starts with "✓", reload after a short beat so the user
+                # sees the success line. Any warning (⚠) keeps the wizard
+                # visible so they can correct and retry.
                 w_launch_btn.click(
                     fn=_finish_wizard,
                     inputs=w_inputs,
-                    outputs=[w_launch_status, wizard_pane, chat_pane,
-                             sidebar_block if sidebar_block is not None else w_launch_status],
+                    outputs=[w_launch_status],
+                ).then(
+                    fn=None,
+                    inputs=[w_launch_status],
+                    outputs=None,
+                    js=(
+                        "(status) => {"
+                        "  if (typeof status === 'string' && status.startsWith('✓')) {"
+                        "    setTimeout(() => window.location.reload(), 1000);"
+                        "  }"
+                        "  return [];"
+                        "}"
+                    ),
                 )
 
-                # "Re-run setup" in the drawer flips panes back to wizard
+                # "Re-run setup" in the drawer — same reload-after-flip
+                # pattern for the reverse direction.
                 if "restart_setup" in settings:
                     def _trigger_rerun():
                         try:
                             msg = settings["restart_setup"]()
                         except Exception as e:
-                            return (
-                                f"⚠ {e}",
-                                gr.update(), gr.update(), gr.update(),
-                            )
-                        return (
-                            f"✓ {msg}",
-                            gr.update(visible=True),   # wizard_pane
-                            gr.update(visible=False),  # chat_pane
-                            gr.update(visible=False),  # sidebar_block
-                        )
+                            return f"⚠ {e}"
+                        return f"✓ {msg} — reloading page…"
 
                     reset_setup_btn.click(
                         fn=_trigger_rerun,
-                        outputs=[
-                            reset_setup_status, wizard_pane, chat_pane,
-                            sidebar_block if sidebar_block is not None else reset_setup_status,
-                        ],
+                        outputs=[reset_setup_status],
                     ).then(
-                        fn=_load_wizard_defaults,
-                        outputs=[*w_inputs, w_test_status, w_autostart_note],
+                        fn=None,
+                        inputs=[reset_setup_status],
+                        outputs=None,
+                        js=(
+                            "(status) => {"
+                            "  if (typeof status === 'string' && status.startsWith('✓')) {"
+                            "    setTimeout(() => window.location.reload(), 800);"
+                            "  }"
+                            "  return [];"
+                            "}"
+                        ),
                     )
 
         return app

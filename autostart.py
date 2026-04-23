@@ -31,6 +31,7 @@ import shlex
 import subprocess
 import sys
 from pathlib import Path
+from xml.sax.saxutils import escape as xml_escape
 
 REPO_ROOT = Path(__file__).parent.resolve()
 
@@ -203,29 +204,35 @@ def _render_launchagent_plist(
     stdout_log: str,
     stderr_log: str,
 ) -> str:
-    """Render the plist XML. Small enough to inline; escaping is
-    limited to the known-safe fields we control, so no XML-injection
-    surface to audit here.
+    """Render the plist XML.
+
+    Every interpolated string is XML-escaped because several fields
+    (``agent_name`` most notably) come from user input — a wizard
+    user who names their agent ``bad<name>`` or ``me & co`` would
+    otherwise produce a malformed or injection-vulnerable plist.
+    ``port`` is an int so it's safe as-is, but we coerce+escape it
+    anyway for consistency.
     """
+    e = xml_escape
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>{label}</string>
+    <string>{e(label)}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>{python}</string>
-        <string>{server_py}</string>
+        <string>{e(python)}</string>
+        <string>{e(server_py)}</string>
         <string>--port</string>
-        <string>{port}</string>
+        <string>{e(str(port))}</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>{working_dir}</string>
+    <string>{e(working_dir)}</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>AGENT_NAME</key>
-        <string>{agent_name}</string>
+        <string>{e(agent_name)}</string>
         <key>PATH</key>
         <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
     </dict>
@@ -237,9 +244,9 @@ def _render_launchagent_plist(
         <false/>
     </dict>
     <key>StandardOutPath</key>
-    <string>{stdout_log}</string>
+    <string>{e(stdout_log)}</string>
     <key>StandardErrorPath</key>
-    <string>{stderr_log}</string>
+    <string>{e(stderr_log)}</string>
 </dict>
 </plist>
 """
