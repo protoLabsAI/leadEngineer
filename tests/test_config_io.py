@@ -125,13 +125,21 @@ def test_config_to_dict_mirrors_yaml_shape() -> None:
     cfg = LangGraphConfig()
     d = config_to_dict(cfg)
 
-    # Top-level schema surface
-    assert set(d.keys()) == {"model", "subagents", "middleware", "knowledge"}
+    # Top-level schema surface — all the sections the YAML exposes.
+    # Adding a new section here without updating config_to_dict would
+    # strand fork-added fields outside the drawer's round-trip.
+    assert set(d.keys()) == {
+        "model", "subagents", "middleware", "knowledge",
+        "identity", "auth", "runtime",
+    }
     assert d["model"]["name"] == cfg.model_name
     assert d["model"]["temperature"] == cfg.temperature
     assert d["subagents"]["worker"]["tools"] == list(cfg.worker.tools)
     assert d["middleware"]["audit"] == cfg.audit_middleware
     assert d["knowledge"]["top_k"] == cfg.knowledge_top_k
+    assert d["identity"]["name"] == cfg.identity_name
+    assert d["auth"]["token"] == cfg.auth_token
+    assert d["runtime"]["autostart_on_boot"] == cfg.autostart_on_boot
 
 
 # ── validate_config_dict ─────────────────────────────────────────────────────
@@ -321,3 +329,93 @@ def test_list_available_tools_returns_starter_set():
     assert "calculator" in names
     assert "current_time" in names
     assert all(isinstance(n, str) for n in names)
+
+
+# ── Setup wizard marker ─────────────────────────────────────────────────────
+
+
+def test_setup_marker_lifecycle(monkeypatch, tmp_path):
+    """Marker presence = wizard skipped. Mark → present. Reset → gone.
+    Reset on a missing marker is a no-op, not an error."""
+    from graph import config_io
+
+    marker = tmp_path / ".setup-complete"
+    monkeypatch.setattr(config_io, "SETUP_MARKER_PATH", marker)
+
+    assert config_io.is_setup_complete() is False
+
+    config_io.mark_setup_complete()
+    assert config_io.is_setup_complete() is True
+    assert marker.exists()
+
+    config_io.mark_setup_complete()  # idempotent
+    assert config_io.is_setup_complete() is True
+
+    config_io.reset_setup()
+    assert config_io.is_setup_complete() is False
+
+    config_io.reset_setup()  # no-op on missing marker — doesn't raise
+
+
+def test_mark_setup_complete_creates_parent_dir(monkeypatch, tmp_path):
+    """If config/ doesn't exist yet, mark_setup_complete must create
+    it — otherwise a fresh clone with a pristine filesystem fails
+    on first wizard run."""
+    from graph import config_io
+
+    marker = tmp_path / "fresh" / "config" / ".setup-complete"
+    monkeypatch.setattr(config_io, "SETUP_MARKER_PATH", marker)
+
+    config_io.mark_setup_complete()
+    assert marker.exists()
+
+
+# ── SOUL.md presets ─────────────────────────────────────────────────────────
+
+
+def test_list_soul_presets_returns_shipped_starters():
+    """The template must ship four starter presets so the wizard's
+    dropdown is useful on day one. Add a file to config/soul-presets/
+    and it should appear here automatically — no registry."""
+    from graph.config_io import list_soul_presets
+
+    presets = list_soul_presets()
+    assert "generic-assistant" in presets
+    assert "research" in presets
+    assert "coding" in presets
+    assert "blank" in presets
+
+
+def test_list_soul_presets_sorted():
+    from graph.config_io import list_soul_presets
+
+    presets = list_soul_presets()
+    assert presets == sorted(presets)
+
+
+def test_read_soul_preset_returns_content():
+    from graph.config_io import read_soul_preset
+
+    content = read_soul_preset("research")
+    assert "research" in content.lower()
+    assert content.strip().startswith("#")  # markdown h1
+
+
+def test_read_soul_preset_unknown_returns_empty():
+    """Unknown preset names must return '' not raise — the wizard
+    treats empty as 'user didn't pick a preset, keep textarea as-is'."""
+    from graph.config_io import read_soul_preset
+
+    assert read_soul_preset("not-a-real-preset") == ""
+    assert read_soul_preset("") == ""
+
+
+def test_list_soul_presets_missing_dir_returns_empty(monkeypatch, tmp_path):
+    """If a fork accidentally deletes the presets dir, the wizard
+    should render an empty dropdown, not crash."""
+    from graph import config_io
+
+    fake = tmp_path / "does-not-exist"
+    monkeypatch.setattr(config_io, "PRESETS_DIR", fake)
+
+    assert config_io.list_soul_presets() == []

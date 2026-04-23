@@ -26,7 +26,7 @@ RUN useradd -m -s /bin/bash -u ${SANDBOX_UID} sandbox
 # auth, add them here. The ddgs + beautifulsoup4 pair powers the
 # starter web_search / fetch_url tools; drop them if you strip those.
 RUN pip install --no-cache-dir \
-    gradio httpx uvicorn langfuse prometheus-client pyyaml \
+    gradio httpx uvicorn langfuse prometheus-client pyyaml ruamel.yaml \
     langchain langchain-openai langgraph websockets \
     ddgs beautifulsoup4
 
@@ -39,6 +39,16 @@ RUN chmod +x /opt/protoagent/entrypoint.sh
 # Sandbox workspace + knowledge/audit dirs
 RUN mkdir -p /sandbox /tmp/sandbox /sandbox/audit /sandbox/knowledge \
     && chown -R sandbox:sandbox /sandbox /tmp/sandbox
+
+# Make /opt/protoagent/config writable by the sandbox user so the
+# drawer and setup wizard can persist edits from inside the container.
+RUN chown -R sandbox:sandbox /opt/protoagent/config
+
+# Declare config as a volume so setup completion (``.setup-complete``
+# marker + any YAML / SOUL.md edits) survives ``docker run`` without
+# a -v flag. Operators who want cross-host persistence still mount a
+# named volume or host directory at /opt/protoagent/config.
+VOLUME ["/opt/protoagent/config"]
 
 ENV PYTHONPATH=/opt/protoagent
 

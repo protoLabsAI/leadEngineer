@@ -40,6 +40,18 @@ CONFIG_YAML_PATH = REPO_ROOT / "config" / "langgraph-config.yaml"
 SOUL_SOURCE_PATH = REPO_ROOT / "config" / "SOUL.md"
 SOUL_RUNTIME_PATH = Path("/sandbox/SOUL.md")
 
+# Setup wizard state.
+# Presence of this (empty) marker file = wizard has been run and the
+# server should boot straight into the chat UI. Absence = show the
+# wizard on first page load. Lives in ``config/`` so a Docker volume
+# mount at /opt/<agent>/config persists setup across container runs.
+SETUP_MARKER_PATH = REPO_ROOT / "config" / ".setup-complete"
+
+# SOUL.md starter templates. The wizard offers these as presets the
+# user can pick then edit before saving. Adding a new file here
+# automatically makes it a choice — no registry to update.
+PRESETS_DIR = REPO_ROOT / "config" / "soul-presets"
+
 
 # ---------------------------------------------------------------------------
 # YAML round-trip
@@ -144,6 +156,16 @@ def config_to_dict(config: LangGraphConfig) -> dict[str, Any]:
             "db_path": config.knowledge_db_path,
             "embed_model": config.embed_model,
             "top_k": config.knowledge_top_k,
+        },
+        "identity": {
+            "name": config.identity_name,
+            "operator": config.identity_operator,
+        },
+        "auth": {
+            "token": config.auth_token,
+        },
+        "runtime": {
+            "autostart_on_boot": config.autostart_on_boot,
         },
     }
 
@@ -319,3 +341,68 @@ def list_available_tools(knowledge_store: Any = None) -> list[str]:
     from tools.lg_tools import get_all_tools
 
     return [t.name for t in get_all_tools(knowledge_store)]
+
+
+# ---------------------------------------------------------------------------
+# Setup wizard state
+# ---------------------------------------------------------------------------
+
+
+def is_setup_complete() -> bool:
+    """True once the wizard has been completed at least once.
+
+    Checked at server boot to decide wizard-first vs chat-first
+    rendering. Don't read the YAML to infer this — a fork that ships
+    with a baked-in config still needs to walk a user through the
+    wizard on first run.
+    """
+    return SETUP_MARKER_PATH.exists()
+
+
+def mark_setup_complete() -> None:
+    """Write the marker so subsequent boots skip the wizard.
+
+    Idempotent — safe to call repeatedly. The file is empty; only
+    its presence matters.
+    """
+    SETUP_MARKER_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SETUP_MARKER_PATH.touch()
+
+
+def reset_setup() -> None:
+    """Remove the marker, forcing the wizard to run on next page load.
+
+    Exposed to the drawer as a "Re-run setup" action. Leaves the YAML
+    + SOUL.md in place so the wizard pre-populates with the current
+    values — reset is for revisiting choices, not for wiping config.
+    """
+    SETUP_MARKER_PATH.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# SOUL.md presets
+# ---------------------------------------------------------------------------
+
+
+def list_soul_presets() -> list[str]:
+    """Return preset names (file stems, no extension) sorted alphabetically.
+
+    The wizard's preset dropdown reads from this — dropping a new
+    markdown file into ``config/soul-presets/`` makes it a choice
+    without code changes.
+    """
+    if not PRESETS_DIR.exists():
+        return []
+    return sorted(p.stem for p in PRESETS_DIR.glob("*.md"))
+
+
+def read_soul_preset(name: str) -> str:
+    """Return the preset's content.
+
+    Returns empty string for an unknown name rather than raising —
+    the wizard treats that as "no preset selected, blank canvas".
+    """
+    path = PRESETS_DIR / f"{name}.md"
+    if not path.exists():
+        return ""
+    return path.read_text(encoding="utf-8")

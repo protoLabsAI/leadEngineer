@@ -181,6 +181,21 @@ def create_chat_app(
     _css = CLEAN_CSS + AGENT_DARK_CSS + extra_css
     _head = AGENT_PWA_HEAD if pwa else ""
 
+    # Determine first-run state. Fresh clones land in the wizard;
+    # subsequent boots go straight to chat unless the user explicitly
+    # triggers "Re-run setup" from the drawer. Settings dicts without
+    # the ``is_setup_complete`` key (older template forks) skip the
+    # wizard entirely — chat is always visible.
+    setup_done = True
+    if settings and "is_setup_complete" in settings:
+        try:
+            setup_done = bool(settings["is_setup_complete"]())
+        except Exception:
+            setup_done = True  # fail-open: don't trap forks in a broken wizard
+    wizard_enabled = bool(
+        settings and "finish_setup" in settings and "get_config" in settings
+    )
+
     def _build() -> gr.Blocks:
         with gr.Blocks(
             title=title.replace("*", "").strip(),
@@ -197,29 +212,156 @@ def create_chat_app(
 
             header_md = gr.Markdown(header_text)
 
-            chatbot = gr.Chatbot(height=chat_height, show_label=False)
+            # === SETUP WIZARD PANE =====================================
+            # Visible on first run (no .setup-complete marker), hidden
+            # after the user clicks Launch. All fields default from the
+            # current config so re-running the wizard doesn't start
+            # from zero.
+            wizard_pane = None
+            w_launch_btn = None
+            w_launch_status = None
+            w_inputs: list = []
+            if wizard_enabled:
+                with gr.Column(visible=not setup_done) as wizard_pane:
+                    gr.Markdown(
+                        "# Welcome — let's set up your agent\n\n"
+                        "Walk through the steps below and hit **Launch agent**. "
+                        "You can revisit every one of these choices later from "
+                        "the Configuration drawer. Nothing is persisted until "
+                        "you click Launch."
+                    )
+                    w_launch_status = gr.Markdown("")
 
-            with gr.Row():
-                txt = gr.Textbox(
-                    placeholder=placeholder, show_label=False,
-                    scale=9, container=False,
-                )
-                send_btn = gr.Button("Send", variant="primary", scale=1, min_width=80)
+                    with gr.Accordion("1. Connect to your model", open=True):
+                        w_api_base = gr.Textbox(
+                            label="API base URL",
+                            placeholder="e.g. https://api.openai.com/v1 or http://localhost:4000/v1",
+                            interactive=True,
+                        )
+                        w_api_key = gr.Textbox(
+                            label="API key",
+                            type="password",
+                            placeholder="your OpenAI or gateway master key",
+                            interactive=True,
+                        )
+                        with gr.Row():
+                            w_test_btn = gr.Button(
+                                "Test connection & fetch models",
+                                variant="secondary", scale=3,
+                            )
+                        w_test_status = gr.Markdown("")
+                        w_model = gr.Dropdown(
+                            label="Model",
+                            choices=[], allow_custom_value=True,
+                            interactive=True,
+                        )
 
-            with gr.Row():
-                clear_btn = gr.Button("Clear", size="sm", variant="secondary")
-                new_btn = gr.Button("New Session", size="sm", variant="secondary")
+                    with gr.Accordion("2. Name your agent", open=False):
+                        w_agent_name = gr.Textbox(
+                            label="Agent name",
+                            placeholder="short lowercase slug, e.g. product-director",
+                            interactive=True,
+                        )
+                        gr.Markdown(
+                            "_This becomes the agent card name, OpenAI-compat "
+                            "model id, and chat header. Metric prefix still "
+                            "needs a process restart to pick up._"
+                        )
+                        with gr.Row():
+                            w_preset = gr.Dropdown(
+                                label="Persona preset (optional)",
+                                choices=[], interactive=True, scale=3,
+                            )
+                            w_load_preset_btn = gr.Button(
+                                "Load preset into SOUL.md",
+                                size="sm", scale=2,
+                            )
+                        w_soul = gr.Textbox(
+                            label="SOUL.md — the agent's persona",
+                            lines=14, interactive=True,
+                            placeholder=(
+                                "Identity, personality, values, communication "
+                                "style. Loaded into every system prompt."
+                            ),
+                        )
 
-            if footer_html:
-                gr.HTML(footer_html)
+                    with gr.Accordion("3. Tools & middleware", open=False):
+                        w_tools = gr.CheckboxGroup(
+                            label="Tools available to the agent",
+                            choices=[], interactive=True,
+                        )
+                        w_mw_audit = gr.Checkbox(
+                            label="Audit middleware — logs every tool call",
+                            value=True, interactive=True,
+                        )
+                        w_mw_memory = gr.Checkbox(
+                            label="Memory middleware — persists session summaries",
+                            value=True, interactive=True,
+                        )
+                        w_mw_knowledge = gr.Checkbox(
+                            label="Knowledge middleware — requires a knowledge store (leave off for starter setups)",
+                            value=False, interactive=True,
+                        )
+
+                    with gr.Accordion("4. Optional — you, security, autostart", open=False):
+                        w_operator = gr.Textbox(
+                            label="Your name",
+                            placeholder="so the agent can address you directly — blank = anonymous",
+                            interactive=True,
+                        )
+                        w_auth = gr.Textbox(
+                            label="A2A bearer token",
+                            type="password",
+                            placeholder="set before exposing to a network; blank = open mode for local dev",
+                            interactive=True,
+                        )
+                        w_autostart = gr.Checkbox(
+                            label="Launch this agent automatically on login",
+                            value=False, interactive=True,
+                        )
+                        w_autostart_note = gr.Markdown("")
+
+                    w_launch_btn = gr.Button(
+                        "Launch agent", variant="primary", size="lg",
+                    )
+
+                    w_inputs = [
+                        w_api_base, w_api_key, w_model,
+                        w_agent_name, w_soul, w_preset,
+                        w_tools, w_mw_audit, w_mw_memory, w_mw_knowledge,
+                        w_operator, w_auth, w_autostart,
+                    ]
+
+            # === CHAT PANE =============================================
+            # Wrapped in a Column so visibility toggles in lockstep with
+            # the wizard. On fresh setup it starts hidden and the Launch
+            # button flips it on.
+            with gr.Column(visible=setup_done) as chat_pane:
+                chatbot = gr.Chatbot(height=chat_height, show_label=False)
+
+                with gr.Row():
+                    txt = gr.Textbox(
+                        placeholder=placeholder, show_label=False,
+                        scale=9, container=False,
+                    )
+                    send_btn = gr.Button("Send", variant="primary", scale=1, min_width=80)
+
+                with gr.Row():
+                    clear_btn = gr.Button("Clear", size="sm", variant="secondary")
+                    new_btn = gr.Button("New Session", size="sm", variant="secondary")
+
+                if footer_html:
+                    gr.HTML(footer_html)
 
             # --- Settings sidebar ---
             # Each section below is gated on the presence of its callback,
             # so forks can opt in per panel. The Configuration panel (the
             # live-editable drawer) renders when "get_config" + "save_all"
-            # are provided by the server.
+            # are provided by the server. The drawer is hidden during the
+            # wizard so the user has one surface to look at at a time.
+            sidebar_block = None
             if settings:
-                with gr.Sidebar(label="Settings", open=False, position="right"):
+                with gr.Sidebar(label="Settings", open=False, position="right", visible=setup_done) as sidebar_block:
 
                     # === Live configuration drawer ============================
                     if "get_config" in settings and "save_all" in settings:
@@ -319,6 +461,22 @@ def create_chat_app(
                             reload_btn = gr.Button(
                                 "Reload from Disk", variant="secondary", scale=1,
                             )
+
+                        # "Re-run setup" re-opens the wizard with current
+                        # values pre-populated — for re-picking a preset,
+                        # swapping models, or resetting the autostart plist.
+                        if "restart_setup" in settings and wizard_enabled:
+                            with gr.Accordion("Re-run setup wizard", open=False):
+                                gr.Markdown(
+                                    "_Reopens the wizard with all current "
+                                    "values pre-filled. Your config isn't "
+                                    "wiped — you're just re-visiting the "
+                                    "choices._"
+                                )
+                                reset_setup_btn = gr.Button(
+                                    "Run wizard now", variant="secondary",
+                                )
+                                reset_setup_status = gr.Markdown("")
 
                         # Ordered tuple used for both load_all outputs and
                         # save_all inputs — keeps the wiring obvious and the
@@ -562,6 +720,201 @@ def create_chat_app(
 
             clear_btn.click(fn=lambda: ([], "default"), outputs=[chatbot, session_id])
             new_btn.click(fn=lambda: ([], secrets.token_hex(4)), outputs=[chatbot, session_id])
+
+            # --- Wizard callbacks -----------------------------------------
+            if wizard_enabled:
+                def _load_wizard_defaults():
+                    """Seed every wizard field from the current on-disk
+                    config. Returns updates in the exact order of
+                    ``w_inputs`` plus the connection-test status + the
+                    autostart note."""
+                    cfg = settings["get_config"]() if "get_config" in settings else {}
+                    soul = settings["get_soul"]() if "get_soul" in settings else ""
+                    tools = settings["list_tools"]() if "list_tools" in settings else []
+                    presets = settings["list_soul_presets"]() if "list_soul_presets" in settings else []
+
+                    model = cfg.get("model", {})
+                    identity = cfg.get("identity", {})
+                    worker = cfg.get("subagents", {}).get("worker", {})
+                    mw = cfg.get("middleware", {})
+                    runtime = cfg.get("runtime", {})
+                    auth = cfg.get("auth", {})
+
+                    current_model = model.get("name", "")
+                    model_choices = [current_model] if current_model else []
+
+                    autostart_msg = ""
+                    if "autostart_info" in settings:
+                        try:
+                            info = settings["autostart_info"]()
+                        except Exception as e:
+                            info = {"supported": False, "reason": str(e)}
+                        if info.get("supported"):
+                            state = "installed" if info.get("installed") else "not installed"
+                            autostart_msg = f"_Platform supported. Current state: **{state}**._"
+                        else:
+                            autostart_msg = f"⚠ {info.get('reason', 'not supported on this platform')}"
+
+                    return (
+                        model.get("api_base", ""),
+                        model.get("api_key", ""),
+                        gr.update(choices=model_choices, value=current_model),
+                        identity.get("name", ""),
+                        soul,
+                        gr.update(choices=presets, value=None),
+                        gr.update(choices=tools, value=list(worker.get("tools", []))),
+                        bool(mw.get("audit", True)),
+                        bool(mw.get("memory", True)),
+                        bool(mw.get("knowledge", False)),
+                        identity.get("operator", ""),
+                        auth.get("token", ""),
+                        bool(runtime.get("autostart_on_boot", False)),
+                        "",  # w_test_status
+                        autostart_msg,
+                    )
+
+                app.load(
+                    fn=_load_wizard_defaults,
+                    outputs=[*w_inputs, w_test_status, w_autostart_note],
+                )
+
+                # Connection test — fills the model dropdown
+                def _test_connection(api_base, api_key):
+                    if "list_models" not in settings:
+                        return gr.update(), "⚠ list_models callback not wired"
+                    if not api_base:
+                        return gr.update(), "⚠ enter an API base URL first"
+                    try:
+                        models, err = settings["list_models"](api_base, api_key)
+                    except Exception as e:
+                        return gr.update(), f"⚠ {e}"
+                    if err:
+                        return gr.update(), f"⚠ {err}"
+                    pick = models[0] if models else None
+                    return (
+                        gr.update(choices=models, value=pick),
+                        f"✓ {len(models)} model(s) — picked **{pick}**, change if needed",
+                    )
+
+                w_test_btn.click(
+                    fn=_test_connection,
+                    inputs=[w_api_base, w_api_key],
+                    outputs=[w_model, w_test_status],
+                )
+
+                # Preset loader — pastes template text into SOUL textarea
+                def _load_preset(name):
+                    if not name or "read_soul_preset" not in settings:
+                        return gr.update()
+                    try:
+                        return settings["read_soul_preset"](name)
+                    except Exception:
+                        return gr.update()
+
+                w_load_preset_btn.click(
+                    fn=_load_preset, inputs=[w_preset], outputs=[w_soul],
+                )
+
+                # Launch button — write everything, mark complete, swap panes
+                def _finish_wizard(
+                    api_base, api_key, model_name,
+                    agent_name_val, soul, _preset_unused,
+                    tools, mw_audit, mw_memory, mw_knowledge,
+                    operator, auth_token, autostart,
+                ):
+                    if not (api_base or "").strip():
+                        return (
+                            "⚠ API base URL is required — go back to step 1",
+                            gr.update(), gr.update(), gr.update(),
+                        )
+                    if not (model_name or "").strip():
+                        return (
+                            "⚠ pick a model — use the Test connection button in step 1",
+                            gr.update(), gr.update(), gr.update(),
+                        )
+                    if not (agent_name_val or "").strip():
+                        return (
+                            "⚠ agent name is required — step 2",
+                            gr.update(), gr.update(), gr.update(),
+                        )
+
+                    new_config = {
+                        "model": {
+                            "api_base": api_base,
+                            "api_key": api_key or "",
+                            "name": model_name,
+                        },
+                        "subagents": {
+                            "worker": {
+                                "enabled": True,
+                                "tools": list(tools or []),
+                            },
+                        },
+                        "middleware": {
+                            "audit": bool(mw_audit),
+                            "memory": bool(mw_memory),
+                            "knowledge": bool(mw_knowledge),
+                        },
+                        "identity": {
+                            "name": agent_name_val.strip(),
+                            "operator": (operator or "").strip(),
+                        },
+                        "auth": {"token": auth_token or ""},
+                        "runtime": {"autostart_on_boot": bool(autostart)},
+                    }
+                    try:
+                        ok, msg = settings["finish_setup"](new_config, soul or "")
+                    except Exception as e:
+                        return (
+                            f"⚠ setup failed: {e}",
+                            gr.update(), gr.update(), gr.update(),
+                        )
+                    if ok:
+                        return (
+                            f"✓ {msg}",
+                            gr.update(visible=False),  # wizard_pane
+                            gr.update(visible=True),   # chat_pane
+                            gr.update(visible=True),   # sidebar_block
+                        )
+                    return (
+                        f"⚠ {msg}",
+                        gr.update(), gr.update(), gr.update(),
+                    )
+
+                w_launch_btn.click(
+                    fn=_finish_wizard,
+                    inputs=w_inputs,
+                    outputs=[w_launch_status, wizard_pane, chat_pane,
+                             sidebar_block if sidebar_block is not None else w_launch_status],
+                )
+
+                # "Re-run setup" in the drawer flips panes back to wizard
+                if "restart_setup" in settings:
+                    def _trigger_rerun():
+                        try:
+                            msg = settings["restart_setup"]()
+                        except Exception as e:
+                            return (
+                                f"⚠ {e}",
+                                gr.update(), gr.update(), gr.update(),
+                            )
+                        return (
+                            f"✓ {msg}",
+                            gr.update(visible=True),   # wizard_pane
+                            gr.update(visible=False),  # chat_pane
+                            gr.update(visible=False),  # sidebar_block
+                        )
+
+                    reset_setup_btn.click(
+                        fn=_trigger_rerun,
+                        outputs=[
+                            reset_setup_status, wizard_pane, chat_pane,
+                            sidebar_block if sidebar_block is not None else reset_setup_status,
+                        ],
+                    ).then(
+                        fn=_load_wizard_defaults,
+                        outputs=[*w_inputs, w_test_status, w_autostart_note],
+                    )
 
         return app
 
