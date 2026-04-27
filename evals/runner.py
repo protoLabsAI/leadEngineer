@@ -91,7 +91,14 @@ async def _run_agent_card(client: AgentClient, case: dict) -> CaseResult:
 
 
 async def _run_auth_check(client: AgentClient, case: dict) -> CaseResult:
-    """Verify the A2A endpoint rejects a bad bearer with the expected status."""
+    """Verify the A2A endpoint rejects a request with the expected status.
+
+    Default behaviour exercises bearer auth alone using ``case["bad_token"]``.
+    Cases can override headers via ``case["headers"]`` to test other
+    auth surfaces — e.g. ``{"X-API-Key": "wrong"}`` for the legacy
+    X-API-Key path. ``Content-Type: application/json`` is always set
+    for the eval client; case headers override anything else.
+    """
     import httpx
 
     expected_status = case.get("expect", {}).get("status", 401)
@@ -99,8 +106,8 @@ async def _run_auth_check(client: AgentClient, case: dict) -> CaseResult:
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {bad}",
-        # No X-API-Key — testing bearer alone.
     }
+    headers.update(case.get("headers") or {})
     payload = {
         "jsonrpc": "2.0",
         "id": "auth-check",
@@ -141,25 +148,61 @@ async def _run_stream(client: AgentClient, case: dict) -> CaseResult:
     return await _run_prompt_case(client, case, streaming=True)
 
 
+_AUDIT_POLL_DEADLINE_S = 2.0
+_AUDIT_POLL_INTERVAL_S = 0.05
+
+
+async def _await_audit_assertion(
+    since: str,
+    expected_tools: list[str],
+    *,
+    require_success: bool,
+) -> tuple[list[dict], bool, str]:
+    """Poll the audit log until ``expected_tools`` have all fired (or the
+    deadline is hit). Returns ``(entries, passed, detail)``.
+
+    Replaces a fixed ``asyncio.sleep`` — under audit-log contention the
+    fixed wait was sometimes shorter than the flush, causing flaky
+    tool-firing assertions. Polling exits as soon as the assertion
+    passes; the deadline only kicks in when the tool genuinely never
+    fired.
+    """
+    deadline = asyncio.get_event_loop().time() + _AUDIT_POLL_DEADLINE_S
+    entries: list[dict] = []
+    passed = False
+    detail = ""
+    while True:
+        entries = verify.audit_entries_since(since)
+        passed, detail = verify.assert_tools_fired(
+            entries, expected_tools, require_success=require_success,
+        )
+        if passed or asyncio.get_event_loop().time() >= deadline:
+            return entries, passed, detail
+        await asyncio.sleep(_AUDIT_POLL_INTERVAL_S)
+
+
 async def _run_prompt_case(
     client: AgentClient,
     case: dict,
     *,
     streaming: bool,
 ) -> CaseResult:
-    # Pre-seed state via direct DB writes (model never sees this).
-    if "setup" in case:
-        err = verify.apply_setup(case["setup"])
-        if err:
-            return CaseResult(
-                case["id"], case["category"], case["name"], False,
-                f"setup failed: {err}",
-            )
-
     events: list[dict] = []
     result: TaskResult | None = None
 
     try:
+        # Pre-seed state via direct DB writes (model never sees this).
+        # Inside the ``try`` so a partial setup failure still triggers
+        # the ``finally`` teardown — otherwise rows from the steps that
+        # *did* succeed would leak into the next case.
+        if "setup" in case:
+            err = verify.apply_setup(case["setup"])
+            if err:
+                return CaseResult(
+                    case["id"], case["category"], case["name"], False,
+                    f"setup failed: {err}",
+                )
+
         since = verify.audit_now()
 
         if streaming:
@@ -190,11 +233,9 @@ async def _run_prompt_case(
         # cases). Missing key skips the audit check entirely.
         expected_tools = case.get("expected_tools")
         if expected_tools is not None:
-            await asyncio.sleep(0.3)  # let the audit log catch up
-            entries = verify.audit_entries_since(since)
             require_success = case.get("tool_outcome", "success") == "success"
-            passed, detail = verify.assert_tools_fired(
-                entries, expected_tools, require_success=require_success,
+            entries, passed, detail = await _await_audit_assertion(
+                since, expected_tools, require_success=require_success,
             )
             if not passed:
                 problems.append(detail)

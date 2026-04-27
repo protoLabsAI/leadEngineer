@@ -17,7 +17,8 @@ The store is path-aware and degradation-aware:
 - If the configured path is unwritable (running locally outside the
   container, no /sandbox), falls back to ``~/.protoagent/knowledge/agent.db``
   so a fresh ``python server.py`` works without sudo.
-- All write operations swallow ``sqlite3.OperationalError`` and log;
+- All write operations swallow ``sqlite3.DatabaseError`` (covers
+  OperationalError, IntegrityError, and corruption variants) and log;
   the store never crashes the agent loop on a corrupt or read-only DB.
 
 Forks that want embeddings on top of FTS5 can subclass and override
@@ -90,6 +91,36 @@ def _resolve_path(db_path: str | Path | None) -> Path:
 
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
+
+
+# LIKE escaping — sqlite treats ``%`` and ``_`` as wildcards in LIKE
+# patterns. Without escaping, a search for ``"100%"`` matches every row
+# starting with ``"100"`` instead of literal "100%". We escape them
+# alongside the escape char itself, then bind ``ESCAPE '\'`` on every
+# LIKE clause that takes user input.
+_LIKE_ESCAPE = "\\"
+
+
+def _escape_like(text: str) -> str:
+    """Escape ``%``, ``_``, and the escape char for safe LIKE matching."""
+    return (
+        text
+        .replace(_LIKE_ESCAPE, _LIKE_ESCAPE + _LIKE_ESCAPE)
+        .replace("%", _LIKE_ESCAPE + "%")
+        .replace("_", _LIKE_ESCAPE + "_")
+    )
+
+
+def _fts_quote(token: str) -> str:
+    """Quote a token for FTS5 MATCH so it's treated as a literal phrase.
+
+    FTS5 has its own query syntax (column filters, prefix wildcards,
+    NEAR, AND/OR/NOT operators). Wrapping each token in double quotes
+    forces FTS5 to interpret it as a phrase token, neutralising any
+    operator characters the user happened to type. Internal double
+    quotes are doubled per FTS5 phrase rules.
+    """
+    return '"' + token.replace('"', '""') + '"'
 
 
 def _has_fts5(db: sqlite3.Connection) -> bool:
@@ -187,7 +218,7 @@ class KnowledgeStore:
                     db.execute(
                         "INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')"
                     )
-                except sqlite3.OperationalError as exc:
+                except sqlite3.DatabaseError as exc:
                     log.debug("[knowledge] FTS rebuild skipped: %s", exc)
             else:
                 log.info(
@@ -195,7 +226,7 @@ class KnowledgeStore:
                 )
             db.commit()
             db.close()
-        except sqlite3.OperationalError as exc:
+        except sqlite3.DatabaseError as exc:
             log.error("[knowledge] schema init failed at %s: %s", self.path, exc)
 
     # Convenience for middleware that wants the raw connection. Kept
@@ -235,7 +266,7 @@ class KnowledgeStore:
             )
             db.commit()
             return int(cur.lastrowid)
-        except sqlite3.OperationalError as exc:
+        except sqlite3.DatabaseError as exc:
             log.error("[knowledge] add_chunk failed: %s", exc)
             return None
         finally:
@@ -285,7 +316,7 @@ class KnowledgeStore:
         try:
             rows = self._search_fts(db, query, k, domain) if self._fts_available \
                 else self._search_like(db, query, k, domain)
-        except sqlite3.OperationalError as exc:
+        except sqlite3.DatabaseError as exc:
             log.warning("[knowledge] search failed: %s", exc)
             rows = []
         finally:
@@ -310,10 +341,14 @@ class KnowledgeStore:
     ) -> list[sqlite3.Row]:
         # Sanitize to FTS5-safe tokens; OR them so a multi-word query
         # matches any of the keywords (closer to LIKE behaviour).
+        # Each token is double-quoted so FTS5 treats it as a literal
+        # phrase rather than parsing operators (column filters, prefix
+        # wildcards, NEAR, etc.) — even though ``[\w']+`` already
+        # filters most special chars, defence in depth is cheap.
         tokens = [t for t in re.findall(r"[\w']+", query) if t]
         if not tokens:
             return []
-        match = " OR ".join(tokens)
+        match = " OR ".join(_fts_quote(t) for t in tokens)
         if domain:
             return db.execute(
                 "SELECT c.* FROM chunks_fts f "
@@ -341,14 +376,18 @@ class KnowledgeStore:
         if not tokens:
             return []
         # Score = number of tokens matched (rough recall-style ranking).
+        # User-supplied tokens are LIKE-escaped so a query containing
+        # ``%`` or ``_`` doesn't silently match every row; ESCAPE is
+        # bound on each clause.
         like_clauses = " + ".join(
-            "CASE WHEN content LIKE ? OR heading LIKE ? THEN 1 ELSE 0 END"
+            "CASE WHEN content LIKE ? ESCAPE ? OR heading LIKE ? ESCAPE ? "
+            "THEN 1 ELSE 0 END"
             for _ in tokens
         )
         params: list[Any] = []
         for t in tokens:
-            needle = f"%{t}%"
-            params.extend([needle, needle])
+            needle = f"%{_escape_like(t)}%"
+            params.extend([needle, _LIKE_ESCAPE, needle, _LIKE_ESCAPE])
         sql = (
             f"SELECT *, ({like_clauses}) AS score FROM chunks "
             "WHERE score > 0"
@@ -380,7 +419,7 @@ class KnowledgeStore:
                     "SELECT * FROM chunks ORDER BY id DESC LIMIT ?",
                     (limit,),
                 ).fetchall()
-        except sqlite3.OperationalError as exc:
+        except sqlite3.DatabaseError as exc:
             log.warning("[knowledge] list_chunks failed: %s", exc)
             rows = []
         finally:
@@ -397,7 +436,7 @@ class KnowledgeStore:
                 "SELECT domain, COUNT(*) AS n FROM chunks GROUP BY domain ORDER BY n DESC"
             ).fetchall()
             total = db.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
-        except sqlite3.OperationalError as exc:
+        except sqlite3.DatabaseError as exc:
             log.warning("[knowledge] stats failed: %s", exc)
             return {"total": 0}
         finally:
@@ -426,17 +465,18 @@ class KnowledgeStore:
         if db is None:
             return None
         try:
+            needle = f"%{_escape_like(text)}%"
             sql = (
                 "SELECT * FROM chunks "
-                "WHERE (content LIKE ? OR heading LIKE ?)"
+                "WHERE (content LIKE ? ESCAPE ? OR heading LIKE ? ESCAPE ?)"
             )
-            params: list[Any] = [f"%{text}%", f"%{text}%"]
+            params: list[Any] = [needle, _LIKE_ESCAPE, needle, _LIKE_ESCAPE]
             if domain:
                 sql += " AND domain = ?"
                 params.append(domain)
             sql += " ORDER BY id DESC LIMIT 1"
             row = db.execute(sql, params).fetchone()
-        except sqlite3.OperationalError as exc:
+        except sqlite3.DatabaseError as exc:
             log.warning("[knowledge] find_chunk_containing failed: %s", exc)
             row = None
         finally:
@@ -455,10 +495,13 @@ class KnowledgeStore:
         if db is None:
             return 0
         try:
-            cur = db.execute("DELETE FROM chunks WHERE content LIKE ?", (f"%{contains}%",))
+            cur = db.execute(
+                "DELETE FROM chunks WHERE content LIKE ? ESCAPE ?",
+                (f"%{_escape_like(contains)}%", _LIKE_ESCAPE),
+            )
             db.commit()
             return int(cur.rowcount)
-        except sqlite3.OperationalError as exc:
+        except sqlite3.DatabaseError as exc:
             log.warning("[knowledge] delete_by_content failed: %s", exc)
             return 0
         finally:
@@ -476,7 +519,7 @@ class KnowledgeStore:
             )
             db.commit()
             return int(cur.rowcount)
-        except sqlite3.OperationalError as exc:
+        except sqlite3.DatabaseError as exc:
             log.warning("[knowledge] delete_by_heading failed: %s", exc)
             return 0
         finally:
