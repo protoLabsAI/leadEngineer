@@ -334,6 +334,7 @@ def test_list_available_tools_returns_starter_set():
     # the user couldn't enable them on a fresh boot.
     assert "memory_ingest" in names
     assert "schedule_task" in names
+    assert "list_schedules" in names
     assert "cancel_schedule" in names
     assert all(isinstance(n, str) for n in names)
     # No duplicates — list_available_tools dedupes between the

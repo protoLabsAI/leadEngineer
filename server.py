@@ -30,9 +30,12 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from graph.output_format import extract_output
+
+if TYPE_CHECKING:
+    from scheduler.interface import SchedulerBackend
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -138,7 +141,43 @@ def _build_knowledge_store(config):
         return None
 
 
-def _build_scheduler(config):
+def _start_scheduler_async(backend: "SchedulerBackend") -> None:
+    """Fire-and-forget scheduler.start() onto the running loop.
+
+    Reload paths are sync but invoked from FastAPI request handlers,
+    so the running loop is available. Awaiting would force the entire
+    reload chain to become async — not worth it for one no-await
+    coroutine.
+    """
+    import asyncio
+    try:
+        asyncio.get_running_loop().create_task(backend.start())
+    except RuntimeError:
+        log.warning(
+            "[reload] no running event loop; scheduler will start "
+            "on next process boot",
+        )
+    except Exception:
+        log.exception("[reload] scheduler start failed")
+
+
+def _stop_scheduler_async(backend: "SchedulerBackend") -> None:
+    """Fire-and-forget scheduler.stop() onto the running loop.
+
+    Used when the YAML toggle flips off mid-reload. The polling task
+    cancels cleanly; the next graph rebuild registers no scheduler
+    tools.
+    """
+    import asyncio
+    try:
+        asyncio.get_running_loop().create_task(backend.stop())
+    except RuntimeError:
+        log.warning("[reload] no running event loop; scheduler not stopped")
+    except Exception:
+        log.exception("[reload] scheduler stop failed")
+
+
+def _build_scheduler(config) -> "SchedulerBackend | None":
     """Return the active scheduler backend, or ``None`` when disabled.
 
     Selection order:
@@ -252,35 +291,28 @@ def _reload_langgraph_agent() -> tuple[bool, str]:
     if is_setup_complete():
         try:
             new_store = _build_knowledge_store(new_config)
-            # Reuse the running scheduler so a drawer save doesn't tear
-            # down the polling loop and orphan in-flight fires. Build
-            # one only when none was constructed yet — the typical
-            # path is: server boots before setup is complete (no
-            # scheduler), wizard finishes, drawer triggers reload —
-            # this is when we *first* construct the scheduler.
+            # Three states for the scheduler on reload:
             #
-            # Note: the freshly-built scheduler isn't started here.
-            # FastAPI's startup hook fires once at process start; on
-            # post-setup reloads we kick the polling loop manually.
+            # 1. Toggle flipped OFF (was on) → stop + drop the running
+            #    scheduler so the agent stops registering scheduler
+            #    tools. The new graph is built with scheduler=None.
+            # 2. Toggle is ON and we have a running scheduler → reuse
+            #    it. Drawer saves don't tear down the polling loop.
+            # 3. Toggle is ON but _scheduler is None (first-run after
+            #    setup completes) → construct + start.
+            #
+            # Env-driven config (WORKSTACEAN_API_BASE) only takes
+            # effect on full process restart; the YAML toggle is the
+            # canonical reload-time switch.
             global _scheduler
-            if _scheduler is None:
+            scheduler_wanted = getattr(new_config, "scheduler_enabled", True)
+            if not scheduler_wanted and _scheduler is not None:
+                _stop_scheduler_async(_scheduler)
+                _scheduler = None
+            elif scheduler_wanted and _scheduler is None:
                 _scheduler = _build_scheduler(new_config)
                 if _scheduler is not None:
-                    # _reload_langgraph_agent is sync but called from
-                    # inside the FastAPI event loop, so the running
-                    # loop is available. Fire-and-forget the start —
-                    # awaiting it would require making this whole
-                    # function async (and every caller along with it).
-                    try:
-                        import asyncio
-                        asyncio.get_running_loop().create_task(_scheduler.start())
-                    except RuntimeError:
-                        log.warning(
-                            "[reload] no running event loop; scheduler will "
-                            "start on next process boot",
-                        )
-                    except Exception:
-                        log.exception("[reload] scheduler start failed")
+                    _start_scheduler_async(_scheduler)
             new_graph = create_agent_graph(
                 new_config, knowledge_store=new_store, scheduler=_scheduler,
             )

@@ -73,7 +73,7 @@ class TestParseIso:
         assert dt.hour == 20  # 15 EST → 20 UTC
 
     def test_malformed_raises(self):
-        with pytest.raises(ValueError, match="Invalid isoformat|could not convert"):
+        with pytest.raises(ValueError, match=r"Invalid isoformat|could not convert"):
             parse_iso_to_utc("not an iso string")
 
 
@@ -98,12 +98,12 @@ class TestAddJob:
 
     def test_empty_prompt_rejected(self, tmp_path):
         s = _make_scheduler(tmp_path)
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match=r"prompt is required"):
             s.add_job("   ", "0 9 * * *")
 
     def test_malformed_schedule_rejected(self, tmp_path):
         s = _make_scheduler(tmp_path)
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match=r"Invalid isoformat|could not convert"):
             s.add_job("hi", "not-a-real-schedule")
 
     def test_user_id_preserved(self, tmp_path):

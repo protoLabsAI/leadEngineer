@@ -223,8 +223,15 @@ class LocalScheduler:
         self._task.cancel()
         try:
             await self._task
-        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+        except asyncio.CancelledError:
+            # Expected — we just cancelled it.
             pass
+        except Exception:  # noqa: BLE001
+            # Anything else means the polling loop crashed during
+            # shutdown. Log with traceback so we can debug; don't
+            # re-raise (caller is in shutdown path, raising would
+            # mask the original shutdown trigger).
+            log.exception("[scheduler] polling task raised during stop")
         self._task = None
         log.info("[scheduler] local backend stopped")
 
