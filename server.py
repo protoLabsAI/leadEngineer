@@ -185,7 +185,11 @@ def _build_scheduler(config):
             f"http://127.0.0.1:{_active_port}",
         )
         bearer = (config.auth_token or os.environ.get("A2A_AUTH_TOKEN", "")).strip()
-        api_key_env = f"{name.upper()}_API_KEY"
+        # The A2A handler reads X-API-Key from ``<AGENT_NAME_ENV>_API_KEY``
+        # (server.py L893 — note: the env-derived name, NOT the wizard-set
+        # ``identity.name``). Match that here so a wizard rename doesn't
+        # break self-invocation auth.
+        api_key_env = f"{AGENT_NAME_ENV.upper()}_API_KEY"
         api_key = os.environ.get(api_key_env, "").strip()
         return LocalScheduler(
             agent_name=name,
@@ -238,11 +242,35 @@ def _reload_langgraph_agent() -> tuple[bool, str]:
     if is_setup_complete():
         try:
             new_store = _build_knowledge_store(new_config)
-            # Re-use the running scheduler instance — tearing down the
-            # polling loop on every drawer save would orphan in-flight
-            # fires. Env-driven scheduler config (WORKSTACEAN_API_BASE,
-            # SCHEDULER_DISABLED) only takes effect on full restart;
-            # the YAML doesn't carry scheduler settings yet.
+            # Reuse the running scheduler so a drawer save doesn't tear
+            # down the polling loop and orphan in-flight fires. Build
+            # one only when none was constructed yet — the typical
+            # path is: server boots before setup is complete (no
+            # scheduler), wizard finishes, drawer triggers reload —
+            # this is when we *first* construct the scheduler.
+            #
+            # Note: the freshly-built scheduler isn't started here.
+            # FastAPI's startup hook fires once at process start; on
+            # post-setup reloads we kick the polling loop manually.
+            global _scheduler
+            if _scheduler is None:
+                _scheduler = _build_scheduler(new_config)
+                if _scheduler is not None:
+                    # _reload_langgraph_agent is sync but called from
+                    # inside the FastAPI event loop, so the running
+                    # loop is available. Fire-and-forget the start —
+                    # awaiting it would require making this whole
+                    # function async (and every caller along with it).
+                    try:
+                        import asyncio
+                        asyncio.get_running_loop().create_task(_scheduler.start())
+                    except RuntimeError:
+                        log.warning(
+                            "[reload] no running event loop; scheduler will "
+                            "start on next process boot",
+                        )
+                    except Exception:
+                        log.exception("[reload] scheduler start failed")
             new_graph = create_agent_graph(
                 new_config, knowledge_store=new_store, scheduler=_scheduler,
             )

@@ -281,6 +281,18 @@ def _extract_text_from_html(content: bytes) -> str:
 _MEMORY_RECALL_MAX_K = 20
 _MEMORY_LIST_MAX_LIMIT = 200
 
+# Stable list of scheduler tool names. Exposed as a module-level
+# constant so ``graph/config_io.py::list_available_tools`` can show
+# the wizard the right surface even when the runtime hasn't yet
+# constructed a scheduler instance (e.g. fresh boot before setup is
+# complete). Keep in sync with ``_build_scheduler_tools``.
+SCHEDULER_TOOL_NAMES: tuple[str, ...] = (
+    "schedule_task", "list_schedules", "cancel_schedule",
+)
+MEMORY_TOOL_NAMES: tuple[str, ...] = (
+    "memory_ingest", "memory_recall", "memory_list", "memory_stats", "daily_log",
+)
+
 
 def _build_memory_tools(knowledge_store) -> list:
     """Bind memory tools to a ``KnowledgeStore``. Returns a list."""

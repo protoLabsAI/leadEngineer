@@ -288,3 +288,82 @@ async def test_due_job_fires(tmp_path, monkeypatch):
     assert any("FIRED-ME" in str(c["json"]) for c in fired)
     # One-shot was deleted after firing
     assert s.list_jobs() == []
+
+
+@pytest.mark.asyncio
+async def test_fire_failure_leaves_job_in_place(tmp_path, monkeypatch):
+    """A 5xx HTTP response from /a2a must NOT delete the job.
+
+    Regression guard for the round-2 review finding: previously,
+    _tick() called _reschedule_or_delete in finally, which silently
+    consumed one-shot jobs on transient failures. Now the job stays
+    until delivery actually succeeds.
+    """
+    s = _make_scheduler(tmp_path)
+    past = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
+    s.add_job("DURABLE", past, job_id="firetest")
+
+    class _FakeResponse:
+        status_code = 503
+        text = "service unavailable"
+
+    class _FakeClient:
+        def __init__(self, *_a, **_kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_a):
+            return False
+
+        async def post(self, url, headers=None, json=None):
+            return _FakeResponse()
+
+    import httpx
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
+
+    await s.start()
+    await asyncio.sleep(1.5)  # one polling tick
+    await s.stop()
+
+    # Job survives the failed fire, will be retried on the next tick.
+    assert len(s.list_jobs()) == 1
+    assert s.list_jobs()[0].id == "firetest"
+
+
+@pytest.mark.asyncio
+async def test_fire_returns_bool(tmp_path, monkeypatch):
+    """``_fire`` is the success/failure signal feeding the
+    reschedule decision in ``_tick``. Lock the contract."""
+    s = _make_scheduler(tmp_path)
+    job = s.add_job("hi", "0 9 * * *", job_id="x")
+
+    class _OkResponse:
+        status_code = 200
+        text = "ok"
+
+    class _ErrResponse:
+        status_code = 500
+        text = "boom"
+
+    class _FakeClient:
+        def __init__(self, response):
+            self._response = response
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_a):
+            return False
+
+        async def post(self, *_a, **_kw):
+            return self._response
+
+    import httpx
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _FakeClient(_OkResponse()))
+    assert await s._fire(job) is True
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _FakeClient(_ErrResponse()))
+    assert await s._fire(job) is False

@@ -245,10 +245,18 @@ class LocalScheduler:
         now = datetime.now(UTC)
         due = self._claim_due_jobs(now)
         for job in due:
-            try:
-                await self._fire(job)
-            finally:
+            # Reschedule (or delete) only when delivery actually
+            # succeeded. A transient HTTP failure leaves the row in
+            # place so the next tick retries; a one-shot stays alive
+            # until it lands rather than vanishing on the first
+            # network blip.
+            if await self._fire(job):
                 self._reschedule_or_delete(job, fired_at=now)
+            else:
+                log.warning(
+                    "[scheduler] fire failed for job %s; leaving in place for retry",
+                    job.id,
+                )
 
     def _claim_due_jobs(self, now: datetime) -> list[Job]:
         db = self._connect()
@@ -322,8 +330,14 @@ class LocalScheduler:
         finally:
             db.close()
 
-    async def _fire(self, job: Job) -> None:
-        """Deliver a job by POSTing to the agent's own A2A endpoint."""
+    async def _fire(self, job: Job) -> bool:
+        """Deliver a job by POSTing to the agent's own A2A endpoint.
+
+        Returns ``True`` on a 2xx response, ``False`` on any HTTP
+        error or network exception. Callers use the return value to
+        decide whether to advance the schedule (success) or leave
+        the row in place for the next tick to retry (failure).
+        """
         import httpx
 
         headers = {"Content-Type": "application/json"}
@@ -356,10 +370,12 @@ class LocalScheduler:
                     "[scheduler] fire failed for job %s: HTTP %d %s",
                     job.id, r.status_code, r.text[:200],
                 )
-            else:
-                log.info("[scheduler] fired job %s", job.id)
+                return False
+            log.info("[scheduler] fired job %s", job.id)
+            return True
         except Exception:  # noqa: BLE001
             log.exception("[scheduler] fire exception for job %s", job.id)
+            return False
 
     def _generate_id(self) -> str:
         # Agent-name prefix keeps cross-agent IDs distinct in shared
