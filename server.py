@@ -30,9 +30,12 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from graph.output_format import extract_output
+
+if TYPE_CHECKING:
+    from scheduler.interface import SchedulerBackend
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -58,6 +61,10 @@ _checkpointer = None   # MemorySaver for session persistence
 _active_port = 7870    # populated by _main() — the port this process is actually bound to.
                        # Read by the autostart installer so the LaunchAgent reboots
                        # on the same port the operator launched with, not the default.
+_scheduler = None      # SchedulerBackend (LocalScheduler or WorkstaceanScheduler).
+                       # Constructed at init, started on FastAPI startup, stopped
+                       # on shutdown. Lifecycle is hooked in _main() so the
+                       # polling coroutine doesn't leak on server reload.
 
 
 def _init_langgraph_agent():
@@ -97,11 +104,21 @@ def _init_langgraph_agent():
     # the worker subagent — the store is still cheap to construct.
     knowledge_store = _build_knowledge_store(_graph_config)
 
-    _graph = create_agent_graph(_graph_config, knowledge_store=knowledge_store)
+    # Scheduler — local sqlite by default, swaps to a WorkstaceanScheduler
+    # automatically when WORKSTACEAN_API_BASE + WORKSTACEAN_API_KEY env
+    # vars are set. Both backends share the same agent-tool surface
+    # (schedule_task / list_schedules / cancel_schedule).
+    global _scheduler
+    _scheduler = _build_scheduler(_graph_config)
+
+    _graph = create_agent_graph(
+        _graph_config, knowledge_store=knowledge_store, scheduler=_scheduler,
+    )
     log.info(
-        "LangGraph agent initialized (model: %s, knowledge_db: %s)",
+        "LangGraph agent initialized (model: %s, knowledge_db: %s, scheduler: %s)",
         _graph_config.model_name,
         getattr(knowledge_store, "path", "(disabled)"),
+        getattr(_scheduler, "name", "disabled"),
     )
 
 
@@ -121,6 +138,119 @@ def _build_knowledge_store(config):
         return KnowledgeStore(db_path=config.knowledge_db_path)
     except Exception as exc:
         log.warning("[server] knowledge store init failed: %s; running KB-less", exc)
+        return None
+
+
+def _start_scheduler_async(backend: "SchedulerBackend") -> None:
+    """Fire-and-forget scheduler.start() onto the running loop.
+
+    Reload paths are sync but invoked from FastAPI request handlers,
+    so the running loop is available. Awaiting would force the entire
+    reload chain to become async — not worth it for one no-await
+    coroutine.
+    """
+    import asyncio
+    try:
+        asyncio.get_running_loop().create_task(backend.start())
+    except RuntimeError:
+        log.warning(
+            "[reload] no running event loop; scheduler will start "
+            "on next process boot",
+        )
+    except Exception:
+        log.exception("[reload] scheduler start failed")
+
+
+def _stop_scheduler_async(backend: "SchedulerBackend") -> None:
+    """Fire-and-forget scheduler.stop() onto the running loop.
+
+    Used when the YAML toggle flips off mid-reload. The polling task
+    cancels cleanly; the next graph rebuild registers no scheduler
+    tools.
+    """
+    import asyncio
+    try:
+        asyncio.get_running_loop().create_task(backend.stop())
+    except RuntimeError:
+        log.warning("[reload] no running event loop; scheduler not stopped")
+    except Exception:
+        log.exception("[reload] scheduler stop failed")
+
+
+def _build_scheduler(config) -> "SchedulerBackend | None":
+    """Return the active scheduler backend, or ``None`` when disabled.
+
+    Selection order:
+
+    1. ``WORKSTACEAN_API_BASE`` + ``WORKSTACEAN_API_KEY`` set →
+       ``WorkstaceanScheduler``. Forks running on the protoLabs fleet
+       infrastructure get this for free.
+    2. Otherwise → ``LocalScheduler`` with sqlite at
+       ``/sandbox/scheduler/<agent_name>/jobs.db``.
+
+    Returns ``None`` when explicitly disabled via ``SCHEDULER_DISABLED=1``
+    so a fork can ship without a scheduler at all.
+
+    The agent's auth token + api-key are passed into the local backend
+    so its self-invocation HTTP call can pass through bearer / X-API-Key
+    auth — the scheduler hits the same A2A endpoint as a real caller.
+    """
+    # Two opt-out paths, in priority order:
+    # 1. ``middleware.scheduler: false`` in YAML (drawer / wizard).
+    #    This is the canonical opt-out — symmetric with
+    #    ``middleware.knowledge`` / ``middleware.memory``.
+    # 2. ``SCHEDULER_DISABLED=1`` env var. Runtime escape hatch for
+    #    fleet operators who need to kill the scheduler without
+    #    editing config (e.g. emergency rollback).
+    if not getattr(config, "scheduler_enabled", True):
+        log.info("[server] scheduler disabled via middleware.scheduler config")
+        return None
+    if os.environ.get("SCHEDULER_DISABLED", "").lower() in ("1", "true", "yes"):
+        log.info("[server] scheduler disabled via SCHEDULER_DISABLED env")
+        return None
+
+    name = agent_name()
+    workstacean_base = os.environ.get("WORKSTACEAN_API_BASE", "").strip()
+    workstacean_key = os.environ.get("WORKSTACEAN_API_KEY", "").strip()
+    if workstacean_base and workstacean_key:
+        try:
+            from scheduler import WorkstaceanScheduler
+            return WorkstaceanScheduler(
+                agent_name=name,
+                base_url=workstacean_base,
+                api_key=workstacean_key,
+                topic_prefix=os.environ.get("WORKSTACEAN_TOPIC_PREFIX") or None,
+            )
+        except Exception as exc:
+            log.warning(
+                "[server] WorkstaceanScheduler init failed: %s; falling back to local",
+                exc,
+            )
+
+    try:
+        from scheduler import LocalScheduler
+        invoke_url = os.environ.get(
+            "SCHEDULER_INVOKE_URL",
+            f"http://127.0.0.1:{_active_port}",
+        )
+        bearer = (config.auth_token or os.environ.get("A2A_AUTH_TOKEN", "")).strip()
+        # The A2A handler reads X-API-Key from ``<AGENT_NAME_ENV>_API_KEY``
+        # (server.py L893 — note: the env-derived name, NOT the wizard-set
+        # ``identity.name``). Match that here so a wizard rename doesn't
+        # break self-invocation auth.
+        api_key_env = f"{AGENT_NAME_ENV.upper()}_API_KEY"
+        api_key = os.environ.get(api_key_env, "").strip()
+        return LocalScheduler(
+            agent_name=name,
+            invoke_url=invoke_url,
+            api_key=api_key,
+            bearer_token=bearer,
+        )
+    except Exception as exc:
+        log.warning(
+            "[server] LocalScheduler init failed: %s; running scheduler-less",
+            exc,
+        )
         return None
 
 
@@ -158,12 +288,44 @@ def _reload_langgraph_agent() -> tuple[bool, str]:
     # would leave the process serving the prior compiled _graph under
     # fresh _graph_config + rotated bearer auth on failure — the
     # metrics / card / auth all de-sync from what's actually running.
+    # Plan the scheduler swap *before* attempting the graph rebuild so
+    # the polling loop isn't torn down (or a fresh one started) until
+    # we know the rebuild will succeed. Three states:
+    #
+    # 1. Toggle flipped OFF, scheduler currently running → next graph
+    #    uses None; we stop the running scheduler only after commit.
+    # 2. Toggle ON, none running (first-run after setup completes) →
+    #    construct now (cheap), start only after commit.
+    # 3. Toggle ON, already running → reuse. Drawer saves don't tear
+    #    down the polling loop.
+    #
+    # Env-driven config (WORKSTACEAN_API_BASE) only takes effect on
+    # full process restart; the YAML toggle is the canonical
+    # reload-time switch.
+    global _scheduler
+    scheduler_wanted = getattr(new_config, "scheduler_enabled", True)
+    next_scheduler: "SchedulerBackend | None"
+    pending_start: "SchedulerBackend | None" = None
+    pending_stop: "SchedulerBackend | None" = None
+    if not scheduler_wanted:
+        next_scheduler = None
+        pending_stop = _scheduler  # may be None — stopper is no-op then
+    elif _scheduler is None:
+        next_scheduler = _build_scheduler(new_config)
+        pending_start = next_scheduler
+    else:
+        next_scheduler = _scheduler
+
     if is_setup_complete():
         try:
             new_store = _build_knowledge_store(new_config)
-            new_graph = create_agent_graph(new_config, knowledge_store=new_store)
+            new_graph = create_agent_graph(
+                new_config, knowledge_store=new_store, scheduler=next_scheduler,
+            )
         except Exception as e:
             log.exception("[reload] graph rebuild failed")
+            # Scheduler state hasn't been committed yet — caller's
+            # running scheduler keeps polling, no orphaned tasks.
             return False, f"graph rebuild failed: {e}"
     else:
         new_graph = None
@@ -180,6 +342,15 @@ def _reload_langgraph_agent() -> tuple[bool, str]:
         # before _main wires routes) — harmless.
         pass
     _graph = new_graph
+    # Commit the scheduler swap. start/stop are async — fire-and-forget
+    # onto the active loop so reload stays sync. We've already verified
+    # the graph rebuild succeeded; if start/stop fails we log but
+    # don't roll back (the agent is already serving the new graph).
+    _scheduler = next_scheduler
+    if pending_stop is not None:
+        _stop_scheduler_async(pending_stop)
+    if pending_start is not None:
+        _start_scheduler_async(pending_start)
 
     if new_graph is None:
         log.info("[reload] setup not complete — config reloaded, graph not compiled")
@@ -756,6 +927,31 @@ def _main():
     from pydantic import BaseModel as PydanticBaseModel
 
     fastapi_app = FastAPI(title=f"{agent_name()} — protoAgent")
+
+    # --- Scheduler lifecycle ------------------------------------------------
+    # The local scheduler needs an asyncio polling task; the Workstacean
+    # adapter is a no-op start/stop. Both implement the same contract so
+    # we just call through. on_event is preferred over a lifespan
+    # context manager here — the rest of the boot is sync (uvicorn.run
+    # is the only blocking call) and FastAPI fires startup/shutdown
+    # around it.
+    @fastapi_app.on_event("startup")
+    async def _scheduler_startup() -> None:
+        if _scheduler is None:
+            return
+        try:
+            await _scheduler.start()
+        except Exception:
+            log.exception("[scheduler] startup failed")
+
+    @fastapi_app.on_event("shutdown")
+    async def _scheduler_shutdown() -> None:
+        if _scheduler is None:
+            return
+        try:
+            await _scheduler.stop()
+        except Exception:
+            log.exception("[scheduler] shutdown failed")
 
     # --- Chat API -----------------------------------------------------------
     class ChatRequest(PydanticBaseModel):

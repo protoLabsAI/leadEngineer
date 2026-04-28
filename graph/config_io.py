@@ -133,6 +133,7 @@ def config_to_dict(config: LangGraphConfig) -> dict[str, Any]:
             "knowledge": config.knowledge_middleware,
             "audit": config.audit_middleware,
             "memory": config.memory_middleware,
+            "scheduler": config.scheduler_enabled,
         },
         "knowledge": {
             "db_path": config.knowledge_db_path,
@@ -319,10 +320,30 @@ def list_gateway_models(
 
 
 def list_available_tools(knowledge_store: Any = None) -> list[str]:
-    """Return every tool name the runtime would wire into the graph."""
-    from tools.lg_tools import get_all_tools
+    """Return every tool name the runtime *could* wire into the graph.
 
-    return [t.name for t in get_all_tools(knowledge_store)]
+    The wizard's tool checkbox group reads this. We deliberately
+    expose the scheduler tool names even when no scheduler has been
+    constructed yet (fresh boot, pre-setup) — otherwise the wizard
+    would hide tools that the runtime will register the moment the
+    user finishes setup. Same logic for memory tools when the
+    knowledge store is absent.
+    """
+    from tools.lg_tools import (
+        MEMORY_TOOL_NAMES,
+        SCHEDULER_TOOL_NAMES,
+        get_all_tools,
+    )
+
+    names = [t.name for t in get_all_tools(knowledge_store)]
+    # Deduplicate while preserving order: tools already present
+    # (because their backend was passed in) shouldn't appear twice.
+    seen = set(names)
+    for extra in (*MEMORY_TOOL_NAMES, *SCHEDULER_TOOL_NAMES):
+        if extra not in seen:
+            names.append(extra)
+            seen.add(extra)
+    return names
 
 
 # ---------------------------------------------------------------------------

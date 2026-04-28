@@ -32,16 +32,22 @@ subagents:
       - memory_list
       - memory_stats
       - daily_log
+      - schedule_task
+      - list_schedules
+      - cancel_schedule
     max_turns: 20
 
 middleware:
-  # All three middlewares default ON. The knowledge middleware needs a
-  # store; the template constructs one automatically (see
-  # ``server.py::_build_knowledge_store``). Set ``knowledge: false`` if
-  # your fork is purely stateless.
+  # All four subsystems default ON. The template constructs the
+  # knowledge store + scheduler backends automatically (see
+  # ``server.py::_build_knowledge_store`` and ``_build_scheduler``).
+  # Flip any of these to ``false`` to opt out — the corresponding
+  # tools (memory_*, schedule_*) are dropped from the agent loop
+  # without touching the worker subagent's tool allowlist.
   knowledge: true
   audit: true
   memory: true
+  scheduler: true
 
 knowledge:
   db_path: /sandbox/knowledge/agent.db
