@@ -46,10 +46,14 @@ class LangGraphConfig:
         max_turns=20,
     ))
 
-    # Middleware toggles
+    # Middleware / subsystem toggles. All default-on so a fresh fork has
+    # a working memory loop + scheduler on day one. Forks that want a
+    # purely stateless agent (no KB, no scheduled tasks) can flip these
+    # via the drawer or by editing the YAML directly.
     knowledge_middleware: bool = True
     audit_middleware: bool = True
     memory_middleware: bool = True
+    scheduler_enabled: bool = True
 
     # Knowledge store — sqlite + FTS5, see ``knowledge/store.py``.
     # The default path lives under ``/sandbox/`` to play well with the
@@ -109,6 +113,7 @@ class LangGraphConfig:
             knowledge_middleware=middleware.get("knowledge", cls.knowledge_middleware),
             audit_middleware=middleware.get("audit", cls.audit_middleware),
             memory_middleware=middleware.get("memory", cls.memory_middleware),
+            scheduler_enabled=middleware.get("scheduler", cls.scheduler_enabled),
             knowledge_db_path=knowledge.get("db_path", cls.knowledge_db_path),
             embed_model=knowledge.get("embed_model", cls.embed_model),
             knowledge_top_k=knowledge.get("top_k", cls.knowledge_top_k),

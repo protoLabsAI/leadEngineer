@@ -34,12 +34,19 @@ not "do that thing we discussed").
 
 `server.py::_build_scheduler` picks at startup:
 
-1. `WORKSTACEAN_API_BASE` + `WORKSTACEAN_API_KEY` set → **`WorkstaceanScheduler`**.
-2. Otherwise → **`LocalScheduler`** (sqlite, asyncio polling).
-3. `SCHEDULER_DISABLED=1` → no scheduler. The three tools don't ship.
+1. `middleware.scheduler: false` in YAML → no scheduler. The three
+   tools don't ship. (Symmetric with `middleware.knowledge` /
+   `middleware.memory` — drawer/wizard editable.)
+2. `SCHEDULER_DISABLED=1` env → no scheduler. Runtime escape hatch
+   for fleet operators who can't edit config.
+3. `WORKSTACEAN_API_BASE` + `WORKSTACEAN_API_KEY` set →
+   **`WorkstaceanScheduler`**.
+4. Otherwise → **`LocalScheduler`** (sqlite, asyncio polling).
 
 Both backends honor the same `SchedulerBackend` protocol; the agent
-loop never knows which one is wired up.
+loop never knows which one is wired up. The scheduler is **default
+on** — explicitly opt out via either config path above when a fork
+wants a stateless agent with no scheduling surface.
 
 ```bash
 # Solo / local dev — falls through to LocalScheduler automatically.

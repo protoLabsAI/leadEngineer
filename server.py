@@ -156,6 +156,16 @@ def _build_scheduler(config):
     so its self-invocation HTTP call can pass through bearer / X-API-Key
     auth — the scheduler hits the same A2A endpoint as a real caller.
     """
+    # Two opt-out paths, in priority order:
+    # 1. ``middleware.scheduler: false`` in YAML (drawer / wizard).
+    #    This is the canonical opt-out — symmetric with
+    #    ``middleware.knowledge`` / ``middleware.memory``.
+    # 2. ``SCHEDULER_DISABLED=1`` env var. Runtime escape hatch for
+    #    fleet operators who need to kill the scheduler without
+    #    editing config (e.g. emergency rollback).
+    if not getattr(config, "scheduler_enabled", True):
+        log.info("[server] scheduler disabled via middleware.scheduler config")
+        return None
     if os.environ.get("SCHEDULER_DISABLED", "").lower() in ("1", "true", "yes"):
         log.info("[server] scheduler disabled via SCHEDULER_DISABLED env")
         return None

@@ -133,6 +133,7 @@ def config_to_dict(config: LangGraphConfig) -> dict[str, Any]:
             "knowledge": config.knowledge_middleware,
             "audit": config.audit_middleware,
             "memory": config.memory_middleware,
+            "scheduler": config.scheduler_enabled,
         },
         "knowledge": {
             "db_path": config.knowledge_db_path,

@@ -33,6 +33,7 @@ middleware:
   knowledge: true
   audit: true
   memory: true
+  scheduler: true
 
 knowledge:
   db_path: /sandbox/knowledge/agent.db
@@ -71,6 +72,7 @@ Adding a new subagent name to the YAML requires matching entries in `graph/subag
 | `knowledge` | `true` | Inject retrieved knowledge into state before LLM calls. Backed by the bundled `KnowledgeStore` (sqlite + FTS5). Set `false` for a stateless agent. |
 | `audit` | `true` | Append every tool call to `/sandbox/audit/audit.jsonl`. |
 | `memory` | `true` | Persist a session summary on terminal turn and asynchronously index conversation findings under `domain='finding'`. |
+| `scheduler` | `true` | Wire the bundled scheduler backend (local sqlite, or `WorkstaceanScheduler` when env vars are set). Drops the `schedule_task` / `list_schedules` / `cancel_schedule` tools from the agent loop when `false`. Equivalent to setting `SCHEDULER_DISABLED=1`; the YAML toggle is the canonical opt-out path. |
 
 ## `knowledge`
 
