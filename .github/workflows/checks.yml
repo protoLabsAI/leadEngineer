@@ -39,22 +39,20 @@ jobs:
     name: Python tests
     runs-on: namespace-profile-protolabs-linux
     timeout-minutes: 15
-    # Non-blocking for now. The collection-time langchain_core poisoning is
-    # fixed (#175) and 371 tests pass, but ~11 pre-existing behavioral tests
-    # still fail (langchain 1.x API drift; tracked in #176). Keep the job
-    # visible; flip to blocking once those are green.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
       - name: Install dependencies
+        # venv keeps tests/conftest.py's site.getsitepackages() reorder
+        # resolving correctly (see #175).
         run: |
-          python -m venv --clear .venv
+          python -m venv .venv
           . .venv/bin/activate
           python -m pip install --upgrade pip
-          pip install --no-cache-dir -r requirements.txt pytest pytest-asyncio
+          pip install -r requirements.txt pytest pytest-asyncio
       - name: Run tests
         run: |
           . .venv/bin/activate

@@ -46,9 +46,19 @@ def _stub_langchain_core():
 
 
 def _stub_tracing():
-    """Stub the tracing module to avoid langfuse imports + side effects."""
-    if "tracing" in sys.modules:
-        return
+    """Stub the tracing module to avoid langfuse imports + side effects.
+
+    Only as a fallback when the real module can't import — otherwise the
+    partial stub leaks into sys.modules for the whole session and breaks
+    other tests that patch tracing attributes it omits (e.g. the audit
+    redaction suite patches tracing.trace_tool_call). See protoAgent#176."""
+    try:
+        import tracing  # noqa: F401
+
+        return  # real module present — never stub
+    except Exception:
+        pass
+
     import contextlib
 
     tracing = types.ModuleType("tracing")
@@ -62,6 +72,7 @@ def _stub_tracing():
     tracing.is_enabled = lambda: False
     tracing.current_trace_id = lambda: ""
     tracing.current_session_id = lambda: ""
+    tracing.trace_tool_call = lambda *a, **k: None
     sys.modules["tracing"] = tracing
 
 

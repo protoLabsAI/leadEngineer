@@ -1436,16 +1436,10 @@ def register_a2a_routes(
 
     # ── GET /tasks/{task_id} ──────────────────────────────────────────────────
 
-    @app.get("/tasks/{task_id}", include_in_schema=False)
-    async def _get_task(task_id: str, request: Request):
-        _check_auth(request, api_key)
-        _check_bearer_auth(request)
-        record = await _store.get(task_id)
-        if record is None:
-            raise HTTPException(404, f"Task not found: {task_id}")
-        return _task_to_response(record)
-
     # ── GET /tasks/{task_id}:subscribe  (SSE reconnect) ──────────────────────
+    # MUST be registered before the bare GET /tasks/{task_id} below: the
+    # {task_id} param matches `[^/]+` (colons included), so the generic route
+    # would otherwise capture `<id>:subscribe` as a task_id and 404.
 
     @app.get("/tasks/{task_id}:subscribe", include_in_schema=False)
     async def _subscribe_task(task_id: str, request: Request):
@@ -1505,6 +1499,15 @@ def register_a2a_routes(
                 raise
 
         return StreamingResponse(_sse_gen(), media_type="text/event-stream", headers=_SSE_HEADERS)
+
+    @app.get("/tasks/{task_id}", include_in_schema=False)
+    async def _get_task(task_id: str, request: Request):
+        _check_auth(request, api_key)
+        _check_bearer_auth(request)
+        record = await _store.get(task_id)
+        if record is None:
+            raise HTTPException(404, f"Task not found: {task_id}")
+        return _task_to_response(record)
 
     # ── POST /tasks/{task_id}:cancel ──────────────────────────────────────────
 
