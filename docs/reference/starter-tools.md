@@ -203,6 +203,8 @@ Cross-agent cancellation is blocked — `gina-personal` cannot cancel `gina-work
 
 ## Adding your own
 
+For tools that shell out, build on `tools/shell.py::run_command` (async; handles timeout/kill, missing-binary → structured error, env merge, stdin/cwd) or `tools/gh_cli.py` for `gh` specifically — don't hand-roll `subprocess`.
+
 Follow the same pattern:
 
 ```python
