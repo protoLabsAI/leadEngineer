@@ -31,16 +31,16 @@ _SKILLS_MAX_TOKENS = 2000
 _SKILLS_CONTEXT_CHARS = 2000  # chars of recent context to include in query
 
 
-def _in_goal_continuation() -> bool:
-    """Whether the current turn is a goal-continuation invocation.
+def _in_goal_turn() -> bool:
+    """Whether the current turn is a goal-driven invocation.
 
     Lazy import keeps the middleware decoupled from the goals package and
     fail-safe (treat as a normal turn if the marker module is unavailable).
     """
     try:
-        from graph.goals.continuation import in_goal_continuation
+        from graph.goals.goal_turn import in_goal_turn
 
-        return in_goal_continuation()
+        return in_goal_turn()
     except Exception:
         return False
 
@@ -311,11 +311,11 @@ class KnowledgeMiddleware(AgentMiddleware):
         parts: list[str] = []
 
         # Load prior sessions once per middleware instance (lazy cache).
-        # Suppressed on goal-continuation turns: unrelated cross-session
-        # history biases the self-driving loop (see graph.goals.continuation).
+        # Suppressed on goal-driven turns: unrelated cross-session history
+        # biases the self-driving loop (see graph.goals.goal_turn).
         if self._prior_sessions_cache is None:
             self._prior_sessions_cache = self.load_memory()
-        if self._prior_sessions_cache and not _in_goal_continuation():
+        if self._prior_sessions_cache and not _in_goal_turn():
             parts.append(self._prior_sessions_cache)
 
         # Hot memory — always-on operator facts (domain="hot"). Loaded per turn

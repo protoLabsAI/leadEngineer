@@ -225,23 +225,23 @@ def test_before_model_injects_prior_sessions(tmp_path):
     assert 'id="inject-sess"' in result["context"]
 
 
-def test_before_model_suppresses_prior_sessions_in_goal_continuation(tmp_path):
-    """Goal-continuation turns must NOT receive cross-session prior_sessions —
-    unrelated history biases the self-driving loop. The footer/knowledge paths
-    are unaffected; only the prior_sessions block is dropped."""
+def test_before_model_suppresses_prior_sessions_in_goal_turn(tmp_path):
+    """Goal-driven turns must NOT receive cross-session prior_sessions —
+    unrelated history biases the self-driving loop. The knowledge-search path
+    is unaffected; only the prior_sessions block is dropped."""
     _write_session(str(tmp_path), "leak-sess", _sample_session("leak-sess"))
 
     mw = _make_middleware()
     mw._prior_sessions_cache = mw.load_memory(memory_path=str(tmp_path))
 
     from langchain_core.messages import HumanMessage
-    from graph.goals.continuation import goal_continuation_turn
+    from graph.goals.goal_turn import goal_turn
 
     state = {"messages": [HumanMessage(content="continue the goal")]}
 
-    # Normal turn injects it; continuation turn suppresses it.
+    # Normal turn injects it; goal-driven turn suppresses it.
     assert "<prior_sessions>" in (mw.before_model(state, runtime=None) or {}).get("context", "")
-    with goal_continuation_turn():
+    with goal_turn():
         result = mw.before_model(state, runtime=None)
     ctx = (result or {}).get("context", "")
     assert "<prior_sessions>" not in ctx

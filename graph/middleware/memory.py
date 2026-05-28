@@ -37,16 +37,16 @@ else:
     log.info("[memory] session persistence enabled — path: %s", MEMORY_PATH)
 
 
-def _in_goal_continuation() -> bool:
-    """Whether the current turn is a goal-continuation invocation.
+def _in_goal_turn() -> bool:
+    """Whether the current turn is a goal-driven invocation.
 
     Lazy import keeps memory decoupled from the goals package and fail-safe
     (treat as a normal turn if the marker module is unavailable).
     """
     try:
-        from graph.goals.continuation import in_goal_continuation
+        from graph.goals.goal_turn import in_goal_turn
 
-        return in_goal_continuation()
+        return in_goal_turn()
     except Exception:
         return False
 
@@ -269,9 +269,9 @@ class MemoryMiddleware(AgentMiddleware):
         """
         if self._store is not None:
             return None
-        # Suppressed on goal-continuation turns (see graph.goals.continuation):
+        # Suppressed on goal-driven turns (see graph.goals.goal_turn):
         # unrelated cross-session history biases the self-driving loop.
-        if _in_goal_continuation():
+        if _in_goal_turn():
             return None
         if self._prior_sessions_cache is None:
             self._prior_sessions_cache = self._load_prior_sessions()
