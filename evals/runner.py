@@ -322,11 +322,16 @@ async def _run_goal_case(client: AgentClient, case: dict) -> CaseResult:
 
         expected_status = case.get("expected_goal_status")
         if expected_status:
-            gstate = (await client.get_goal(ctx)).get("goal") or {}
-            actual = gstate.get("status")
-            if actual != expected_status:
+            goal_resp = await client.get_goal(ctx)
+            gstate = goal_resp.get("goal")
+            if not isinstance(gstate, dict):
+                # Fail loudly on a missing/empty goal record instead of letting
+                # a None status quietly mismatch — surfaces a backend/shape
+                # divergence rather than masking it.
+                problems.append(f"expected goal status {expected_status!r} but no goal state returned (resp={goal_resp})")
+            elif gstate.get("status") != expected_status:
                 problems.append(
-                    f"goal status={actual!r} expected {expected_status!r} "
+                    f"goal status={gstate.get('status')!r} expected {expected_status!r} "
                     f"(iter={gstate.get('iteration')}, reason={str(gstate.get('last_reason',''))[:80]!r})"
                 )
 
