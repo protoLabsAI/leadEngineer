@@ -212,6 +212,14 @@ h2 {
   grid-template-rows: auto minmax(0, 1fr);
 }
 
+.notes-panel {
+  grid-template-rows: auto auto auto minmax(0, 1fr);
+}
+
+.beads-panel {
+  grid-template-rows: auto auto minmax(0, 1fr);
+}
+
 .panel-header {
   min-height: 52px;
   display: flex;
@@ -690,6 +698,54 @@ textarea {
   padding: 12px;
 }
 
+.notes-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.notes-tabbar {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.notes-tabbar button {
+  max-width: 140px;
+  height: 28px;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--fg-muted);
+  padding: 0 9px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.notes-tabbar button.active,
+.notes-tabbar button:hover {
+  border-color: var(--border);
+  background: var(--bg-hover);
+  color: var(--fg);
+}
+
+.notes-meta {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 8px;
+  align-items: center;
+  padding: 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.notes-meta input {
+  height: 32px;
+}
+
 .issue-create {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -970,6 +1026,7 @@ textarea {
   .subagent-grid,
   .batch-task-fields,
   .issue-create,
+  .notes-meta,
   .setup-grid.two,
   .setup-grid.three,
   .setup-grid.model-row {

@@ -47,6 +47,23 @@ function createBatchTask(type = "researcher"): BatchTask {
   };
 }
 
+function createNoteTab() {
+  const now = Date.now();
+  const id = `note-${now}-${Math.random().toString(36).slice(2, 8)}`;
+  return {
+    id,
+    name: "Notes",
+    content: "",
+    permissions: { agentRead: true, agentWrite: true },
+    metadata: {
+      createdAt: now,
+      updatedAt: now,
+      wordCount: 0,
+      characterCount: 0,
+    },
+  };
+}
+
 function useLocalStorageState(key: string, fallback: string) {
   const [value, setValue] = useState(() => {
     try {
@@ -98,6 +115,7 @@ export function App() {
   const [subagentBusy, setSubagentBusy] = useState(false);
 
   const [notesBusy, setNotesBusy] = useState(false);
+  const [notesDirty, setNotesDirty] = useState(false);
   const [issueDraft, setIssueDraft] = useState("");
   const [beadsBusy, setBeadsBusy] = useState(false);
 
@@ -122,6 +140,7 @@ export function App() {
       api.beadsStatus(path),
     ]);
     setWorkspace(notesPayload.workspace);
+    setNotesDirty(false);
     setBeadsReady(beadsStatus.initialized);
     if (beadsStatus.initialized) {
       const issuesPayload = await api.beadsIssues(path);
@@ -147,6 +166,14 @@ export function App() {
   useEffect(() => {
     void refreshAll();
   }, []);
+
+  useEffect(() => {
+    if (!notesDirty || !workspace || !projectPath.trim()) return;
+    const handle = window.setTimeout(() => {
+      void saveWorkspaceSnapshot(workspace, { quiet: true });
+    }, 800);
+    return () => window.clearTimeout(handle);
+  }, [notesBusy, notesDirty, projectPath, workspace]);
 
   async function runSubagent() {
     const prompt = subagentPrompt.trim();
@@ -209,7 +236,12 @@ export function App() {
     }
   }
 
-  async function saveActiveNote(content: string) {
+  function updateWorkspace(nextWorkspace: NotesWorkspace) {
+    setWorkspace(nextWorkspace);
+    setNotesDirty(true);
+  }
+
+  function saveActiveNote(content: string) {
     if (!workspace || !activeTab || !projectPath.trim()) return;
     const nextWorkspace: NotesWorkspace = {
       ...workspace,
@@ -228,20 +260,87 @@ export function App() {
         },
       },
     };
-    setWorkspace(nextWorkspace);
+    updateWorkspace(nextWorkspace);
   }
 
-  async function persistNotes() {
-    if (!workspace || !projectPath.trim() || notesBusy) return;
+  async function saveWorkspaceSnapshot(
+    snapshot: NotesWorkspace,
+    options: { quiet?: boolean } = {},
+  ) {
+    if (!projectPath.trim() || notesBusy) return;
     setNotesBusy(true);
-    setError("");
+    if (!options.quiet) setError("");
     try {
-      await api.saveNotes(projectPath, workspace);
+      await api.saveNotes(projectPath, snapshot);
+      setNotesDirty(false);
     } catch (exc) {
       setError(exc instanceof Error ? exc.message : String(exc));
     } finally {
       setNotesBusy(false);
     }
+  }
+
+  async function persistNotes() {
+    if (!workspace) return;
+    await saveWorkspaceSnapshot(workspace);
+  }
+
+  function createNote() {
+    if (!workspace) return;
+    const tab = createNoteTab();
+    updateWorkspace({
+      ...workspace,
+      workspaceVersion: workspace.workspaceVersion + 1,
+      activeTabId: tab.id,
+      tabOrder: [...workspace.tabOrder, tab.id],
+      tabs: { ...workspace.tabs, [tab.id]: tab },
+    });
+  }
+
+  function deleteActiveNote() {
+    if (!workspace || workspace.tabOrder.length <= 1) return;
+    const nextOrder = workspace.tabOrder.filter((id) => id !== workspace.activeTabId);
+    const nextTabs = { ...workspace.tabs };
+    delete nextTabs[workspace.activeTabId];
+    updateWorkspace({
+      ...workspace,
+      workspaceVersion: workspace.workspaceVersion + 1,
+      activeTabId: nextOrder[0],
+      tabOrder: nextOrder,
+      tabs: nextTabs,
+    });
+  }
+
+  function renameActiveNote(name: string) {
+    if (!workspace || !activeTab) return;
+    updateWorkspace({
+      ...workspace,
+      workspaceVersion: workspace.workspaceVersion + 1,
+      tabs: {
+        ...workspace.tabs,
+        [activeTab.id]: {
+          ...activeTab,
+          name,
+          metadata: { ...activeTab.metadata, updatedAt: Date.now() },
+        },
+      },
+    });
+  }
+
+  function toggleActiveNotePermission(permission: "agentRead" | "agentWrite", value: boolean) {
+    if (!workspace || !activeTab) return;
+    updateWorkspace({
+      ...workspace,
+      workspaceVersion: workspace.workspaceVersion + 1,
+      tabs: {
+        ...workspace.tabs,
+        [activeTab.id]: {
+          ...activeTab,
+          permissions: { ...activeTab.permissions, [permission]: value },
+          metadata: { ...activeTab.metadata, updatedAt: Date.now() },
+        },
+      },
+    });
   }
 
   async function initBeads() {
@@ -513,20 +612,69 @@ export function App() {
           </div>
 
           {rightPanel === "notes" ? (
-            <section className="panel side-panel">
+            <section className="panel side-panel notes-panel">
               <div className="panel-header compact">
                 <div>
                   <h2>{activeTab?.name || "Notes"}</h2>
-                  <p className="panel-kicker">{workspace ? `${workspace.tabOrder.length} tab` : "not loaded"}</p>
+                  <p className="panel-kicker">
+                    {workspace ? `${workspace.tabOrder.length} tab${workspace.tabOrder.length === 1 ? "" : "s"}${notesDirty ? " • unsaved" : ""}` : "not loaded"}
+                  </p>
                 </div>
-                <button className="icon-button" type="button" onClick={() => void persistNotes()} disabled={!workspace || notesBusy} title="Save notes">
-                  {notesBusy ? <Loader2 className="spin" size={16} /> : <Save size={16} />}
-                </button>
+                <div className="notes-actions">
+                  <button className="icon-button" type="button" onClick={createNote} disabled={!workspace} title="New note">
+                    <Plus size={16} />
+                  </button>
+                  <button className="icon-button" type="button" onClick={deleteActiveNote} disabled={!workspace || workspace.tabOrder.length <= 1} title="Delete note">
+                    <Trash2 size={16} />
+                  </button>
+                  <button className="icon-button" type="button" onClick={() => void persistNotes()} disabled={!workspace || notesBusy} title="Save notes">
+                    {notesBusy ? <Loader2 className="spin" size={16} /> : <Save size={16} />}
+                  </button>
+                </div>
               </div>
+              {workspace ? (
+                <div className="notes-tabbar">
+                  {workspace.tabOrder.map((tabId) => {
+                    const tab = workspace.tabs[tabId];
+                    if (!tab) return null;
+                    const active = tab.id === workspace.activeTabId;
+                    return (
+                      <button className={active ? "active" : ""} type="button" key={tab.id} onClick={() => updateWorkspace({ ...workspace, activeTabId: tab.id })}>
+                        {tab.name || "Notes"}
+                      </button>
+                    );
+                  })}
+                </div>
+              ) : null}
+              {activeTab ? (
+                <div className="notes-meta">
+                  <input
+                    value={activeTab.name}
+                    onChange={(event) => renameActiveNote(event.target.value)}
+                    aria-label="Note name"
+                  />
+                  <label className="checkbox-field">
+                    <input
+                      type="checkbox"
+                      checked={activeTab.permissions.agentRead}
+                      onChange={(event) => toggleActiveNotePermission("agentRead", event.target.checked)}
+                    />
+                    <span>Agent read</span>
+                  </label>
+                  <label className="checkbox-field">
+                    <input
+                      type="checkbox"
+                      checked={activeTab.permissions.agentWrite}
+                      onChange={(event) => toggleActiveNotePermission("agentWrite", event.target.checked)}
+                    />
+                    <span>Agent write</span>
+                  </label>
+                </div>
+              ) : null}
               <textarea
                 className="notes-editor"
                 value={activeTab?.content || ""}
-                onChange={(event) => void saveActiveNote(event.target.value)}
+                onChange={(event) => saveActiveNote(event.target.value)}
                 placeholder="Project notes"
                 disabled={!workspace}
               />
@@ -534,7 +682,7 @@ export function App() {
           ) : null}
 
           {rightPanel === "beads" ? (
-            <section className="panel side-panel">
+            <section className="panel side-panel beads-panel">
               <div className="panel-header compact">
                 <div>
                   <h2>Beads</h2>
