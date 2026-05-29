@@ -658,15 +658,15 @@ textarea {
 }
 
 .metric {
-  min-height: 56px;
+  min-height: 40px;
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
   grid-template-rows: auto auto;
   align-content: center;
   column-gap: 8px;
-  row-gap: 2px;
+  row-gap: 0;
   background: var(--bg-panel);
-  padding: 10px 12px;
+  padding: 6px 12px;
 }
 
 .metric svg {
@@ -1257,7 +1257,7 @@ textarea {
   }
 
   .metric-grid {
-    grid-template-columns: 1fr;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .message {
