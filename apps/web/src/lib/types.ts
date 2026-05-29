@@ -82,3 +82,53 @@ export type BeadsIssue = {
   type?: string;
   assignee?: string;
 };
+
+export type AgentConfig = {
+  model: {
+    provider: string;
+    name: string;
+    api_base: string;
+    api_key?: string;
+    temperature: number;
+    max_tokens: number;
+    max_iterations: number;
+  };
+  subagents: {
+    researcher: {
+      enabled: boolean;
+      tools: string[];
+      max_turns: number;
+    };
+  };
+  middleware: {
+    knowledge: boolean;
+    audit: boolean;
+    memory: boolean;
+    scheduler: boolean;
+  };
+  knowledge: {
+    db_path: string;
+    embed_model: string;
+    top_k: number;
+  };
+  identity: {
+    name: string;
+    operator: string;
+  };
+  auth: {
+    token: string;
+  };
+  runtime: {
+    autostart_on_boot: boolean;
+  };
+};
+
+export type ConfigPayload = {
+  config: AgentConfig;
+  soul: string;
+};
+
+export type SetupStatus = {
+  setup_complete: boolean;
+  presets: string[];
+};

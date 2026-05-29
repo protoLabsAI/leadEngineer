@@ -1,4 +1,13 @@
-import type { BeadsIssue, ChatMessage, NotesWorkspace, RuntimeStatus, Subagent } from "./types";
+import type {
+  AgentConfig,
+  BeadsIssue,
+  ChatMessage,
+  ConfigPayload,
+  NotesWorkspace,
+  RuntimeStatus,
+  SetupStatus,
+  Subagent,
+} from "./types";
 
 type RequestOptions = Omit<RequestInit, "body"> & {
   body?: unknown;
@@ -35,6 +44,32 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
 export const api = {
   runtimeStatus() {
     return request<RuntimeStatus>("/api/runtime/status");
+  },
+
+  setupStatus() {
+    return request<SetupStatus>("/api/config/setup-status");
+  },
+
+  config() {
+    return request<ConfigPayload>("/api/config");
+  },
+
+  soulPreset(name: string) {
+    return request<{ name: string; content: string }>(`/api/config/presets/${encodeURIComponent(name)}`);
+  },
+
+  models(apiBase: string, apiKey: string) {
+    return request<{ models: string[]; error: string }>("/api/config/models", {
+      method: "POST",
+      body: { api_base: apiBase, api_key: apiKey },
+    });
+  },
+
+  finishSetup(config: Partial<AgentConfig>, soul: string) {
+    return request<{ ok: boolean; message: string }>("/api/config/setup", {
+      method: "POST",
+      body: { config, soul },
+    });
   },
 
   subagents() {

@@ -18,9 +18,11 @@ import {
   TerminalSquare,
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
+import type { ReactNode } from "react";
 
 import { api } from "../lib/api";
 import type { BeadsIssue, ChatMessage, NotesWorkspace, RuntimeStatus, Subagent } from "../lib/types";
+import { SetupWizard } from "../setup/SetupWizard";
 
 type Surface = "chat" | "subagents" | "runtime";
 type RightPanel = "notes" | "beads";
@@ -547,6 +549,12 @@ export function App() {
           ) : null}
         </aside>
       </div>
+      <SetupWizard
+        open={runtime?.setup_complete === false}
+        projectPath={projectPath}
+        onProjectPathChange={setProjectPath}
+        onFinished={() => void refreshAll()}
+      />
     </div>
   );
 }
@@ -563,7 +571,7 @@ function RailButton({
 }: {
   active: boolean;
   label: string;
-  icon: React.ReactNode;
+  icon: ReactNode;
   onClick: () => void;
 }) {
   return (
@@ -574,7 +582,7 @@ function RailButton({
   );
 }
 
-function Metric({ icon, label, value }: { icon: React.ReactNode; label: string; value: string }) {
+function Metric({ icon, label, value }: { icon: ReactNode; label: string; value: string }) {
   return (
     <div className="metric">
       {icon}
