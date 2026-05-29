@@ -513,6 +513,43 @@ textarea {
   padding: 12px;
 }
 
+.subagent-mode {
+  margin: 12px 12px 0;
+}
+
+.batch-task-list {
+  min-height: 0;
+  display: grid;
+  gap: 10px;
+  overflow: auto;
+  padding: 0 12px;
+}
+
+.batch-task-row {
+  display: grid;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px;
+}
+
+.batch-task-header {
+  min-height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--fg-muted);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.batch-task-fields {
+  display: grid;
+  grid-template-columns: 180px minmax(0, 1fr);
+  gap: 10px;
+}
+
 .checkbox-field {
   height: 34px;
   align-self: end;
@@ -931,6 +968,7 @@ textarea {
 
   .composer,
   .subagent-grid,
+  .batch-task-fields,
   .issue-create,
   .setup-grid.two,
   .setup-grid.three,

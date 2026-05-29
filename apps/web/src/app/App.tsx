@@ -10,10 +10,12 @@ import {
   MessageSquare,
   Network,
   Play,
+  Plus,
   RefreshCw,
   Save,
   Settings2,
   Sparkles,
+  Trash2,
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
@@ -25,8 +27,25 @@ import { SetupWizard } from "../setup/SetupWizard";
 
 type Surface = "chat" | "subagents" | "runtime";
 type RightPanel = "notes" | "beads";
+type SubagentMode = "single" | "batch";
+
+type BatchTask = {
+  id: string;
+  type: string;
+  description: string;
+  prompt: string;
+};
 
 const sessionId = "operator-default";
+
+function createBatchTask(type = "researcher"): BatchTask {
+  return {
+    id: `batch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    type,
+    description: "",
+    prompt: "",
+  };
+}
 
 function useLocalStorageState(key: string, fallback: string) {
   const [value, setValue] = useState(() => {
@@ -70,8 +89,10 @@ export function App() {
   const [error, setError] = useState("");
 
   const [subagentType, setSubagentType] = useState("researcher");
+  const [subagentMode, setSubagentMode] = useState<SubagentMode>("single");
   const [subagentDescription, setSubagentDescription] = useState("");
   const [subagentPrompt, setSubagentPrompt] = useState("");
+  const [batchTasks, setBatchTasks] = useState<BatchTask[]>(() => [createBatchTask()]);
   const [emitSkill, setEmitSkill] = useState(false);
   const [subagentOutput, setSubagentOutput] = useState("");
   const [subagentBusy, setSubagentBusy] = useState(false);
@@ -129,24 +150,49 @@ export function App() {
 
   async function runSubagent() {
     const prompt = subagentPrompt.trim();
-    if (!prompt || subagentBusy) return;
+    const runnableBatchTasks = batchTasks.filter((task) => task.prompt.trim());
+    if (subagentBusy) return;
+    if (subagentMode === "single" && !prompt) return;
+    if (subagentMode === "batch" && runnableBatchTasks.length === 0) return;
     setSubagentBusy(true);
     setError("");
     setSubagentOutput("");
     try {
-      const response = await api.runSubagent({
-        session_id: sessionId,
-        type: subagentType,
-        description: subagentDescription.trim(),
-        prompt,
-        emit_skill: emitSkill,
-      });
+      const response = subagentMode === "single"
+        ? await api.runSubagent({
+            session_id: sessionId,
+            type: subagentType,
+            description: subagentDescription.trim(),
+            prompt,
+            emit_skill: emitSkill,
+          })
+        : await api.runSubagentBatch({
+            session_id: sessionId,
+            tasks: runnableBatchTasks.map((task) => ({
+              type: task.type,
+              description: task.description.trim(),
+              prompt: task.prompt.trim(),
+              emit_skill: emitSkill,
+            })),
+          });
       setSubagentOutput(response.output);
     } catch (exc) {
       setError(exc instanceof Error ? exc.message : String(exc));
     } finally {
       setSubagentBusy(false);
     }
+  }
+
+  function updateBatchTask(id: string, patch: Partial<BatchTask>) {
+    setBatchTasks((tasks) => tasks.map((task) => (task.id === id ? { ...task, ...patch } : task)));
+  }
+
+  function addBatchTask() {
+    setBatchTasks((tasks) => [...tasks, createBatchTask(subagentType)]);
+  }
+
+  function removeBatchTask(id: string) {
+    setBatchTasks((tasks) => (tasks.length > 1 ? tasks.filter((task) => task.id !== id) : tasks));
   }
 
   async function loadProject() {
@@ -302,6 +348,14 @@ export function App() {
                 </div>
                 <StatusPill label={subagentBusy ? "running" : "ready"} tone={subagentBusy ? "warning" : "muted"} />
               </div>
+              <div className="subagent-mode segmented">
+                <button type="button" className={subagentMode === "single" ? "active" : ""} onClick={() => setSubagentMode("single")}>
+                  Single
+                </button>
+                <button type="button" className={subagentMode === "batch" ? "active" : ""} onClick={() => setSubagentMode("batch")}>
+                  Batch
+                </button>
+              </div>
               <div className="subagent-grid">
                 <label className="field">
                   <span>Type</span>
@@ -330,19 +384,68 @@ export function App() {
                   <span>Emit skill</span>
                 </label>
               </div>
-              <label className="field grow">
-                <span>Prompt</span>
-                <textarea
-                  value={subagentPrompt}
-                  onChange={(event) => setSubagentPrompt(event.target.value)}
-                  placeholder="Subagent instructions"
-                  rows={8}
-                />
-              </label>
+              {subagentMode === "single" ? (
+                <label className="field grow">
+                  <span>Prompt</span>
+                  <textarea
+                    value={subagentPrompt}
+                    onChange={(event) => setSubagentPrompt(event.target.value)}
+                    placeholder="Subagent instructions"
+                    rows={8}
+                  />
+                </label>
+              ) : (
+                <div className="batch-task-list">
+                  {batchTasks.map((task, index) => (
+                    <div className="batch-task-row" key={task.id}>
+                      <div className="batch-task-header">
+                        <span>Task {index + 1}</span>
+                        <button className="icon-button" type="button" onClick={() => removeBatchTask(task.id)} disabled={batchTasks.length === 1} title="Remove task">
+                          <Trash2 size={15} />
+                        </button>
+                      </div>
+                      <div className="batch-task-fields">
+                        <label className="field">
+                          <span>Type</span>
+                          <select value={task.type} onChange={(event) => updateBatchTask(task.id, { type: event.target.value })}>
+                            {subagents.map((subagent) => (
+                              <option key={subagent.name} value={subagent.name}>
+                                {subagent.name}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <label className="field">
+                          <span>Description</span>
+                          <input value={task.description} onChange={(event) => updateBatchTask(task.id, { description: event.target.value })} placeholder="Task label" />
+                        </label>
+                      </div>
+                      <label className="field">
+                        <span>Prompt</span>
+                        <textarea value={task.prompt} onChange={(event) => updateBatchTask(task.id, { prompt: event.target.value })} rows={4} />
+                      </label>
+                    </div>
+                  ))}
+                </div>
+              )}
               <div className="panel-actions">
-                <button className="primary-button" type="button" onClick={() => void runSubagent()} disabled={!subagentPrompt.trim() || subagentBusy}>
+                {subagentMode === "batch" ? (
+                  <button className="secondary-button" type="button" onClick={addBatchTask}>
+                    <Plus size={15} />
+                    Add task
+                  </button>
+                ) : null}
+                <button
+                  className="primary-button"
+                  type="button"
+                  onClick={() => void runSubagent()}
+                  disabled={
+                    subagentBusy ||
+                    (subagentMode === "single" ? !subagentPrompt.trim() : !batchTasks.some((task) => task.prompt.trim()))
+                  }
+                >
                   {subagentBusy ? <Loader2 className="spin" size={16} /> : <Play size={16} />}
-                  Run
+                  {subagentMode === "single" ? "Run" : "Run batch"}
                 </button>
               </div>
               {subagentOutput ? <pre className="output-block">{subagentOutput}</pre> : null}

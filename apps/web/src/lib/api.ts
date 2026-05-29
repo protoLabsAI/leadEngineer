@@ -165,6 +165,22 @@ export const api = {
     });
   },
 
+  runSubagentBatch(body: {
+    session_id: string;
+    tasks: Array<{
+      type?: string;
+      subagent_type?: string;
+      description: string;
+      prompt: string;
+      emit_skill: boolean;
+    }>;
+  }) {
+    return request<{ ok: boolean; session_id: string; output: string }>("/api/subagents/batch", {
+      method: "POST",
+      body,
+    });
+  },
+
   chat(message: string, sessionId: string) {
     return request<{ response: string; messages: ChatMessage[] }>("/api/chat", {
       method: "POST",
