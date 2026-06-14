@@ -323,11 +323,16 @@ export type BackgroundJobDTO = {
   completed_at?: string;
 };
 
+// A renderable UI component (ADR 0051 Slice 2) carried on a component-v1 DataPart and
+// rendered inline by the curated chat component registry.
+export type ComponentSpec = { component: string; props: Record<string, unknown> };
+
 export type ChatMessage = {
   id?: string;
   role: "user" | "assistant" | "system";
   content: string;
   toolCalls?: ToolCall[];
+  components?: ComponentSpec[];
   /** Streamed scratch_pad reasoning ("thinking") — rendered as a collapsible block
    *  above the answer; never part of `content`. */
   reasoning?: string;

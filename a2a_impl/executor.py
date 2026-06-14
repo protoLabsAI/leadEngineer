@@ -57,6 +57,11 @@ HITL_MIME = "application/vnd.protolabs.hitl-v1+json"
 # collapsible reasoning view. Plain consumers ignore it.
 REASONING_MIME = "application/vnd.protolabs.reasoning-v1+json"
 
+# A renderable UI component (ADR 0051 Slice 2) — a typed, data-only widget the console
+# renders inline ({component, props}). Same DataPart contract as the HITL/tool-call parts.
+from graph.components import COMPONENT_MIME  # noqa: E402
+
+
 @dataclass
 class TurnOutcome:
     """Everything a host needs at the end of an A2A turn (ADR 0003 / 0006).
@@ -343,6 +348,18 @@ class ProtoAgentExecutor(AgentExecutor):
                     if isinstance(payload, dict):
                         _notify_progress(
                             context.context_id, context.task_id, {"phase": event_type, **payload}
+                        )
+
+                elif event_type == "component":
+                    # A renderable UI component (ADR 0051 Slice 2) — emit it as a
+                    # component-v1 DataPart on a working frame so the console renders it
+                    # inline immediately.
+                    if isinstance(payload, dict):
+                        await updater.update_status(
+                            TaskState.TASK_STATE_WORKING,
+                            message=updater.new_agent_message(
+                                [_data_part_proto(payload, COMPONENT_MIME)]
+                            ),
                         )
 
                 elif event_type == "reasoning":
