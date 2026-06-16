@@ -12,7 +12,10 @@ from operator_api.routes import register_operator_routes
 
 def test_notify_terminal_invokes_hook_and_is_exception_safe():
     outcome = TurnOutcome(
-        task_id="t1", context_id="system:activity", state="completed", text="hi",
+        task_id="t1",
+        context_id="system:activity",
+        state="completed",
+        text="hi",
     )
     seen = []
     prior = executor._ON_TERMINAL[0]
@@ -78,3 +81,62 @@ def test_activity_route_absent_without_callback():
 
 async def _unused(*_a, **_k):  # pragma: no cover - placeholder callable
     return ""
+
+
+# ── ActivityLog.prune ────────────────────────────────────────────────────────
+
+from datetime import UTC, datetime
+
+from activity.store import ActivityLog
+
+
+def _activity_log(tmp_path):
+    return ActivityLog(str(tmp_path / "activity.db"))
+
+
+def test_prune_activity_removes_old(tmp_path):
+    """Entries older than keep_days are deleted; recent ones survive."""
+    al = _activity_log(tmp_path)
+    now = datetime(2024, 3, 1, tzinfo=UTC)
+    old = datetime(2024, 1, 1, tzinfo=UTC)
+
+    # Directly insert rows with controlled timestamps via raw SQL so we
+    # can set created_at to an old date (ActivityLog.add always uses _now_iso).
+    import sqlite3
+
+    db = sqlite3.connect(str(tmp_path / "activity.db"))
+    db.execute(
+        "INSERT INTO activity (created_at, context_id, origin, text) VALUES (?, ?, ?, ?)",
+        (old.isoformat(), "ctx-old", "test", "old entry"),
+    )
+    db.execute(
+        "INSERT INTO activity (created_at, context_id, origin, text) VALUES (?, ?, ?, ?)",
+        (now.isoformat(), "ctx-new", "test", "recent entry"),
+    )
+    db.commit()
+    db.close()
+
+    removed = al.prune(keep_days=30, now=now)
+    assert removed == 1
+    remaining = al.recent(limit=10)
+    assert len(remaining) == 1
+    assert remaining[0]["text"] == "recent entry"
+
+
+def test_prune_activity_keep_all_zero(tmp_path):
+    """keep_days=0 removes nothing (keep forever)."""
+    al = _activity_log(tmp_path)
+
+    import sqlite3
+
+    db = sqlite3.connect(str(tmp_path / "activity.db"))
+    db.execute(
+        "INSERT INTO activity (created_at, context_id, origin, text) VALUES (?, ?, ?, ?)",
+        (datetime(2020, 1, 1, tzinfo=UTC).isoformat(), "ctx", "test", "ancient"),
+    )
+    db.commit()
+    db.close()
+
+    removed = al.prune(keep_days=0, now=datetime(2026, 1, 1, tzinfo=UTC))
+    assert removed == 0
+    assert len(al.recent(limit=10)) == 1
