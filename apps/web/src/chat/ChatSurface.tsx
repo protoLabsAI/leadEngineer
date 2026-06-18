@@ -28,7 +28,13 @@ import { ConfirmDialog } from "@protolabsai/ui/overlays";
 import type { ChatMessage, HitlPayload, SlashCommand, ToolCall } from "../lib/types";
 import { HitlForm } from "./HitlForm";
 import { notifyIfHidden } from "../lib/notify";
-import { chatStore, useChatState } from "./chat-store";
+import {
+  chatStore,
+  useChatState,
+  DEFAULT_REASONING_EFFORT,
+  REASONING_EFFORTS,
+  effectiveReasoningEffort,
+} from "./chat-store";
 import { ChatComponent } from "./ChatComponent";
 import { ComposerModelSelect } from "./ComposerModelSelect";
 import { Markdown } from "./LazyMarkdown";
@@ -160,6 +166,7 @@ export function ChatSurface({
             key={sessionId}
             sessionId={sessionId}
             visible={sessionId === currentSession?.id}
+            surfaceActive={active}
             onError={onError}
           />
         ))}
@@ -201,10 +208,14 @@ export function ChatSurface({
 function ChatSessionSlot({
   sessionId,
   visible,
+  surfaceActive,
   onError,
 }: {
   sessionId: string;
   visible: boolean;
+  // The chat SURFACE is the active rail surface (not just: this is the active session
+  // tab). Both must be true for the composer to grab focus.
+  surfaceActive: boolean;
   onError: (message: string) => void;
 }) {
   const session = useSession(sessionId);
@@ -228,11 +239,13 @@ function ChatSessionSlot({
   // Forwarded into the DS PromptInput (inputRef) — for slash-completion focus and
   // the Ctrl/⌘+Enter caret insert. The DS component owns the auto-grow.
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
-  // Autofocus the composer when this session becomes the visible one, so you can type
-  // immediately on open / tab-switch — the field doesn't grab focus on its own.
+  // Autofocus the composer when this becomes the active session AND the chat surface is
+  // the active rail surface — so clicking the Chat rail item (or switching tabs) lands
+  // focus in the composer without a click. (`visible` alone is the active tab, which
+  // doesn't change when you switch INTO the chat surface from another rail item.)
   useEffect(() => {
-    if (visible) textareaRef.current?.focus();
-  }, [visible]);
+    if (visible && surfaceActive) textareaRef.current?.focus();
+  }, [visible, surfaceActive]);
   const status = chat.sessionStatusMap[sessionId] || "idle";
 
   // Pending file attachments. Each is uploaded to /api/knowledge/attach on pick;
@@ -309,7 +322,14 @@ function ChatSessionSlot({
   const slashMatches = useMemo(() => {
     if (slashQuery === null) return [];
     const q = slashQuery.toLowerCase();
-    return commands.filter(
+    // Deterministic client-side commands (ADR 0057) surface first, then server skills.
+    const all: SlashCommand[] = [
+      { name: "new", description: "Open a new chat tab" },
+      { name: "clear", description: "Clear this chat's history" },
+      { name: "effort", description: "Reasoning effort: low | medium | high | max | off" },
+      ...commands,
+    ];
+    return all.filter(
       (c) => !q || c.name.toLowerCase().includes(q) || c.description.toLowerCase().includes(q),
     );
   }, [slashQuery, commands]);
@@ -317,7 +337,62 @@ function ChatSessionSlot({
   const slashActive = slashMatches.length > 0;
   const slashSel = slashActive ? Math.min(slashIndex, slashMatches.length - 1) : 0;
 
+  // A local-only system note in the thread (e.g. /effort confirmation) — never sent
+  // to the agent, just shown so the operator sees the command took effect.
+  function noteToThread(text: string) {
+    if (!session) return;
+    const base = chatStore.getSnapshot().sessions.find((s) => s.id === session.id)?.messages ?? [];
+    chatStore.updateMessages(session.id, [
+      ...base,
+      { id: messageId(), role: "assistant", content: text, createdAt: Date.now(), status: "done" },
+    ]);
+  }
+
+  // Deterministic client-side commands (ADR 0057) — run locally, never sent to the
+  // agent. `/new` opens + focuses a fresh tab; `/clear` wipes THIS tab's history
+  // (server checkpoint + transcript), keeping the tab; `/effort <level>` sets this
+  // tab's reasoning effort (sent with each turn). `raw` is the command minus the
+  // slash, e.g. "effort high". Returns true if handled.
+  function runClientSlash(raw: string): boolean {
+    const [verb, ...rest] = raw.split(/\s+/);
+    const arg = rest.join(" ").trim().toLowerCase();
+    if (verb === "new") {
+      chatStore.createSession();
+      textareaRef.current?.focus();
+      return true;
+    }
+    if (verb === "clear" && session) {
+      void api.deleteChatSession(session.id, false).catch(() => {});
+      chatStore.updateMessages(session.id, []);
+      textareaRef.current?.focus();
+      return true;
+    }
+    if (verb === "effort" && session) {
+      const opts = REASONING_EFFORTS.join(" · ");
+      if (!arg) {
+        const cur = session.reasoningEffort ?? `${DEFAULT_REASONING_EFFORT} (default)`;
+        noteToThread(`⚙ Reasoning effort: **${cur}**. Set it with \`/effort ${REASONING_EFFORTS.join("|")}\`.`);
+      } else if ((REASONING_EFFORTS as readonly string[]).includes(arg)) {
+        chatStore.setSessionReasoningEffort(session.id, arg);
+        const off = arg === "off" ? " — reasoning disabled for this tab" : "";
+        noteToThread(`⚙ Reasoning effort set to **${arg}**${off}. Applies to the next message.`);
+      } else {
+        noteToThread(`⚠ Unknown effort \`${arg}\`. Options: ${opts}.`);
+      }
+      textareaRef.current?.focus();
+      return true;
+    }
+    return false;
+  }
+
   function completeCommand(cmd: SlashCommand) {
+    // A client command runs on pick; a server skill fills the draft to edit + send.
+    if (runClientSlash(cmd.name)) {
+      setDraft("");
+      setSlashIndex(0);
+      setSlashDismissed(true);
+      return;
+    }
     setDraft(`/${cmd.name} `);
     setSlashIndex(0);
     setSlashDismissed(true); // a space follows, so it would close anyway
@@ -447,6 +522,8 @@ function ChatSessionSlot({
     if (!session || !canSend) return;
     const text = draft.trim();
     setDraft("");
+    // Deterministic client-side slash commands (ADR 0057) — handled locally, not sent.
+    if (text.startsWith("/") && runClientSlash(text.slice(1).trim())) return;
     // Native-vision images ride the turn as multimodal parts; pipeline attachments
     // contribute a prepended context block.
     const nativeImgs = attachments.filter((a) => a.status === "ready" && a.native && a.b64);
@@ -845,7 +922,7 @@ function ChatSessionSlot({
             }),
           );
         },
-      }, { images: opts.images, model: session.model });
+      }, { images: opts.images, model: session.model, reasoningEffort: effectiveReasoningEffort(session) });
       chatStore.setSessionStatus(session.id, "idle");
       setStatusMessage("idle");
       void reconcileSteer();

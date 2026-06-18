@@ -81,7 +81,6 @@ import { useAnyChatStreaming } from "../chat/chat-store";
 import { KnowledgeStore } from "../knowledge/KnowledgeStore";
 import { SettingsSurface } from "../settings/SettingsSurface";
 import { SettingsOverlay } from "../settings/SettingsOverlay";
-import { HamburgerMenu } from "./HamburgerMenu";
 import { FleetSwitcher } from "./FleetSwitcher";
 import {
   useUI,
@@ -94,6 +93,7 @@ import { api, apiUrl, authToken, is401 } from "../lib/api";
 import { PluginView, consoleTheme } from "./PluginView";
 import { AppShell, Header, UtilityBar } from "@protolabsai/ui/app-shell";
 import { CommandPalette, usePaletteHotkey } from "@protolabsai/ui/command-palette";
+import type { PaletteView } from "@protolabsai/ui/command-palette";
 import { Alert } from "@protolabsai/ui/data";
 import { Logo } from "@protolabsai/ui/primitives";
 import { useIsMobile } from "../lib/useIsMobile";
@@ -114,7 +114,7 @@ import { SetupWizard } from "../setup/SetupWizard";
 import { hostRuntimeStatusQuery, runtimeStatusQuery } from "../lib/queries";
 import { buildViews } from "../lib/viewRegistry";
 import { usePaletteRegistry } from "./usePaletteRegistry";
-import { makeChatTransport } from "./paletteChat";
+import { PaletteChat } from "./PaletteChat";
 
 // Consolidated nav (heavy grouping): four rail surfaces, each grouped one
 // fanning out to sub-views via an in-surface segmented control.
@@ -483,6 +483,7 @@ export function App() {
   const CORE_SURFACES: { id: string; label: string; icon: ReactNode }[] = [
     { id: "chat", label: "Chat", icon: <MessageSquare size={18} /> },
     { id: "activity", label: "Activity", icon: <Activity size={18} /> },
+    { id: "schedule", label: "Schedule", icon: <CalendarClock size={18} /> },
     // "studio" (Workflows) is contributed via src/ext/workflows.tsx, gated on the
     // workflows plugin (lean core) — no longer a hardcoded core surface.
     { id: "knowledge", label: "Knowledge", icon: <BookMarked size={18} /> },
@@ -491,7 +492,6 @@ export function App() {
     { id: "settings", label: "Settings", icon: <Settings2 size={18} /> },
     { id: "beads", label: "Beads", icon: <Boxes size={18} /> },
     { id: "goals", label: "Goals", icon: <Target size={18} /> },
-    // "schedule" is now a tab inside the Activity surface (#1075), not a rail surface.
   ];
   // Surfaces for a rail side, in the user's order (railOrder, ADR 0036). Core AND plugin views are
   // first-class railOrder members — reconciled below — so all are reorderable/movable, including
@@ -557,9 +557,13 @@ export function App() {
   const paletteChat = useMemo(
     () => ({
       name: chatAgentName,
-      transport: makeChatTransport(chatAgentName),
       icon: <MessageSquare size={16} />,
-      greeting: `Ask ${chatAgentName} anything — a quick scratch chat (its own context).`,
+      view: {
+        id: "chat",
+        title: chatAgentName,
+        width: 620,
+        render: () => <PaletteChat agentName={chatAgentName} />,
+      } as PaletteView,
     }),
     [chatAgentName],
   );
@@ -572,16 +576,17 @@ export function App() {
       case "activity":
         return (
           <>
-            {/* Schedule is a third Activity tab (#1075): cron is a TRIGGER, so timed
-                turns belong alongside the thread + inbox triggers, not in their own rail. */}
             <Tabs responsive active={activityTab} onSelect={(t) => setActivityTab(t as ActivityTab)} items={[
               { id: "thread", label: "Thread", icon: Activity },
               { id: "inbox", label: "Inbox", icon: Inbox, badge: inboxUnread ? (<span data-testid="inbox-badge">{inboxUnread > 9 ? "9+" : inboxUnread}</span>) : null },
-              { id: "schedule", label: "Schedule", icon: CalendarClock },
             ].map(toTab)} />
-            {activityTab === "thread" ? <ActivitySurface onError={setError} /> : activityTab === "inbox" ? <InboxPanel /> : <SchedulePanel />}
+            {activityTab === "thread" ? <ActivitySurface onError={setError} /> : <InboxPanel />}
           </>
         );
+      // Schedule is its own rail surface again (un-fold from #1075): cron triggers, but
+      // timed work earns a top-level rail rather than a tab buried in Activity.
+      case "schedule":
+        return <SchedulePanel />;
       // The Agent surface folded into Settings ▸ Workspace (ADR 0048 S-C). Its tabs
       // (Identity/Settings/Tools/MCP/Subagents/Skills/Middleware) are now Workspace
       // sections in SettingsSurface.
@@ -795,12 +800,6 @@ export function App() {
           />
         }
         org={runtime?.identity?.org || "protoLabs.studio"}
-        actions={
-          // Always-on hamburger — the new home for global actions as Settings get
-          // rearranged app-wide. Replaces the old theme toggle + settings gear + status
-          // light (theme lives in Settings ▸ Appearance; Settings is also a rail surface).
-          <HamburgerMenu onOpenSettings={() => setSettingsOverlayOpen(true)} />
-        }
       />
       </div>
 
