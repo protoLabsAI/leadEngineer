@@ -3,6 +3,17 @@ import { expect, test } from "@playwright/test";
 // The Knowledge ▸ Playbooks surface (ADR 0009) browses the skill index:
 // pinned (SKILL.md) vs learned (agent-emitted), with search + delete-with-confirm.
 
+// The promote test MUTATES the shared mock (a skill flips private→commons) and a
+// commons skill is read-only under the CRUD editability gating, so its delete
+// affordance is gone. With fullyParallel the file's tests would otherwise run on
+// separate workers against the one mock process and stomp each other (the promote
+// leaks into the delete test). Run serially + reset the mock before every test —
+// same guard the fleet spec uses for its shared mutable state.
+test.describe.configure({ mode: "serial" });
+test.beforeEach(async ({ page }) => {
+  await page.request.post("/api/__test__/playbooks/reset");
+});
+
 test("Agent → Skills lists pinned + learned skills and supports search", async ({ page }) => {
   await page.goto("/app/", { waitUntil: "load" });
   await page.locator(".pl-rail").getByRole("button", { name: "Settings", exact: true }).click();
