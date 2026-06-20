@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.64.0] - 2026-06-20
+
 ### Added
 - **Quick-add for common MCP servers.** Settings ▸ MCP has a "Browse common servers"
   picker — a curated directory (filesystem, git, fetch, GitHub, Brave Search, memory,
@@ -23,6 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with one-click share / unshare, and a sharing-mode quick-set sits by the header. A
   shared server runs on every layered agent on the box, so it only adds servers you trust
   box-wide.
+
+### Changed
+- **Desktop in-app updater shows the curated changelog.** The updater's release notes now
+  come from the hand-written `CHANGELOG.md` section for the new version (the
+  `### Added/Changed/Fixed` markdown) instead of auto-generated commit subjects, falling
+  back gracefully when a section is empty. First applies to this release. (#1263)
 
 ## [0.63.1] - 2026-06-20
 
