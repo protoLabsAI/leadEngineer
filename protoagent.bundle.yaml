@@ -1,0 +1,51 @@
+# A protoAgent plugin BUNDLE (ADR 0040) — the Lead Engineer tier of the
+# portfolio→team hierarchy. This repo is the BUNDLE and its REFERENCE HOST: the
+# manifest pins the plugin set, config/SOUL.md gives it the tech-lead persona, and
+# config/coding/ enables it on the headless :7872 instance.
+#
+# Install (onto any host):  python -m server plugin install <this-repo-url>
+#
+# A Lead Engineer focuses on ONE repo and a set of coding agents. The Portfolio
+# Manager tier (portfolio plugin, ADR 0055) treats each Lead Engineer as a board it
+# can dispatch to over A2A and read back — so this bundle is deliberately the team
+# subset of the old pm-stack: project_board (runs the board + spawn loop) WITHOUT
+# portfolio (that's the manager-of-teams, a separate bundle).
+#
+# PIN LIFECYCLE (ADR 0049): members are pinned to release TAGS and only move through
+# a passing verify (scripts/ + .github/workflows/verify-bundle.yml install this
+# manifest into a scratch agent and probe every declared console view). Keep member
+# entries on ONE line — scripts/check_bundle_updates.py rewrites the `ref:` in place.
+
+id: lead-engineer
+name: Lead Engineer
+description: >-
+  A single-repo technical lead. It owns one codebase and a set of coding agents:
+  decomposes an idea into board features, dispatches a coder (`acp` delegate, e.g.
+  proto) into a disposable per-feature git worktree, opens a PR, and reports
+  completion as features merge to done. The project-team counterpart of the
+  Portfolio Manager (ADR 0055) — built to be delegated to, and to report back.
+  Composes the delegates spine + project_board (the board + spawn loop) + a browser
+  for verification. Portfolio orchestration is intentionally NOT bundled here.
+
+# The core version this exact pin set was last verified against (ADR 0049). The
+# verify workflow checks out this protoAgent ref for the smoke — bump on re-verify.
+verified_against: 0.66.0
+
+plugins:
+  - { id: delegates, builtin: true }                                                  # ACP/A2A spawn spine — ships with protoAgent
+  - { id: project_board, url: https://github.com/protoLabsAI/projectBoard-plugin,  ref: v0.19.0 }
+  - { id: agent_browser, url: https://github.com/protoLabsAI/agent-browser-plugin, ref: v0.5.1 }
+
+enabled: [delegates, project_board, agent_browser]   # suggested turn-on list (you apply it)
+config:                                              # recommended defaults (you apply them)
+  project_board:
+    coder: proto          # the acp delegate the board's spawn loop dispatches builds to
+  agent_browser:
+    panel_mode: full
+
+# Agent archetype (ADR 0042) — presents this bundle as a "Lead Engineer" agent type
+# in the new-agent picker. Additive metadata; it doesn't change the bundle shape.
+archetype:
+  label: Lead Engineer
+  icon: Wrench
+  blurb: Single-repo technical lead — decomposes work and ships it through coding agents, reporting back as it merges.

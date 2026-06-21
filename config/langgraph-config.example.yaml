@@ -286,3 +286,69 @@ fleet:
   warm:
     max: 0                  # warm-agent cap (0 = unlimited)
     grace_seconds: 0        # spare agents touched within N seconds from LRU eviction
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Lead Engineer configuration — this fork's identity.
+# This fork ships as a "Lead Engineer": a single-repo technical lead that
+# decomposes work and ships it through coding agents (see protoagent.bundle.yaml
+# + config/SOUL.md). The blocks below wire that up. BEFORE running:
+#   1. Replace every `REPLACE_ME` with your target repo (and `br init` it for the board).
+#   2. Install the bundle so project_board + agent_browser exist:
+#        python -m server plugin install <this-fork-url>
+#   3. For the Opus brain (agent_runtime: acp:claude): install + auth the `claude` CLI
+#      and the claude-agent-acp adapter, launch with CLAUDECODE/CLAUDE_CODE_* stripped
+#      and ANTHROPIC_MODEL=opus. Or set `agent_runtime: native` to run on the gateway.
+# ═════════════════════════════════════════════════════════════════════════════
+
+# A2A card name + metric prefix.
+identity:
+  name: engineering-team
+
+# Main brain runs NATIVELY on Claude Code over ACP (ADR 0033) for the best
+# planning/decomposition, instead of the LiteLLM gateway. Opus is pinned via
+# ANTHROPIC_MODEL=opus in the launch env (the acp.agents override carries only
+# command/args, not env). The gateway (model:) stays configured for aux calls
+# (compaction/goal-verify) + embeddings. Use `native` to run on the gateway.
+agent_runtime: acp:claude
+acp:
+  agents:
+    claude: { command: claude-agent-acp, args: [] }   # installed adapter (else npx default)
+
+# Lead Engineer bundle plugins (delegates is builtin; project_board + agent_browser
+# come from the bundle — install it, then they load).
+plugins:
+  enabled: [delegates, project_board, agent_browser]
+
+# Coding agents the board dispatches to (ACP). `proto` is the primary coder; the
+# board escalates to `opus` (Claude Code on Opus) on failure. The other four are
+# optional extra coding agents — uncomment to enable. Set `workdir` to YOUR repo.
+delegates:
+  - { name: proto, type: acp, command: proto,            args: ["--acp"], workdir: ~/dev/REPLACE_ME, permissions: auto }
+  - { name: opus,  type: acp, command: claude-agent-acp, args: [],        workdir: ~/dev/REPLACE_ME, permissions: auto }  # Opus via ANTHROPIC_MODEL
+  # - { name: codex,    type: acp, command: codex-acp, args: [],        workdir: ~/dev/REPLACE_ME, permissions: auto }  # @zed-industries/codex-acp adapter (codex CLI has no native ACP)
+  # - { name: opencode, type: acp, command: opencode,  args: ["acp"],   workdir: ~/dev/REPLACE_ME, permissions: auto }
+  # - { name: copilot,  type: acp, command: copilot,   args: ["--acp"], workdir: ~/dev/REPLACE_ME, permissions: auto }
+
+# Project board (beads-backed) — the Lead Engineer's board + spawn loop. Pin it to
+# YOUR repo (which needs a `.beads/` workspace — run `br init` there first).
+project_board:
+  repo: ~/dev/REPLACE_ME       # the repo the board manages; worktrees branch off it
+  base_branch: main
+  coder: proto                 # fallback single coder
+  coders:                      # escalation ladder (fast→smart→reasoning)
+    fast: proto                #   primary coder
+    smart: opus                #   escalate to Opus on failure
+  loop_enabled: false          # set true (after the repo is configured) to auto-dispatch ready features
+  local_gate_cmd: ""           # OPT-IN pre-PR gate — the repo's real check cmd (e.g. "npm ci && npm run build")
+
+# A real browser for the lead to verify running changes.
+agent_browser:
+  panel_mode: full
+
+# Fenced filesystem (ADR 0007) — the lead READS repos + WRITES planning/grounding
+# docs, but has NO shell (the coder shells in its own worktree). Register YOUR repo.
+filesystem:
+  enabled: true
+  allow_run: false
+  projects:
+    - { name: REPLACE_ME, path: ~/dev/REPLACE_ME, write: true }

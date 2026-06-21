@@ -100,3 +100,6 @@ test-results/
 # OpenShell local deployment artifacts (deploy/openshell/)
 deploy/openshell/jwt/
 deploy/openshell/openshell-policy.yaml
+
+# Instance-scoped plugin installs/symlinks (dev-local, like config/*/langgraph-config.yaml)
+config/*/plugins/
