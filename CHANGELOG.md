@@ -22,6 +22,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   background-job tool glyphs (now lucide icons). Status is carried by text/tone/icons, not emoji.
 
 ### Added
+- **Full-screen document viewer** (ADR 0062) — a reusable reader (`openDocument(spec)` → a
+  root-mounted full-screen dialog rendering markdown). Background-agent reports no longer strand
+  you: the chat card keeps the preview but a **"Read full report"** button opens the *full* report
+  (fetched by job id) full-screen, and **Activity feed** entries open into the *same* viewer — no
+  trip to the Background/Activity panel. `DocumentSpec` is generic (inline `content`, async `load()`,
+  or a custom `render()`), so future long-content views can reuse it.
 - **Keyboard shortcuts** (ADR 0063) — a scoped, user-rebindable keybinding system. Defaults: `⌘K`
   command palette, `⌘,` Settings, `/` focus composer, VS Code-style panel toggles `⌘B` left rail /
   `⌘⌥B` right panel / `⌘J` bottom dock, and (in the chat panel) `⌘T` new chat, `⌘⇧K` clear,
