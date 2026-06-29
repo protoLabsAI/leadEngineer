@@ -135,6 +135,22 @@ def test_run_command_executes_in_project_cwd(workspace):
     assert "README.md" in out
 
 
+def test_run_command_runs_via_shell(workspace):
+    """run_command goes through /bin/sh -c, so shell operators (&&, |, >, $()) work."""
+    _, a, _ = workspace
+    t = _tools(
+        _Cfg(
+            filesystem_projects=[{"name": "a", "path": str(a)}],
+            filesystem_allow_run=True,
+            filesystem_run_requires_approval=False,
+        )
+    )
+    out = asyncio.run(t["run_command"].ainvoke({"project": "a", "command": "echo one && echo two"}))
+    # Exact lines (not substrings): the old argv path would print the literal "one && echo two",
+    # so this assertion specifically fails unless the && actually chained two commands.
+    assert out.splitlines() == ["one", "two"]
+
+
 def test_run_command_declined_raises(workspace, monkeypatch):
     """A declined approval RAISES (ToolException) rather than returning a string —
     so the ToolNode stamps status="error" and the chat card shows the X, not a green
