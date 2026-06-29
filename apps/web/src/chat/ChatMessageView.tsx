@@ -43,7 +43,19 @@ export function ChatMessageView({
   // Per-turn token/cost footer is an opt-out display pref (Settings ▸ Chat, #1372).
   const showChatUsage = useUI((s) => s.showChatUsage);
   return (
-    <Message role={message.role} streaming={streaming} className={message.report ? "chat-report" : undefined}>
+    <Message
+      role={message.role}
+      streaming={streaming}
+      className={
+        message.report
+          ? "chat-report"
+          : // Any non-report system message is a local note → compact .chat-note card; the
+            // tone modifier is appended only when set, so neutral notes still get the styling.
+            message.role === "system"
+            ? `chat-note${message.noteTone ? ` chat-note--${message.noteTone}` : ""}`
+            : undefined
+      }
+    >
       {message.reasoning && !(message.parts && message.parts.length) ? (
         // History-loaded turns have no ordered parts — fall back to the flat collapsed
         // reasoning card. Live turns render reasoning inline via parts.
