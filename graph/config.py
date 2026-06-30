@@ -146,22 +146,49 @@ def _env_default(name: str, default, cast=str):
         return default
 
 
+def _host_scoped_fields():
+    """The host-scoped (ADR 0047 ``scope=="host"``) settings fields — the single
+    source for both the host-layer filter and the shadow check, so they can't drift."""
+    from graph.settings_schema import FIELDS
+
+    return [f for f in FIELDS if getattr(f, "scope", "agent") == "host"]
+
+
 def _filter_to_host_keys(raw: dict) -> dict:
     """Keep only the host-scoped FIELDS keys present in a raw host-config doc.
 
     The Host file can set box-shared defaults but **cannot inject agent-only
     settings** (ADR 0047 D1/D4) — anything outside the ``scope=="host"`` set is
     dropped here before the merge."""
-    from graph.settings_schema import FIELDS
-
     out: dict = {}
-    for f in FIELDS:
-        if getattr(f, "scope", "agent") != "host":
-            continue
+    for f in _host_scoped_fields():
         found, val = _get_dotted(raw, f.key)
         if found:
             _set_dotted(out, f.key, val)
     return out
+
+
+def _warn_shadowed_host_keys(host_layer: dict, agent_data: dict) -> None:
+    """Warn when the agent leaf overrides a host-scoped (box-shared) key with a
+    different, non-empty value. The agent wins (ADR 0047), so the box default in
+    ``host-config.yaml`` is silently *shadowed* — otherwise invisible until you read
+    the merge (issue #1459). Best-effort: a provenance warning must never break boot."""
+    try:
+        for f in _host_scoped_fields():
+            h_found, h_val = _get_dotted(host_layer, f.key)
+            a_found, a_val = _get_dotted(agent_data, f.key)
+            if h_found and a_found and a_val not in (None, "") and a_val != h_val:
+                log.warning(
+                    "config: agent leaf overrides host-scoped %r — the box default %r is "
+                    "shadowed by the agent value %r, which wins. Remove %r from the agent "
+                    "config (langgraph-config.yaml) to use the box default.",
+                    f.key,
+                    h_val,
+                    a_val,
+                    f.key,
+                )
+    except Exception:  # noqa: BLE001 — never let a provenance warning break config load
+        pass
 
 
 def _load_host_layer() -> dict:
@@ -733,6 +760,9 @@ class LangGraphConfig:
 
         # Host is the base; the agent leaf overlays it (agent wins). No host layer ⇒
         # merged is exactly the agent doc — the pre-cascade input, unchanged.
+        if host_layer:
+            # Surface silent shadowing of a box default by the agent leaf (issue #1459).
+            _warn_shadowed_host_keys(host_layer, agent_data)
         merged = _deep_merge_dicts(copy.deepcopy(host_layer), agent_data) if host_layer else agent_data
 
         secrets = _load_secrets_doc(p.parent)
