@@ -50,8 +50,8 @@ FROM_YAML_EXAMPLE_FIELDS = {
     "a2a_description": "",
     "a2a_require_routable_url": False,
     "a2a_skills": [],
-    "acp_agents": {},
-    "agent_runtime": "native",
+    "acp_agents": {"claude": {"command": "claude-agent-acp", "args": []}},
+    "agent_runtime": "acp:claude",
     "api_base": "http://gateway:4000/v1",
     "audit_middleware": True,
     "autostart_on_boot": False,
@@ -82,10 +82,10 @@ FROM_YAML_EXAMPLE_FIELDS = {
     "enforcement_disallowed_tools": [],
     "enforcement_enabled": False,
     "enforcement_rate_limits": {},
-    "filesystem_allow_run": True,
+    "filesystem_allow_run": False,
     "filesystem_bypass_allowed": True,
     "filesystem_enabled": True,
-    "filesystem_projects": [],
+    "filesystem_projects": [{"name": "REPLACE_ME", "path": "~/dev/REPLACE_ME", "write": True}],
     "filesystem_run_requires_approval": True,
     "fleet_max_warm": 0,
     "fleet_port_base": 7870,
@@ -95,7 +95,7 @@ FROM_YAML_EXAMPLE_FIELDS = {
     "goal_max_iterations": 8,
     "goal_no_progress_limit": 3,
     "goal_verify_timeout": 120.0,
-    "identity_name": "protoagent",
+    "identity_name": "engineering-team",
     "identity_operator": "",
     "identity_org": "",
     "instance_id": "",
@@ -137,7 +137,7 @@ FROM_YAML_EXAMPLE_FIELDS = {
     "operator_mcp_tools": [],
     "plugins_dir": "",
     "plugins_disabled": [],
-    "plugins_enabled": [],
+    "plugins_enabled": ["delegates", "project_board", "agent_browser"],
     "plugins_sources_allow": [],
     "presence_penalty": None,
     "prompt_cache_enabled": True,
@@ -188,7 +188,7 @@ _GOLDEN_EXEMPT = {"api_key", "auth_token", "federation_token", "plugin_config"}
 # / knowledge.embeddings+facts / middleware.enforcement / operator_mcp /
 # prompt_cache / routing / telemetry appeared; no pre-existing value changed.
 CONFIG_TO_DICT_GOLDEN = {
-    "agent_runtime": "native",
+    "agent_runtime": "acp:claude",
     "auth": {
         "token": "",
     },
@@ -231,7 +231,7 @@ CONFIG_TO_DICT_GOLDEN = {
         "max_iterations": 8,
     },
     "identity": {
-        "name": "protoagent",
+        "name": "engineering-team",
         "operator": "",
         "org": "",
     },
@@ -296,7 +296,7 @@ CONFIG_TO_DICT_GOLDEN = {
     "plugins": {
         "dir": "",
         "disabled": [],
-        "enabled": [],
+        "enabled": ["delegates", "project_board", "agent_browser"],
         "sources": {
             "allow": [],
         },
