@@ -33,13 +33,20 @@ verified_against: 0.93.1
 
 plugins:
   - { id: delegates, builtin: true }                                                  # ACP/A2A spawn spine — ships with protoAgent
-  - { id: project_board, url: https://github.com/protoLabsAI/projectBoard-plugin,  ref: v0.29.3 }
+  - { id: project_board, url: https://github.com/protoLabsAI/projectBoard-plugin,  ref: v0.31.0 }
   - { id: agent_browser, url: https://github.com/protoLabsAI/agent-browser-plugin, ref: v0.5.1 }
 
 enabled: [delegates, project_board, agent_browser]   # suggested turn-on list (you apply it)
 config:                                              # recommended defaults (you apply them)
   project_board:
     coder: proto          # the acp delegate the board's spawn loop dispatches builds to
+    # Blocking adversarial review (board v0.30.0, plan M5): after each PR opens, the
+    # loop runs the host's `code-review` workflow (protoAgent ADR 0077) and bounces
+    # blocking findings back to the coder — the CI-bounce loop, for review. On a host
+    # whose core predates the findings convention the gate goes loudly inert (never a
+    # silent pass), so this default is safe to ship ahead of the core release.
+    review_gate: true
+    review_fix_max: 2
   agent_browser:
     panel_mode: full
 
