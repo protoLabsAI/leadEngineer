@@ -25,7 +25,7 @@ env:
   REGISTRY: ghcr.io
   # Normalise the image name — GHCR paths are case-sensitive and Docker refuses
   # uppercase; github.repository would otherwise yield a mixed-case value.
-  IMAGE_NAME: protolabsai/protoagent
+  IMAGE_NAME: protolabsai/leadengineer
 
 jobs:
   build-and-push:
@@ -55,8 +55,8 @@ jobs:
             type=raw,value=latest
             type=sha,prefix=sha-,format=short
           labels: |
-            org.opencontainers.image.title=protoagent
-            org.opencontainers.image.description=protoAgent — LangGraph + A2A template
+            org.opencontainers.image.title=leadengineer
+            org.opencontainers.image.description=leadEngineer — protoAgent Lead Engineer team bundle
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
 
