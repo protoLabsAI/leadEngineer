@@ -18,7 +18,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: protolabsai/protoagent
+  IMAGE_NAME: protolabsai/leadengineer
 
 jobs:
   release:
@@ -76,8 +76,8 @@ jobs:
             type=semver,pattern={{version}},value=${{ steps.version.outputs.tag }}
             type=semver,pattern={{major}}.{{minor}},value=${{ steps.version.outputs.tag }}
           labels: |
-            org.opencontainers.image.title=protoagent
-            org.opencontainers.image.description=protoAgent — LangGraph + A2A template
+            org.opencontainers.image.title=leadengineer
+            org.opencontainers.image.description=leadEngineer — protoAgent Lead Engineer team bundle
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ steps.version.outputs.version }}
