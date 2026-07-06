@@ -33,7 +33,7 @@ verified_against: 0.94.0
 
 plugins:
   - { id: delegates, builtin: true }                                                  # ACP/A2A spawn spine — ships with protoAgent
-  - { id: project_board, url: https://github.com/protoLabsAI/projectBoard-plugin,  ref: v0.31.0 }
+  - { id: project_board, url: https://github.com/protoLabsAI/projectBoard-plugin,  ref: v0.32.0 }
   - { id: agent_browser, url: https://github.com/protoLabsAI/agent-browser-plugin, ref: v0.5.1 }
 
 enabled: [delegates, project_board, agent_browser]   # suggested turn-on list (you apply it)
