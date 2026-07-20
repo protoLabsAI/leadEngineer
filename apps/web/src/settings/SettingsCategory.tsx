@@ -4,7 +4,7 @@ import { Alert } from "@protolabsai/ui/data";
 import { Combobox, DropdownSelect, Input, SecretInput, Switch, Textarea } from "@protolabsai/ui/forms";
 import { Badge, Button } from "@protolabsai/ui/primitives";
 import { useMutation, useQueryClient, useSuspenseQuery } from "@tanstack/react-query";
-import { Boxes, RotateCcw, Save } from "lucide-react";
+import { Boxes, ChevronDown, ChevronUp, RotateCcw, Save } from "lucide-react";
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
@@ -56,7 +56,7 @@ export function SettingsCategory({
   pluginId?: string;
 }) {
   const queryClient = useQueryClient();
-  const { data } = useSuspenseQuery(settingsSchemaQuery());
+  const { data, isFetching } = useSuspenseQuery(settingsSchemaQuery());
   const groups = useMemo(() => {
     // One category, or several aggregated into one panel (the `categories` prop).
     const inScope = (g: SettingsGroup) =>
@@ -289,7 +289,12 @@ export function SettingsCategory({
             Needs a restart to take effect: {pendingRestart.join(", ")}
           </Alert>
         ) : null}
-        {!groups.length && !footer ? <p className="muted">{emptyHint || "Nothing to configure here."}</p> : null}
+        {/* While a background refetch is in flight (the #1643 fresh-install hydration
+            re-pulls the schema), an empty group set is "still loading", not "nothing
+            here" — don't flash the misleading empty hint. */}
+        {!groups.length && !footer ? (
+          <p className="muted">{isFetching ? "Loading settings…" : emptyHint || "Nothing to configure here."}</p>
+        ) : null}
 
         {/* Each field group is a collapsible accordion (DS 0.29) so a dense category
             (the Workspace home's panels run long) can be tidied to the few sections
@@ -430,20 +435,45 @@ function SettingRow({
 // Parsed → a clean string[] on every change; re-syncs from `value` on an external change
 // (discard / reset / load).
 // Split a string-list text field into clean items: comma OR newline separated, trimmed,
-// empties dropped — so "a, b", "a\nb", and "a , , b\n" all yield ["a","b"].
+// empties dropped — so "a, b", "a\nb", and "a , , b\n" all yield ["a","b"]. A quoted empty
+// token — `""` — survives as the empty string: some lists use "" as a sentinel (e.g.
+// knowledge.inject_namespaces, where "" means the un-namespaced rows), and blank-between-
+// separators must still be droppable noise, so the sentinel needs an explicit spelling.
 export function parseStringList(text: string): string[] {
-  return text.split(/[,\n]/).map((s) => s.trim()).filter(Boolean);
+  return text
+    .split(/[,\n]/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((s) => (s === '""' || s === "''" ? "" : s));
+}
+
+// The inverse: render items for the text field, spelling the empty-string entry as `""`
+// so it survives the round-trip (join would otherwise emit a bare separator that the
+// parse drops).
+export function formatStringList(items: string[]): string {
+  return items.map((s) => (s === "" ? '""' : s)).join(", ");
+}
+
+// Swap an item with its neighbor (the ordered-list up/down buttons, #1957). Out-of-range
+// moves return the list unchanged, so the boundary buttons can no-op safely.
+export function moveListItem<T>(items: T[], index: number, delta: number): T[] {
+  const target = index + delta;
+  if (index < 0 || index >= items.length || target < 0 || target >= items.length) return items;
+  const next = items.slice();
+  const [moved] = next.splice(index, 1);
+  next.splice(target, 0, moved);
+  return next;
 }
 
 function StringListInput({ id, value, onChange }: { id: string; value: unknown; onChange: (v: unknown) => void }) {
   const items = Array.isArray(value) ? value.filter((v): v is string => typeof v === "string") : [];
-  const [text, setText] = useState(items.join(", "));
+  const [text, setText] = useState(formatStringList(items));
   const lastParsed = useRef(items);
   useEffect(() => {
     // Adopt the parent value only when it changed to something we didn't just emit
     // (e.g. Discard reverted it) — otherwise leave the user's in-progress text alone.
     if (JSON.stringify(items) !== JSON.stringify(lastParsed.current)) {
-      setText(items.join(", "));
+      setText(formatStringList(items));
       lastParsed.current = items;
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -454,7 +484,7 @@ function StringListInput({ id, value, onChange }: { id: string; value: unknown; 
       className="setting-input setting-textarea"
       rows={2}
       value={text}
-      placeholder="comma-separated (e.g. owner/repo, owner/repo2)"
+      placeholder={'comma-separated (e.g. owner/repo, owner/repo2 — "" for an empty entry)'}
       onChange={(e) => {
         setText(e.target.value);
         const parsed = parseStringList(e.target.value);
@@ -516,18 +546,33 @@ export function SettingInput({ field, value, onChange }: { field: SettingsField;
     };
     // A column of DS Comboboxes — one per value plus a trailing blank-to-add row;
     // each carries its own suggestion list (the gateway models), and clearing a row
-    // removes it. Type any alias OR pick a suggestion.
+    // removes it. Type any alias OR pick a suggestion. Filled rows get up/down
+    // buttons (#1957) — these lists are ORDERED (favorites rank the /model picker;
+    // fallbacks are retried in order), so reordering must not require retyping.
     return (
       <div id={id} className="setting-list" style={{ display: "flex", flexDirection: "column", gap: "0.35rem" }}>
         {[...items, ""].map((item, i) => (
-          <Combobox
-            key={i}
-            className="setting-input"
-            options={field.options}
-            value={item}
-            placeholder={i === items.length ? "add a model…" : ""}
-            onValueChange={(v) => update(i, v)}
-          />
+          <div key={i} className="setting-list-row" style={{ display: "flex", gap: "0.35rem", alignItems: "center" }}>
+            <div style={{ flex: 1 }}>
+              <Combobox
+                className="setting-input"
+                options={field.options}
+                value={item}
+                placeholder={i === items.length ? "add a model…" : ""}
+                onValueChange={(v) => update(i, v)}
+              />
+            </div>
+            {i < items.length && items.length > 1 ? (
+              <>
+                <Button variant="ghost" size="sm" type="button" aria-label={`Move ${item} up`} disabled={i === 0} onClick={() => onChange(moveListItem(items, i, -1))}>
+                  <ChevronUp size={14} />
+                </Button>
+                <Button variant="ghost" size="sm" type="button" aria-label={`Move ${item} down`} disabled={i === items.length - 1} onClick={() => onChange(moveListItem(items, i, 1))}>
+                  <ChevronDown size={14} />
+                </Button>
+              </>
+            ) : null}
+          </div>
         ))}
       </div>
     );

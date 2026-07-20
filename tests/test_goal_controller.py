@@ -139,14 +139,15 @@ async def test_verifier_overrides_giveup(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_checklist_recorded_and_carried(tmp_path):
+async def test_plan_recorded_and_carried(tmp_path):
     # The plan is recorded mid-turn via the update_goal_plan tool (→ record_plan),
-    # persisted, and fed back into the next continuation prompt.
+    # persisted to the durable plan artifact (ADR 0079 — for EVERY goal, not just
+    # fresh-context), and fed back into the next continuation prompt.
     c = _ctrl(tmp_path)
     await c.parse_control('/goal {"condition": "done", "verifier": {"type": "command", "command": "exit 1"}}', "s")
     c.record_plan("s", "1. do A\n2. do B")
     decision = await c.evaluate("s", last_text="progress")
-    assert "do A" in c.active_goal("s").checklist
+    assert "do A" in c._store.read_plan("s")  # durable plan artifact, unified store
     assert "do A" in decision.message
 
 
@@ -231,3 +232,152 @@ def test_set_goal_operator_requires_condition(tmp_path):
     c = _ctrl(tmp_path)
     ok, msg = c.set_goal_operator("s", "", {"type": "command", "command": "true"})
     assert not ok and "condition is required" in msg
+
+
+# --- completion contracts (ADR 0073) ---------------------------------------
+
+
+def test_set_goal_operator_stores_contract(tmp_path):
+    c = _ctrl(tmp_path)
+    ok, _ = c.set_goal_operator(
+        "s",
+        "ship it",
+        {"type": "command", "command": "pytest -q"},
+        outcome="the suite is green",
+        constraints=["no new deps"],
+        boundaries=["graph/"],
+        stop_when="prod credentials are needed",
+    )
+    assert ok
+    state = c.active_goal("s")
+    assert state.outcome == "the suite is green"
+    assert state.constraints == ["no new deps"]
+    assert state.boundaries == ["graph/"]
+    assert state.stop_when == "prod credentials are needed"
+    assert state.has_contract is True
+
+
+def test_set_goal_operator_coerces_string_contract_lists(tmp_path):
+    # A bare string sent for a list field is coerced to a 1-element list.
+    c = _ctrl(tmp_path)
+    c.set_goal_operator(
+        "s", "ship it", {"type": "command", "command": "true"},
+        constraints="do not touch the schema", boundaries="tools/",
+    )
+    state = c.active_goal("s")
+    assert state.constraints == ["do not touch the schema"]
+    assert state.boundaries == ["tools/"]
+
+
+def test_set_goal_safe_stores_contract(tmp_path):
+    c = _ctrl(tmp_path)
+    ok, _ = c.set_goal_safe(
+        "s", "reach it", {"type": "plugin", "check": "p:v"},
+        outcome="target hit", constraints=["stay under budget"], stop_when="the market halts",
+    )
+    assert ok
+    state = c.active_goal("s")
+    assert state.outcome == "target hit"
+    assert state.constraints == ["stay under budget"]
+    assert state.stop_when == "the market halts"
+
+
+@pytest.mark.asyncio
+async def test_continuation_includes_contract(tmp_path):
+    # A `continue` decision re-states the contract (constraints/boundaries/stop_when +
+    # the verifier-decides-DONE framing) on top of the existing continuation text.
+    c = _ctrl(tmp_path)
+    c.set_goal_operator(
+        "s",
+        "ship it",
+        {"type": "command", "command": "pytest -q"},
+        outcome="suite green on main",
+        constraints=["no new network calls"],
+        boundaries=["graph/goals/"],
+        stop_when="a migration is required",
+    )
+    decision = await c.evaluate("s", last_text="working")
+    assert decision.action == "continue"
+    msg = decision.message
+    # The existing continuation text is still there...
+    assert "NOT yet met" in msg
+    # ...and the contract directive is appended.
+    assert "DONE only when the verifier passes" in msg
+    assert "pytest -q" in msg  # verifier summary
+    assert "suite green on main" in msg
+    assert "no new network calls" in msg
+    assert "graph/goals/" in msg
+    assert "a migration is required" in msg
+    assert "ask the operator" in msg
+
+
+@pytest.mark.asyncio
+async def test_continuation_without_contract_is_unchanged(tmp_path):
+    # Backward-compat: a goal with NO contract produces a continuation byte-for-byte
+    # identical to one built with no contract logic — nothing is appended.
+    c = _ctrl(tmp_path)
+    await c.parse_control('/goal {"condition": "done", "verifier": {"type": "command", "command": "exit 1"}}', "s")
+    decision = await c.evaluate("s", last_text="working")
+    assert decision.action == "continue"
+    # The contract block markers never appear.
+    assert "Contract for this goal" not in decision.message
+    assert "Stay within these boundaries" not in decision.message
+    # And it equals the base continuation (no trailing contract append).
+    state = c.active_goal("s")
+    from graph.goals.types import VerifyResult
+
+    base = c._continuation_base(state, VerifyResult(False, "command exited 1", ""))
+    assert c._contract_prompt(state) == ""
+    # (evaluate advanced the iteration counter; compare the shape, not the counter.)
+    assert decision.message.startswith("[goal continuation")
+    assert base.startswith("[goal continuation")
+
+
+def test_verifier_summary_shapes():
+    s = GoalController._verifier_summary
+    assert s({"type": "command", "command": "pytest -q"}) == "command: pytest -q"
+    assert s({"type": "ci", "pr": 12}) == "ci PR #12"
+    assert s({"type": "ci", "branch": "main"}) == "ci branch main"
+    assert s({"type": "plugin", "check": "demo:probe"}) == "plugin demo:probe"
+    assert s({"type": "data", "path": "/x.json"}) == "data check on /x.json"
+    assert s({"type": "llm"}) == "llm judgment"
+    assert s({}) == "llm judgment"
+
+
+# --- verifier invoker identity (#1641) --------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_evaluate_passes_goal_invoker_to_plugin_verifier(tmp_path):
+    # A plugin verifier registered via the normal path (PluginRegistry →
+    # set_plugin_verifiers) can tell WHICH goal is polling it: kind="goal",
+    # id == the owning session (goals are keyed per session), no cadence.
+    from pathlib import Path
+
+    from graph.goals.types import VerifyResult
+    from graph.goals.verifiers import set_plugin_verifiers
+    from graph.plugins.registry import PluginRegistry
+
+    seen = []
+
+    async def probe(spec, ctx):
+        seen.append(ctx)
+        return VerifyResult(True, "met")
+
+    reg = PluginRegistry("demo", Path("."))
+    reg.register_goal_verifier("probe", probe)  # → demo:probe
+    set_plugin_verifiers(reg.goal_verifiers)
+    try:
+        c = _ctrl(tmp_path)
+        ok, _msg = c.set_goal_safe("sess-9", "reach it", {"type": "plugin", "check": "demo:probe"})
+        assert ok
+        decision = await c.evaluate("sess-9", last_text="done")
+        assert decision.state.status == "achieved"
+    finally:
+        set_plugin_verifiers({})
+    (ctx,) = seen
+    assert ctx.invoker.kind == "goal"
+    assert ctx.invoker.id == "sess-9"
+    assert ctx.invoker.session_id == "sess-9"
+    assert ctx.invoker.interval_s is None  # goals evaluate post-turn, not on a cadence
+    assert ctx.condition == "reach it"  # the pre-#1641 ctx fields still flow

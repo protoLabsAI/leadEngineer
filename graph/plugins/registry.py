@@ -13,6 +13,15 @@ from pathlib import Path
 log = logging.getLogger("protoagent.plugins")
 
 
+def _prefix_conforms(prefix: str, plugin_id: str) -> bool:
+    """True iff a router prefix follows the two-router convention: the public view
+    ``/plugins/<id>`` or the bearer-gated data router ``/api/plugins/<id>`` (docs/
+    guides/plugin-views.md, ADR 0026). Both are canonical — the loader must not nag
+    plugins that follow the prescribed pattern (#1732). Shared by the server-side
+    mount check (server/agent_init.py) so the two never drift."""
+    return prefix.startswith(f"/plugins/{plugin_id}") or prefix.startswith(f"/api/plugins/{plugin_id}")
+
+
 class PluginRegistry:
     """Collects a single plugin's contributions during ``register()``.
 
@@ -31,8 +40,11 @@ class PluginRegistry:
     - ``chat_commands`` — user-only ``/<name>`` control commands that short-circuit
       the turn, like ``/goal`` (``register_chat_command``).
 
-    Routes mount + surfaces start **once** at process init; a config reload reuses
-    them — changing ``plugins.enabled`` needs a restart (ADR 0018).
+    Routes and surfaces both wire at process init. Routes now ALSO hot-mount on a
+    config reload — a newly-enabled plugin's routers, public paths, verifiers, and
+    hooks re-apply without a restart (#1752/#1890). SURFACES do not: the startup hook
+    has already fired, so a surface (re)starts only on a full restart; a config reload
+    just fires each running surface's ``reload`` callback (ADR 0018).
     """
 
     def __init__(
@@ -68,6 +80,7 @@ class PluginRegistry:
         self.goal_verifiers: dict = {}  # name -> async (spec, ctx) -> VerifyResult (ADR 0028)
         self.goal_hooks: list = []  # {on_achieved, on_failed, on_stalled} reactions (ADR 0028 + 0030 D5)
         self.watch_hooks: list = []  # {on_met, on_expired, on_stalled} watch reactions (ADR 0067)
+        self.lifecycle_hooks: list = []  # {on_app_loaded, on_agent_active, on_system_wake} (ADR 0074)
         self.knowledge_stores: dict = {}  # name -> (config) -> KnowledgeBackend (ADR 0031)
         self.embedders: dict = {}  # name -> (config) -> (text -> vector) embed_fn (ADR 0031)
         self.chat_commands: dict = {}  # token -> async (rest, session_id) -> str|None (user-only control commands)
@@ -109,17 +122,24 @@ class PluginRegistry:
         turn with the handler's reply, like the core ``/goal`` (and the old, now
         plugin-owned, ``/issue``).
 
-        ``handler`` is ``async (rest: str, session_id: str) -> str | None``: ``rest``
-        is everything after the token; return the reply string to send (the turn is
-        NOT run through the agent), or ``None`` to pass the message through as a
+        ``handler`` is ``async (rest: str, session_id: str) -> str | dict | None``:
+        ``rest`` is everything after the token; return the reply string to send (the
+        turn is NOT run through the agent), or ``None`` to pass the message through as a
         normal turn. This is **user-only by design** — it is NOT an agent tool, so a
         plugin can expose a write action (file an issue, open a PR) that the model
         can't invoke autonomously. Read your own config in ``register()`` and close
         over it, e.g. ``repo = self.config.get("default_repo")``.
 
+        To collect input, return a **form request** (#1701 Slice 2):
+        ``{"form": <request_user_input-shaped payload>, "on_submit": <async
+        (answers: dict, session_id: str) -> str | dict | None>}``. The runtime opens
+        the form in the composer (the same ``HitlForm`` the agent's HITL uses) and,
+        on submit, calls ``on_submit`` with the field values — which may itself return
+        a reply string or another form (a multi-step wizard).
+
         The token is slugified + lowercased (``/Issue`` == ``/issue``). The reserved
-        core token ``goal`` is refused; a collision with a token another enabled
-        plugin already registered keeps the first and warns (resolved in the loader).
+        core tokens ``goal`` / ``lifecycle`` are refused; a collision with a token another
+        enabled plugin already registered keeps the first and warns (resolved in the loader).
         """
         from graph.slash_commands import slugify_slash  # intra-graph, import-safe
 
@@ -129,7 +149,7 @@ class PluginRegistry:
                 "[plugins] %s: register_chat_command needs a name + callable: %r / %r", self.plugin_id, name, handler
             )
             return
-        if token == "goal":
+        if token in ("goal", "lifecycle"):  # reserved core control commands (ADR 0074)
             log.warning("[plugins] %s: chat command /%s is reserved — skipped", self.plugin_id, token)
             return
         if token in self.chat_commands:
@@ -205,12 +225,14 @@ class PluginRegistry:
         self.workflow_dirs.append(p)
 
     def register_goal_verifier(self, name: str, fn) -> None:
-        """Contribute an in-process goal verifier (ADR 0028) — an async
+        """Contribute an in-process goal/watch verifier (ADR 0028) — an async
         ``(spec, ctx) -> VerifyResult`` referenced by a ``{"type":"plugin",
-        "check":"<name>"}`` goal. Name it ``<plugin-id>:<verifier>`` to avoid
-        collisions; ``args`` in the spec are declarative data your verifier
+        "check":"<name>"}`` goal or watch. Name it ``<plugin-id>:<verifier>`` to
+        avoid collisions; ``args`` in the spec are declarative data your verifier
         validates (no shell, no eval). This is the only verifier type safe to set
-        programmatically (D3)."""
+        programmatically (D3). ``ctx`` is a ``graph.goals.VerifyContext``;
+        ``ctx.invoker`` identifies the polling goal/watch (kind/id/session_id/
+        interval_s, #1641) so a verifier can keep per-invoker state."""
         if not name or not callable(fn):
             log.warning(
                 "[plugins] %s: register_goal_verifier needs a name + callable: %r / %r", self.plugin_id, name, fn
@@ -252,6 +274,31 @@ class PluginRegistry:
                 "on_met": on_met if callable(on_met) else None,
                 "on_expired": on_expired if callable(on_expired) else None,
                 "on_stalled": on_stalled if callable(on_stalled) else None,
+            }
+        )
+
+    def register_lifecycle_hook(self, *, on_app_loaded=None, on_agent_active=None, on_system_wake=None) -> None:
+        """React to a system lifecycle event (ADR 0074) — ``on_app_loaded`` (boot finished:
+        graph compiled + scheduler/surfaces/fleet up), ``on_agent_active`` (the agent went
+        idle → active — the first turn after a quiet gap, debounced), ``on_system_wake``
+        (reserved — the desktop shell woke; emitted in a follow-up). Each takes the event
+        ``payload`` dict (``ts`` + ``previous_state`` + event-specific keys), sync or async.
+        Provide ANY of the three. A raising hook is logged + swallowed — a bad hook must never
+        break boot or a turn. (These are *broadcast* on the bus too, so ``registry.on(...)`` is
+        the zero-config alternative; a hook is the direct callback form.)"""
+        if not (callable(on_app_loaded) or callable(on_agent_active) or callable(on_system_wake)):
+            log.warning(
+                "[plugins] %s: register_lifecycle_hook needs on_app_loaded, on_agent_active, "
+                "and/or on_system_wake",
+                self.plugin_id,
+            )
+            return
+        self.lifecycle_hooks.append(
+            {
+                "plugin_id": self.plugin_id,
+                "on_app_loaded": on_app_loaded if callable(on_app_loaded) else None,
+                "on_agent_active": on_agent_active if callable(on_agent_active) else None,
+                "on_system_wake": on_system_wake if callable(on_system_wake) else None,
             }
         )
 
@@ -312,21 +359,25 @@ class PluginRegistry:
 
         Defaults to the namespaced prefix ``/plugins/<id>`` so a plugin can't
         silently shadow a core route. Pass ``prefix=""`` (or your own) to mount
-        elsewhere — an escape hatch, logged. Plugin routes SHOULD live under
-        ``/plugins/<id>/``; a non-conforming prefix logs a WARNING (#870).
-        The default-deny auth middleware guards all non-public paths regardless
-        of prefix.
+        elsewhere — an escape hatch, logged. The two canonical prefixes are the
+        public view ``/plugins/<id>`` and the bearer-gated data router
+        ``/api/plugins/<id>`` (the documented two-router pattern — docs/guides/
+        plugin-views.md, ADR 0026); a prefix outside both logs a WARNING (#870,
+        #1732). The default-deny auth middleware guards all non-public paths
+        regardless of prefix.
         """
         if router is None or not hasattr(router, "routes"):
             log.warning("[plugins] %s: register_router got a non-router: %r", self.plugin_id, router)
             return
         eff = f"/plugins/{self.plugin_id}" if prefix is None else str(prefix)
-        if eff and not eff.startswith(f"/plugins/{self.plugin_id}"):
+        if eff and not _prefix_conforms(eff, self.plugin_id):
             log.warning(
                 "[plugins] %s: register_router prefix %r does not start with "
-                "/plugins/%s/ — plugin routes SHOULD live under /plugins/<id>/",
+                "/plugins/%s or /api/plugins/%s — plugin routes SHOULD live under "
+                "/plugins/<id>/ (public) or /api/plugins/<id>/ (gated data)",
                 self.plugin_id,
                 eff,
+                self.plugin_id,
                 self.plugin_id,
             )
         self.routers.append({"router": router, "prefix": eff})
@@ -409,3 +460,38 @@ class PluginRegistry:
             log.warning("[plugins] %s: register_late_tool_factory needs a callable, got %r", self.plugin_id, factory)
             return
         self.late_tool_factories.append(factory)
+
+    def save_media(self, data, mime: str, meta: dict | None = None):
+        """Persist a generated binary artifact (image/audio/video/…) into the CORE
+        media store and get back a ``MediaRef {id, url, path, mime}`` (#1929).
+
+        The convention: embed ``ref.url`` in the tool's returned markdown —
+        ``f"![generated image]({ref.url})"`` — and the console chat renders it
+        inline, with **no plugin-owned route and no UI change**. ``data`` is the
+        raw ``bytes`` or a source file path to copy in; ``mime`` drives the file
+        extension and the served content type; ``meta`` is optional provenance
+        (prompt, model, …) kept in a hidden sidecar (this plugin's id is recorded
+        automatically). Files land under the instance data dir
+        (``instance_paths().store("media")``) and survive restart.
+
+        Access: the returned ``url`` carries a per-file HMAC signature, so it
+        renders even under a bearer-gated deployment (an ``<img>`` tag can't send
+        a header) while the store stays default-deny; ``media.public: true``
+        (core config) opts the whole store public, and ``media.retention_days``
+        prunes old files. A ``media.saved`` event is broadcast on the bus.
+        """
+        from infra.media import save_media as _save_media
+
+        m = dict(meta or {})
+        m.setdefault("plugin_id", self.plugin_id)
+        ref = _save_media(data, mime, m)
+        # Host-level topic (like ``ui.navigate``), not namespaced via emit(): every
+        # plugin's saves land on ONE topic a consumer (GC dashboard, gallery view)
+        # can subscribe to; the payload carries the producing plugin's id.
+        if self.host and self.host.publish:
+            self.host.publish(
+                "media.saved", {"id": ref.id, "url": ref.url, "mime": ref.mime, "plugin": self.plugin_id}
+            )
+        else:  # non-server context (tests, headless) — no bus wired
+            log.debug("[plugins] %s: media.saved event dropped — no bus", self.plugin_id)
+        return ref

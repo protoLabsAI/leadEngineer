@@ -54,45 +54,70 @@ def atomic_write(path: Path | str, text: str, *, mode: int | None = None) -> Non
         raise
 
 
+def _anchored_pyproject_version() -> str | None:
+    """``[project].version`` from the ``pyproject.toml`` that governs *this* package,
+    or ``None`` when this package didn't ship one (wheel install).
+
+    Anchored to the package's **own location** — never the cwd, never an unbounded
+    upward search (either could swallow an unrelated project's ``pyproject.toml``,
+    e.g. when protoAgent is wheel-installed under ``<their-project>/.venv``):
+
+    - **Frozen (PyInstaller onefile):** the bundle root ``_MEIPASS``, where
+      ``build_sidecar.py`` bundles ``pyproject.toml`` (#894).
+    - **Source checkout / ``COPY .`` image:** the repo root, exactly two levels up
+      (this module is ``<root>/infra/paths.py``).
+    - **Wheel install:** the anchor is ``site-packages`` — no pyproject there, so
+      this returns ``None`` and installed metadata answers instead.
+    """
+    import sys
+
+    here = Path(__file__).resolve()
+    if getattr(sys, "frozen", False):
+        root = Path(getattr(sys, "_MEIPASS", here.parent))
+    else:
+        root = here.parents[1]
+    try:
+        m = re.search(r'^version\s*=\s*"([^"]+)"', (root / "pyproject.toml").read_text(), re.MULTILINE)
+    except OSError:
+        return None
+    return m.group(1) if m else None
+
+
 def package_version() -> str:
     """This instance's app version — ``pyproject.toml`` ``[project].version`` is the
     one source of truth (the release pipeline bumps it).
 
-    Prefer installed-package metadata; fall back to reading pyproject.toml next to
-    this module (source checkout / ``COPY .`` image) or the PyInstaller bundle root;
-    final fallback keeps callers valid if neither is available. Lives here (a leaf
-    module) so the A2A card (``server/a2a.py``), the runtime status, and the fleet
-    supervisor all report it without import cycles — the hub↔remote version
-    handshake compares it.
+    Prefer the pyproject this package ships with (source checkout / ``COPY .``
+    image / PyInstaller bundle — see ``_anchored_pyproject_version``); fall back to
+    installed-package metadata (wheel installs, where no pyproject ships); final
+    ``"0.0.0"`` fallback keeps callers valid if neither is available. The pyproject
+    must win when both exist: editable installs don't rewrite dist-info on a
+    version bump (only the next ``uv sync`` does), so on a dev checkout the
+    metadata goes stale — and when metadata was consulted first, the plugin
+    ``min_protoagent_version`` gate refused valid plugins and the A2A card
+    advertised the old version (#1644).
+
+    Lives here (a leaf module) so the A2A card (``server/a2a.py``), the plugin
+    compat gate (``graph/plugins/loader.py``), the runtime status, and the fleet
+    supervisor all report it without import cycles — one shared resolver, so those
+    surfaces can never disagree.
     """
+    pinned = _anchored_pyproject_version()
+    if pinned:
+        return pinned
     try:
         from importlib.metadata import PackageNotFoundError, version
 
-        try:
-            return version("protoagent")
-        except PackageNotFoundError:
-            pass
+        # The PyPI distribution is `protolabs-agent` (the plain `protoagent` name is
+        # blocked on PyPI as too-similar to an unrelated project). Older/source names
+        # kept as a fallback so a rename never silently reports "0.0.0".
+        for _dist in ("protolabs-agent", "protoagent"):
+            try:
+                return version(_dist)
+            except PackageNotFoundError:
+                continue
     except ImportError:  # pragma: no cover - importlib.metadata always present on 3.11+
         pass
-
-    import sys
-
-    here = Path(__file__).resolve()
-    if getattr(sys, "frozen", False):  # PyInstaller onefile — pyproject bundled at _MEIPASS (#894)
-        candidates = [Path(getattr(sys, "_MEIPASS", here.parent))]
-    else:
-        # Search UPWARD for pyproject.toml: it's at the repo root (or the `COPY .`
-        # image root), NOT next to this module — paths.py lives in infra/, so a
-        # plain `__file__.parent` would look in infra/ and miss it (the regression
-        # the root-module reorg introduced). The nearest one going up is the repo's.
-        candidates = list(here.parents)
-    for base in candidates:
-        try:
-            m = re.search(r'^version\s*=\s*"([^"]+)"', (base / "pyproject.toml").read_text(), re.MULTILINE)
-            if m:
-                return m.group(1)
-        except OSError:
-            continue
     return "0.0.0"
 
 
@@ -286,7 +311,45 @@ def instance_uid() -> str:
         return ""
 
 
-def _pid_alive(pid: int) -> bool:
+def _pid_alive_windows(pid: int, kernel32=None) -> bool:
+    """Windows liveness probe: ``OpenProcess`` + ``GetExitCodeProcess == STILL_ACTIVE``.
+    Access-denied means the process EXISTS (we just can't query it); ambiguity leans
+    *alive* — for the callers (parent-death watchdog, heartbeat) a false "dead" is the
+    catastrophic direction (a healthy sidecar self-killing, #1678)."""
+    import ctypes
+
+    process_query_limited_information = 0x1000
+    still_active = 259
+    error_access_denied = 5
+    k32 = kernel32 if kernel32 is not None else ctypes.windll.kernel32  # type: ignore[attr-defined]
+    handle = k32.OpenProcess(process_query_limited_information, False, pid)
+    if not handle:
+        return k32.GetLastError() == error_access_denied
+    try:
+        code = ctypes.c_ulong()
+        if not k32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return True  # queryable handle but unreadable exit code — lean alive
+        return code.value == still_active
+    finally:
+        k32.CloseHandle(handle)
+
+
+def pid_alive(pid: int) -> bool:
+    """True when ``pid`` is a running process — a real CROSS-PLATFORM liveness probe.
+
+    ``os.kill(pid, 0)`` is NOT one on Windows: signal 0 is ``CTRL_C_EVENT``
+    (``GenerateConsoleCtrlEvent``), which fails with ``OSError`` for any
+    non-console-group target — reading a LIVE pid as dead. That self-killed the
+    desktop sidecar ~2s after every Windows boot (#1678: the parent-death watchdog
+    read its healthy GUI launcher as gone). On POSIX, only ``ProcessLookupError``
+    means gone; ``PermissionError`` means it exists but isn't ours to signal."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            return _pid_alive_windows(pid)
+        except Exception:  # noqa: BLE001 — a probe must never take the caller down
+            return True  # lean alive: false "dead" is the catastrophic direction
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -321,7 +384,18 @@ def register_instance(port: int | None = None, identity: str = "") -> None:
     try:
         d = _instances_dir()
         d.mkdir(parents=True, exist_ok=True)
-        (d / f"{os.getpid()}.json").write_text(json.dumps({"pid": os.getpid(), "port": port, "identity": identity}))
+        # Record the instance_root so colocation_warning can distinguish a genuine
+        # same-instance clobber from a harmless box-only co-resident (#1552).
+        (d / f"{os.getpid()}.json").write_text(
+            json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "port": port,
+                    "identity": identity,
+                    "instance_root": str(instance_paths().instance_root),
+                }
+            )
+        )
     except Exception:  # noqa: BLE001
         pass
 
@@ -350,33 +424,48 @@ def colocated_instances() -> list[dict]:
                 continue
             if pid == os.getpid():
                 continue
-            if not _pid_alive(pid) or not _is_protoagent_pid(pid):
+            if not pid_alive(pid) or not _is_protoagent_pid(pid):
                 f.unlink(missing_ok=True)  # stale heartbeat (crash / pid recycled)
                 continue
             try:
                 rec = json.loads(f.read_text())
             except (OSError, ValueError):
                 rec = {}
-            out.append({"pid": pid, "port": rec.get("port"), "identity": rec.get("identity") or ""})
+            out.append(
+                {
+                    "pid": pid,
+                    "port": rec.get("port"),
+                    "identity": rec.get("identity") or "",
+                    "instance_root": rec.get("instance_root") or "",
+                }
+            )
     except Exception:  # noqa: BLE001
         return out
     return out
 
 
 def colocation_warning() -> str | None:
-    """A user-facing warning when another live instance shares this data root, else None."""
-    others = colocated_instances()
-    if not others:
+    """A user-facing warning when another live process shares THIS instance's data root
+    — i.e. the same ``instance_root`` (every store lives there, so they WOULD clobber each
+    other's chat / knowledge / checkpoints). Returns None otherwise.
+
+    Two instances that merely share the ``box_root`` (distinct ``PROTOAGENT_INSTANCE`` ids —
+    e.g. the desktop app on ``~/.protoagent`` plus a ``dev`` instance on ``~/.protoagent/dev``)
+    keep entirely separate stores and are NOT a clobber risk, so they are not flagged (#1552).
+    A co-resident whose heartbeat predates this field (no ``instance_root`` recorded) can't be
+    confirmed same-instance, so it's treated as distinct — favouring no false alarm."""
+    mine = str(instance_paths().instance_root)
+    same = [o for o in colocated_instances() if o.get("instance_root") == mine]
+    if not same:
         return None
     who = ", ".join(
         f"{o['identity'] or 'unknown'} (pid {o['pid']}" + (f", port {o['port']})" if o.get("port") else ")")
-        for o in others
+        for o in same
     )
-    root = instance_paths().box_root
     return (
-        f"Another running instance shares this machine's data root ({root}): {who}. "
-        "They can clobber each other's chat history, knowledge and stores — give each "
-        "instance its own PROTOAGENT_INSTANCE id (or stop the extra one)."
+        f"Another running process shares THIS instance's data root ({mine}): {who}. "
+        "They will clobber each other's chat history, knowledge and stores — stop one, or run "
+        "them as separate instances (a distinct PROTOAGENT_INSTANCE id, each on its own port)."
     )
 
 
@@ -498,6 +587,12 @@ class InstancePaths:
         return self.config_dir / "SOUL.md"
 
     @property
+    def soul_history_dir(self) -> Path:
+        """Timestamped snapshots of prior ``SOUL.md`` versions (#1691) — every persona save
+        archives the outgoing text here so prompt iterations can be reviewed and restored."""
+        return self.config_dir / "soul-history"
+
+    @property
     def plugins_dir(self) -> Path:
         raw = os.environ.get("PROTOAGENT_PLUGINS_DIR", "").strip()
         return Path(raw).expanduser() if raw else self.instance_root / "plugins"
@@ -553,6 +648,7 @@ class InstancePaths:
                 "setup_marker": str(self.setup_marker),
                 "theme_json": str(self.theme_json),
                 "soul_path": str(self.soul_path),
+                "soul_history_dir": str(self.soul_history_dir),
                 "plugins_dir": str(self.plugins_dir),
                 "plugins_lock": str(self.plugins_lock),
                 "workspace_dir": str(self.workspace_dir),

@@ -23,6 +23,8 @@ from pathlib import Path
 
 from filelock import FileLock
 
+from infra.paths import pid_alive
+
 from graph.workspaces import manager
 
 log = logging.getLogger(__name__)
@@ -106,9 +108,12 @@ def _alive(pid: int | None) -> bool:
         return False
     _reap(pid)  # clear a crashed child's zombie first, so the probe below sees it as gone
     try:
-        os.kill(int(pid), 0)  # signal 0 = liveness probe (a reaped zombie → ProcessLookupError)
-        return True
-    except (OSError, ValueError):
+        # pid_alive, not os.kill(pid, 0): the raw idiom isn't a liveness probe on
+        # Windows (signal 0 = CTRL_C_EVENT → OSError on live pids) and misreads a
+        # POSIX PermissionError (exists) as dead (#1678). A reaped zombie is gone
+        # from the table, so it still probes as dead here.
+        return pid_alive(int(pid))
+    except ValueError:
         return False
 
 
@@ -129,9 +134,47 @@ def is_running(ident: str) -> bool:
     return bool(rec) and _alive(rec.get("pid"))
 
 
+def _port_listening(port: int | None, timeout: float = 0.25) -> bool:
+    """Is something accepting connections on localhost:``port``? The member binds its
+    HTTP port early in boot, so this is the cheap 'it came up' signal."""
+    if not port:
+        return False
+    import socket
+
+    try:
+        with socket.create_connection(("127.0.0.1", int(port)), timeout=timeout):
+            return True
+    except (OSError, OverflowError, ValueError):  # unreachable, or a nonsense port record
+        return False
+
+
+def _log_tail_since(log_path: Path, offset: int, limit: int = 500) -> str:
+    """The last ``limit`` chars the child wrote past ``offset`` (the log is opened
+    append — earlier runs' output stays; only this boot's lines are the reason)."""
+    try:
+        with open(log_path, "rb") as f:
+            f.seek(offset)
+            fresh = f.read().decode("utf-8", errors="replace").strip()
+        return fresh[-limit:]
+    except OSError:
+        return ""
+
+
+# How long start() watches a fresh spawn for insta-death before returning. It returns
+# EARLY on either signal (port bound → up, process exited → raise), so a healthy boot
+# pays only its own bind latency and only a hung-but-not-listening child waits it out.
+_BOOT_WATCH_SECONDS = 10.0
+
+
 def start(ident: str) -> dict:
     """Spawn the workspace's agent (by id or display name) as a detached background
-    process. No-op (returns the live record) if it's already running."""
+    process. No-op (returns the live record) if it's already running.
+
+    Raises ``FleetError`` (with the fresh ``agent.log`` tail) when the child exits
+    during the boot watch — a member that dies at boot (broken spawn, bad config,
+    taken port) used to report ``running: true`` and just show up dead on the next
+    poll, with the reason buried in a log nothing surfaced (#1565 fallout).
+    """
     ws = manager._find(manager._safe(ident))
     if ws is None:
         raise FleetError(f"no workspace {ident!r} — create it: workspace new {ident}")
@@ -145,8 +188,45 @@ def start(ident: str) -> dict:
 
         env, argv = manager.run_exec(wid, ["--ui", "none"])
         full_env = {**os.environ, **env}
+        # A hub-spawned member binds loopback and is reached in-process — the fleet proxy
+        # attaches the hub's own token, and the portfolio PM treats a local board as
+        # tokenless. But the child inherits the hub's INBOUND ``A2A_AUTH_TOKEN`` here, which
+        # would make it REQUIRE a bearer that a token-free local dispatch never sends → 401
+        # (a spawned team is unreachable by its own PM). So a spawned member runs OPEN on
+        # loopback unless its own workspace env set a token explicitly. Loopback-only, so
+        # open is safe; ``PROTOAGENT_ALLOW_OPEN`` covers the case it binds a non-loopback host.
+        if "A2A_AUTH_TOKEN" not in env:
+            full_env.pop("A2A_AUTH_TOKEN", None)
+            full_env.setdefault("PROTOAGENT_ALLOW_OPEN", "1")
+        # A2A URL-based multi-tenancy (A2A spec — Multi-Tenancy § URL-based routing). The
+        # hub reverse-proxies ``/agents/<slug>/*`` to this member (ADR 0042), so the member's
+        # reachable A2A endpoint is the hub's tenant SUB-PATH, not the hub root. But the child
+        # inherits the hub's ``A2A_PUBLIC_URL`` here, so its agent-card's interface ``url``
+        # (``_a2a_card_url`` = ``{A2A_PUBLIC_URL}/a2a``) would advertise the hub root — a peer
+        # that DISCOVERS the member's card would dial the hub (→ the hub agent) instead of the
+        # member, and every member's card would collide on the same URL. Point the member's
+        # advertised public URL at its own tenant path so its card is self-consistent and
+        # directly dial-able (``{hub}/agents/<wid>/a2a``). Respect an explicit per-workspace
+        # override (mirrors the token rule above); no-op when the hub itself has no public URL
+        # (local/desktop runs advertise the bound loopback port, already per-member).
+        if "A2A_PUBLIC_URL" not in env:
+            hub_public_url = (os.environ.get("A2A_PUBLIC_URL") or "").strip().rstrip("/")
+            if hub_public_url:
+                full_env["A2A_PUBLIC_URL"] = f"{hub_public_url}/agents/{wid}"
+        # AGENT_NAME namespaces several subsystems that read os.environ directly rather
+        # than the resolved config identity: Prometheus metric prefixes
+        # (observability/metrics.py), trace tags (observability/tracing.py,
+        # graph/middleware/trace_context.py), scheduler storage
+        # (scheduler/local.py — a real collision risk when members share a storage
+        # path), and the ``<AGENT_NAME>_API_KEY`` lookup (server/agent_init.py,
+        # evals/client.py). full_env otherwise inherits the hub's AGENT_NAME from
+        # os.environ, so a member runs every one of those under the HUB's name. An
+        # explicit per-workspace value still wins (mirrors the pair above).
+        if "AGENT_NAME" not in env:
+            full_env["AGENT_NAME"] = name
         log_path = _log_path(ws)
         log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_offset = log_path.stat().st_size if log_path.exists() else 0
         logf = open(log_path, "a")  # noqa: SIM115 — handed to the child; closed on its exit
         # start_new_session detaches it from this CLI's process group so it survives exit.
         proc = subprocess.Popen(argv, env=full_env, stdout=logf, stderr=logf, start_new_session=True)
@@ -167,6 +247,28 @@ def start(ident: str) -> dict:
         }
         state[wid] = rec
         _save_state(state)
+
+    # Boot watch — OUTSIDE the lock (like stop()'s kill) so other state ops can't freeze
+    # behind it. NOTE: blocks up to _BOOT_WATCH_SECONDS; call off the event loop
+    # (``asyncio.to_thread``) — the routes do.
+    deadline = time.monotonic() + _BOOT_WATCH_SECONDS
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:  # died at boot — reap the entry + surface the reason
+            with _state_lock():
+                state = _load_state()
+                if (state.get(wid) or {}).get("pid") == proc.pid:
+                    state.pop(wid, None)
+                    _save_state(state)
+            tail = _log_tail_since(log_path, log_offset)
+            log.error("[fleet] %s exited during boot (code %s): %s", name, proc.returncode, tail)
+            raise FleetError(
+                f"{name!r} exited during boot (exit code {proc.returncode})."
+                + (f" Log tail: {tail}" if tail else "")
+                + f" Full log: {log_path}"
+            )
+        if _port_listening(rec["port"]):
+            break
+        time.sleep(0.2)
     log.info("[fleet] started %s (pid %d, :%s)", name, proc.pid, rec["port"])
     return {**rec, "name": name, "running": True, "already": False}
 
@@ -222,7 +324,7 @@ def _host_entry() -> dict:
     cfg = getattr(STATE, "graph_config", None)
     name = getattr(cfg, "identity_name", "") or "main"
     port = getattr(STATE, "active_port", None)
-    return {
+    entry = {
         "name": name,
         "id": getattr(cfg, "instance_id", "") or name,
         "port": port,
@@ -236,6 +338,14 @@ def _host_entry() -> dict:
         # release is a real, otherwise-invisible /api/* compat surface.
         "version": package_version(),
     }
+    # This instance is itself a workspace member SPAWNED by another hub's supervisor
+    # (the `workspace.yaml` record at its instance root is the spawn-time marker).
+    # Surfaced read-only on the existing /api/fleet payload so a console reaching the
+    # member DIRECTLY (its own port) can gate hub-only affordances — the header's
+    # "Fleet settings" item disables with a point-at-the-host tooltip (#1708).
+    if manager.is_workspace_member():
+        entry["member"] = True
+    return entry
 
 
 # ── remote fleet members (ADR 0042 §I, the proxy half) ────────────────────────
@@ -290,26 +400,35 @@ def remote_for_slug(slug: str) -> dict | None:
     return _load_remotes().get(slug)
 
 
+def _normalize_remote_url(url: str) -> str:
+    """Validate + canonicalize a remote member URL (trailing slash trimmed, must be http(s),
+    SSRF-guarded). Shared by add/update. Raises FleetError.
+
+    SSRF guard (#871): the hub reverse-proxies /agents/<slug>/* to this URL, so a registered
+    remote can turn the hub into an internal-network proxy. Fleet remotes ARE normally private
+    (LAN / tailnet / a co-located instance), so allow_private — but ALWAYS block
+    link-local/cloud-metadata (169.254.169.254), multicast, reserved.
+    """
+    u = (url or "").strip().rstrip("/")
+    if not u.startswith(("http://", "https://")):
+        raise FleetError(f"remote url must be http(s), got {u!r}")
+    from security import egress
+
+    if egress.check_url(u, allow_private=True, block_unresolvable=False):
+        raise FleetError(
+            f"remote url {u} is blocked by the egress guard (link-local/metadata/"
+            f"reserved address); allowlist it via egress.allowed_hosts if intentional"
+        )
+    return u
+
+
 def add_remote(name: str, url: str, token: str = "") -> dict:
     """Register a remote protoAgent as a fleet member. Name follows the workspace
     charset + uniqueness rules; the id is opaque like a local agent's (#823)."""
     name = manager._safe(name)
     if name.lower() in manager._RESERVED_NAMES:
         raise FleetError(f"{name!r} is reserved — it's how the fleet addresses this instance")
-    url = (url or "").strip().rstrip("/")
-    if not url.startswith(("http://", "https://")):
-        raise FleetError(f"remote url must be http(s), got {url!r}")
-    # SSRF guard (#871): the hub reverse-proxies /agents/<slug>/* to this URL, so a
-    # registered remote can turn the hub into an internal-network proxy. Fleet remotes
-    # ARE normally private (LAN / tailnet / a co-located instance), so allow_private —
-    # but ALWAYS block link-local/cloud-metadata (169.254.169.254), multicast, reserved.
-    from security import egress
-
-    if egress.check_url(url, allow_private=True, block_unresolvable=False):
-        raise FleetError(
-            f"remote url {url} is blocked by the egress guard (link-local/metadata/"
-            f"reserved address); allowlist it via egress.allowed_hosts if intentional"
-        )
+    url = _normalize_remote_url(url)
     with _remotes_lock():
         remotes = _load_remotes()
         taken = {r["name"] for r in remotes.values()} | {w["name"] for w in manager.list_workspaces()}
@@ -322,6 +441,43 @@ def add_remote(name: str, url: str, token: str = "") -> dict:
         remotes[rid] = rec
         _save_remotes(remotes)
     log.info("[fleet] remote member added: %s (%s)", name, url)
+    return {k: v for k, v in rec.items() if k != "token"}
+
+
+def update_remote(ident: str, *, name: str | None = None, url: str | None = None, token: str | None = None) -> dict:
+    """Edit a registered remote's ``name`` / ``url`` / ``token`` in place (by id or name).
+
+    Only the fields you pass change — a ``None`` field is left as-is, so ``token=None`` KEEPS
+    the stored bearer while ``token=""`` clears it (the recovery path for a rotated/wrong
+    token). The id — and so the URL slug, open windows, and data scope — never changes. Re-runs
+    the same reserved-name / SSRF-egress / collision checks as ``add_remote``. Returns the
+    sanitized record (token stripped). ``FleetError`` if no such remote.
+    """
+    with _remotes_lock():
+        remotes = _load_remotes()
+        rid = ident if ident in remotes else next((k for k, r in remotes.items() if r["name"] == ident), None)
+        if rid is None:
+            raise FleetError(f"no remote member {ident!r}")
+        rec = dict(remotes[rid])
+        if name is not None:
+            new_name = manager._safe(name)
+            if new_name.lower() in manager._RESERVED_NAMES:
+                raise FleetError(f"{new_name!r} is reserved — it's how the fleet addresses this instance")
+            others = {r["name"] for k, r in remotes.items() if k != rid} | {w["name"] for w in manager.list_workspaces()}
+            if new_name in others:
+                raise FleetError(f"an agent named {new_name!r} already exists")
+            rec["name"] = new_name
+        if url is not None:
+            new_url = _normalize_remote_url(url)
+            if any(r["url"] == new_url for k, r in remotes.items() if k != rid):
+                raise FleetError(f"a remote at {new_url} is already in the fleet")
+            rec["url"] = new_url
+        if token is not None:
+            rec["token"] = token
+        remotes[rid] = rec
+        _save_remotes(remotes)
+    _probe_cache.pop(rid, None)  # url/token may have changed reachability — force a fresh probe
+    log.info("[fleet] remote member updated: %s (%s)", rec["name"], rec["url"])
     return {k: v for k, v in rec.items() if k != "token"}
 
 
@@ -471,9 +627,16 @@ def status() -> list[dict]:
 
 
 def up(names: list[str] | None = None) -> list[dict]:
-    """Start a set of agents (named, or all workspaces)."""
-    targets = names or [w["name"] for w in manager.list_workspaces()]
-    return [start(n) for n in targets]
+    """Start a set of agents (named, or all workspaces). One member dying at boot
+    (start() now raises on that) doesn't abort the rest — it's reported as its own
+    ``{running: False, error}`` row instead."""
+    out = []
+    for n in names or [w["name"] for w in manager.list_workspaces()]:
+        try:
+            out.append(start(n))
+        except FleetError as exc:
+            out.append({"name": n, "running": False, "error": str(exc)})
+    return out
 
 
 def down(names: list[str] | None = None) -> list[dict]:
@@ -592,6 +755,69 @@ def reconcile_on_boot() -> str:
     except Exception:  # noqa: BLE001 — boot reconcile must never block startup
         log.exception("[fleet] boot version reconcile failed")
     return previous
+
+
+def autostart_members() -> list[str]:
+    """The configured ``fleet.autostart`` roster — member ids or display names to keep
+    (re)started at hub boot. Live config first (folds in the ``PROTOAGENT_FLEET_AUTOSTART``
+    comma-separated env fallback, file > env > default), else the env var directly when no
+    config is loaded. Accepts a list or a comma-separated string; blanks are dropped."""
+    raw: object = None
+    cfg = _live_config()
+    if cfg is not None:
+        raw = getattr(cfg, "fleet_autostart", None)
+    if raw is None:
+        raw = os.environ.get("PROTOAGENT_FLEET_AUTOSTART", "")
+    items = raw.split(",") if isinstance(raw, str) else raw
+    try:
+        return [str(x).strip() for x in items if str(x).strip()]
+    except TypeError:  # a non-iterable in config — treat as empty rather than raise at boot
+        return []
+
+
+def start_autostart_members() -> list[str]:
+    """(Re)start every configured autostart member that isn't already alive — the
+    hub-boot half of ADR 0072's ``autostart``.
+
+    A container recreate or host restart kills the detached member processes (fresh pid
+    namespace), but ``fleet.json`` in the volume keeps their now-dead records; without
+    this the declared crew stays down until someone re-activates each by hand. Idempotent:
+    an already-running member is skipped (never double-spawned).
+
+    Hub-only by construction, like :func:`reconcile_on_boot`: a member runs
+    ``PROTOAGENT_INSTANCE``-scoped, so its own config carries no autostart roster and this
+    no-ops inside a member. Best-effort per member — a missing workspace or a boot-time
+    spawn failure is logged and skipped, never blocking the hub or the rest of the roster.
+    Members are started sequentially (each ``start`` briefly boot-watches the child); call
+    off the event loop (the boot hook does via ``asyncio.to_thread``).
+    """
+    # Hub-only — enforced, not merely "by construction". A member inherits the hub's
+    # PROTOAGENT_FLEET_AUTOSTART env, so autostart_members() returns a NON-empty roster
+    # inside a member too (the config-carries-no-roster guarantee only covers the config
+    # source, not the env fallback). Acting on it there scans the member's own empty
+    # workspaces root and logs a spurious "no workspace <id> — skipping" for every id.
+    if manager.is_workspace_member():
+        return []
+    roster = autostart_members()
+    if not roster:
+        return []
+    started: list[str] = []
+    for ident in roster:
+        try:
+            if is_running(ident):
+                continue
+            if manager._find(manager._safe(ident)) is None:
+                log.warning("[fleet] autostart: no workspace %r — skipping (create it first)", ident)
+                continue
+            start(ident)
+            started.append(ident)
+        except FleetError as exc:
+            log.error("[fleet] autostart: %r failed to start: %s", ident, exc)
+        except Exception:  # noqa: BLE001 — autostart must never block hub boot
+            log.exception("[fleet] autostart: unexpected error starting %r", ident)
+    if started:
+        log.info("[fleet] autostart: (re)started %d member(s): %s", len(started), ", ".join(started))
+    return started
 
 
 def version_skew_warning() -> str | None:

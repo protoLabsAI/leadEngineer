@@ -1,8 +1,9 @@
 """Goal verifiers — the testable-outcome backing for goal mode.
 
 Each verifier is ``async verify(spec, ctx) -> VerifyResult``. ``spec`` is the
-goal's ``verifier`` dict (``type`` + params); ``ctx`` carries the runtime
-(config + last-turn transcript) the verifier may need. Look up by
+goal's ``verifier`` dict (``type`` + params); ``ctx`` is a ``VerifyContext``
+carrying the runtime (config + last-turn transcript) the verifier may need,
+plus ``ctx.invoker`` — which goal/watch is polling (#1641). Look up by
 ``spec["type"]`` in ``VERIFIERS``.
 
 Types:
@@ -24,6 +25,7 @@ import ast
 import json
 import logging
 from dataclasses import dataclass
+from typing import Literal
 
 from graph.goals.types import VerifyResult
 
@@ -84,13 +86,44 @@ def _eval_data_expr(expr: str, data):
     return eval(code, {"__builtins__": _SAFE_BUILTINS}, {"data": data})  # noqa: S307 — AST-validated above
 
 
+@dataclass(frozen=True)
+class VerifierInvoker:
+    """Identity of the goal/watch whose controller is running the verifier (#1641).
+
+    Lets a plugin verifier tell WHO is polling it — so it can key per-invoker
+    state (e.g. one drawdown high-water mark PER watch instead of one global
+    mark), tailor evidence, or log trips against the right context. Frozen and
+    hashable, so the invoker itself (or ``(kind, id)``) works as a dict key.
+
+    kind       — ``"goal"`` or ``"watch"``.
+    id         — the invoker's id: a goal is keyed by its session (== ``session_id``);
+                 a watch by its own watch id.
+    session_id — the session that owns the invoker: the goal's session, or the
+                 watch's ``run_session`` (``""`` when the watch targets no session).
+    interval_s — the watch's effective polling cadence (its ``interval_s``
+                 override, else the config ``watch_interval``); ``None`` for
+                 goals (they evaluate post-turn, not on a cadence).
+    """
+
+    kind: Literal["goal", "watch"]
+    id: str
+    session_id: str = ""
+    interval_s: float | None = None
+
+
 @dataclass
 class VerifyContext:
+    # These five fields are the frozen (pre-#1641) ctx contract external plugin
+    # verifiers may already read — enrich this dataclass additively, never
+    # rename/remove them.
     config: object = None
     condition: str = ""  # the goal condition (used by the llm verifier)
     last_text: str = ""  # last assistant message of the turn
     tool_summary: str = ""  # short summary of recent tool calls
     cwd: str | None = None  # working dir for command/test verifiers
+    # Who is polling — set by the goal/watch controllers (#1641); None when the
+    # verifier runs outside either loop (e.g. a direct run_verifier call).
+    invoker: VerifierInvoker | None = None
 
 
 def _tail(text: str, cap: int = _EVIDENCE_CAP) -> str:
@@ -258,6 +291,11 @@ async def _verify_llm(spec: dict, ctx: VerifyContext) -> VerifyResult:
 # with declarative args — no shell, no eval (that's why a ``plugin`` goal is the
 # only verifier type safe to set programmatically; see ADR 0028 D3).
 _PLUGIN_VERIFIERS: dict = {}
+# Plugin-verifier names already warned as unknown — so an armed goal/watch on a missing
+# verifier logs ONCE, not once per tick (a stalled watch re-checks every cadence, 60+×/hour).
+# Cleared whenever the mapping is re-set, so a still-missing name warns again after a reload
+# and a now-present one goes quiet.
+_WARNED_UNKNOWN_VERIFIERS: set[str] = set()
 
 
 def set_plugin_verifiers(mapping: dict | None) -> None:
@@ -273,6 +311,10 @@ def set_plugin_verifiers(mapping: dict | None) -> None:
     so reassigning the global is safe.)"""
     global _PLUGIN_VERIFIERS
     _PLUGIN_VERIFIERS = dict(mapping or {})
+    # A fresh mapping may now resolve names that were unknown before (e.g. a plugin update
+    # that registers new verifiers, #1752) — reset the dedup set so a still-missing name
+    # warns again and a now-present one stops.
+    _WARNED_UNKNOWN_VERIFIERS.clear()
 
 
 def plugin_verifier_names() -> list[str]:
@@ -287,6 +329,19 @@ async def _verify_plugin(spec: dict, ctx: VerifyContext) -> VerifyResult:
     name = (spec or {}).get("check") or ""
     fn = _PLUGIN_VERIFIERS.get(name)
     if fn is None:
+        # An armed goal/watch pointing at a verifier the live registry doesn't know can never
+        # evaluate — it errors every tick, silently, visible only by polling state. Surface it
+        # once (deduped) so an "armed but blind" monitor (e.g. a plugin update that didn't
+        # refresh the registry, #1752) is diagnosable from the logs.
+        if name and name not in _WARNED_UNKNOWN_VERIFIERS:
+            _WARNED_UNKNOWN_VERIFIERS.add(name)
+            log.warning(
+                "[goal] unknown plugin verifier %r — an armed goal/watch on it can never "
+                "evaluate. Is its plugin installed+enabled, and did the last plugin "
+                "update/reload re-register it? Known: %s",
+                name,
+                ", ".join(sorted(_PLUGIN_VERIFIERS)) or "(none)",
+            )
         return VerifyResult(False, f"unknown plugin verifier {name!r}", "")
     try:
         return await fn(spec, ctx)

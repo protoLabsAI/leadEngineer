@@ -25,6 +25,12 @@ model:
   # protolabs/smart, protolabs/reasoning/deepseek-v4). Chat then sends attached
   # images straight to the model instead of through the extraction pipeline.
   vision: false
+  # Favorite models (#1957) — pinned go-to models the chat `/model` quick-switch
+  # offers (in this order) instead of the gateway's full list. Manage them in
+  # Settings ▸ Model ▸ Favorite models; empty/omitted = /model shows every model.
+  #   favorites:
+  #     - protolabs/fast
+  #     - protolabs/reasoning
   request_timeout: 120   # per-call timeout (s) on the model client — bounds a hung/slow gateway
   max_retries: 2         # transient-error retries inside the client
   # Advanced sampling — all optional; omit to use the gateway / model-card
@@ -79,11 +85,10 @@ knowledge:
   # shared/layered fleet must share ONE embed_model (the commons is stamped + enforced).
   # scope: scoped
   # Semantic recall: hybrid FTS5 + vector search (RRF-fused) via embed_model.
-  # Off by default (keyword-only) — turn on once your gateway serves an
-  # embedding model. Degrades to keyword search on embedding outage.
-  # Hybrid semantic + keyword recall (RRF). On by default; falls back to
-  # keyword-only via the circuit breaker if the gateway can't embed.
-  embeddings: true
+  # OFF by default (#1681) — keyword recall works against any gateway; turn this
+  # on once yours serves the embedding model below (check GET /v1/models). When
+  # on, a route outage degrades to keyword-only via the circuit breaker.
+  embeddings: false
   # The embedding model your gateway serves (NOT the chat model). Default is the
   # protoLabs gateway's; forks on another gateway set theirs (check GET /v1/models).
   embed_model: qwen3-embedding
@@ -95,6 +100,25 @@ knowledge:
   # consolidate them into the store. Rides the harvest pass (ADR 0021).
   facts: true
   top_k: 5
+  # Namespace scope for the per-turn AUTO-INJECTED recall (ADR 0069 D3a). Unset =
+  # no filter (every chunk is eligible — box-commons sharing keeps working). When
+  # set, only chunks whose `namespace` matches a listed value auto-inject; include
+  # "" to also match un-namespaced chunks. memory_recall stays unscoped.
+  # inject_namespaces:
+  #   - "projects/alpha"
+  #   - ""
+  # Trust floor for the per-turn AUTO-INJECTED recall (ADR 0069 D8). Chunks rank
+  # into deterministic trust tiers by source_type: 3 = operator-authored, 2 =
+  # agent-derived (extracted facts, harvest, memory_ingest), 1 = ingested/external
+  # (web, YouTube, PDFs, media) and unknown. 1 (default) excludes nothing — low
+  # tiers are only ranked below higher ones; 2 drops external content from
+  # auto-injection; 3 = operator rows only. memory_recall is never gated.
+  # inject_min_trust: 1
+  # Hot-memory write confirm gate (ADR 0069 D8). When true, the agent's
+  # memory_ingest refuses domain="hot" writes (it must ask the operator);
+  # operator surfaces are unaffected. Every hot write emits a
+  # `memory.hot_written` bus event either way.
+  # hot_write_confirm: false
   # Document chunking on ingest (ADR 0021) — large bodies (conversation
   # summaries, pasted docs) are split into overlapping passages BEFORE
   # embedding, so each passage gets its own vector instead of one diluted
@@ -215,6 +239,24 @@ checkpoint:
   # checkpoints. Needs the knowledge middleware enabled.
   harvest_enabled: true
 
+# Media output store (#1929) — binary artifacts (images/audio/video) plugin
+# tools persist via registry.save_media() and the core /media/<file> route
+# serves. Gated by default: each saved URL carries a per-file HMAC signature so
+# inline chat images render even under a bearer gate, while unsigned requests
+# are denied. Both knobs are optional:
+#   public: true opts the WHOLE store out of the auth gate (explicit exposure).
+#   retention_days prunes files older than N days on each save (0 = keep forever).
+# media:
+#   public: false
+#   retention_days: 0
+
+# Background jobs (ADR 0050/0070) — delegations fired with run_in_background.
+# auto_resume: when a job finishes, immediately run a turn in the session that
+# spawned it so the agent reviews the report and briefs the operator; false
+# restores pull-only delivery (the report drains on that session's next turn).
+background:
+  auto_resume: true
+
 # Model routing / failover.
 #   aux_model: ONE cheap/fast alias for the non-reasoning calls — context
 #     summarization, goal verification, and subagent delegation all fall back
@@ -245,6 +287,14 @@ checkpoint:
 goal:
   # eval_model: protolabs/fast
   max_iterations: 8
+
+# Persona — the agent's own SOUL.md. `self_edit_enabled` (OFF by default) gives the
+# LEAD agent the `edit_soul` tool so it can rewrite SECTIONS of its own persona
+# (identity/voice ONLY, never operating doctrine — ADR 0079/0081). Every edit is
+# snapshotted to soul-history (#1691, restorable from Settings ▸ Identity) and takes
+# effect on the next turn. Guarded self-modification — enable deliberately.
+soul:
+  self_edit_enabled: false
 
 # Programmatic tool calling — let the model write ONE Python script that
 # composes several tools in a single turn (collapses long tool-call chains).
@@ -291,10 +341,34 @@ fleet:
   discovery:
     port_min: 7860          # LAN/tailnet discovery scan window (inclusive)
     port_max: 7910
-    mdns: true              # advertise + browse the _protoagent._tcp mDNS channel
+    mdns: false             # opt-in (#1802): advertise + browse _protoagent._tcp on the LAN. Off = stay quiet on the network
   warm:
     max: 0                  # warm-agent cap (0 = unlimited)
     grace_seconds: 0        # spare agents touched within N seconds from LRU eviction
+  autostart: []             # member ids/names the hub (re)starts on boot (survives container recreate);
+                            # e.g. [cindi, matt]. Env: PROTOAGENT_FLEET_AUTOSTART (comma-separated)
+
+# External secrets manager (ADR 0080) — pull secrets from Infisical at boot, on
+# config reload, and on a refresh interval, and export them as ENV VARS. Values fill
+# the documented env fallback tier (OPENAI_API_KEY, A2A_AUTH_TOKEN, plugin
+# requires_env, …): an env var you set yourself still wins (unless override_env),
+# and secrets.yaml still beats everything. Bootstrap credentials — the machine
+# identity — are the ONE pair that stays local: set INFISICAL_CLIENT_ID /
+# INFISICAL_CLIENT_SECRET in the environment, or put client_id / client_secret
+# under `secrets_manager:` in secrets.yaml (the Settings UI stores them there).
+# Editable in-app: Settings ▸ Secrets manager (incl. connection test + sync-now).
+# secrets_manager:
+#   enabled: true
+#   provider: infisical
+#   host: https://us.infisical.com   # or https://eu.infisical.com / your self-hosted URL
+#   project_id: ""
+#   environment: prod                # the dev sandbox instance can point at `dev`
+#   path: /
+#   recursive: true                  # include subfolders under `path`
+#   refresh_seconds: 300             # re-pull cadence; 0 = boot/config-reload only
+#   required: false                  # true = refuse to boot when the manager is unreachable
+#   override_env: false              # true = manager values beat pre-existing env vars
+#   timeout_seconds: 10
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Lead Engineer configuration — this fork's identity.

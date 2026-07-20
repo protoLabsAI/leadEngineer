@@ -92,6 +92,10 @@ export type RuntimeStatus = {
     tools: string[];
     skills: number;
     error?: string;
+    // Required-config gate (#1719): the plugin loaded but a `required: true` setting
+    // is still blank — its tools return a "needs setup" notice until it's configured.
+    incomplete?: boolean;
+    needs_config?: { key: string; label: string }[];
     // Console surfaces (ADR 0026): rail views the plugin contributes.
     views?: PluginView[];
   }[];
@@ -104,6 +108,11 @@ export type PluginView = {
   label: string;
   icon?: string; // a lucide-react icon name
   path: string;
+  // The console surface key (`plugin:<pluginId>:<viewId>`) — stamped on by App when it
+  // builds the view list from runtime status. The view host needs it to report per-view
+  // state upward (a `background: true` subscribe → the ui store, #1640). Optional:
+  // absent on raw manifest-shaped views that never passed through App's mapping.
+  key?: string;
   tabs?: { id: string; label: string; path: string }[];
   // "rail" (default) = a left-rail surface; "right" = a right-sidebar panel
   // alongside Notes/Tasks/Goals/Schedule (ADR 0026); "bottom" = the bottom dock.
@@ -148,6 +157,13 @@ export type InstalledPlugin = {
   // still listed (and enabled/loaded normally); it just isn't update-tracked.
   tracked?: boolean;
   enabled: boolean;
+  // Required-config gate (#1719) — merged from the loader meta: true when the plugin
+  // loaded but a `required: true` setting is blank, with the fields still needed.
+  incomplete?: boolean;
+  needs_config?: { key: string; label: string }[];
+  // Declared requires_pip entries missing from the runtime — drives the one-click
+  // "Install deps" action (POST /api/plugins/install-deps).
+  deps_missing?: string[];
   manifest?: {
     name: string;
     version: string;
@@ -161,6 +177,9 @@ export type InstalledPlugin = {
     secrets?: string[];
   };
 };
+
+// A fenced filesystem root (ADR 0007) — one entry of `filesystem.projects`.
+export type FsProject = { name?: string; path: string; write: boolean };
 
 // An entry in the official-plugin directory (GET /api/plugins/catalog, ADR 0059),
 // merged with install state. `repo` is the install URL — one-click install runs
@@ -211,12 +230,15 @@ export type McpCatalogEntry = {
 // the network; the rest ls-remote their ref. `behind` ⇒ the recorded
 // `current_sha` lags `latest_sha`; a per-entry `error` is non-fatal (the check
 // failed, the row stays usable). `latest_sha` is null when pinned or on error.
+// `latest_ref` is set when a release-tag pin has a NEWER semver tag to move to
+// (the update installs that tag); null for branch refs / moved-tag cases.
 export type PluginUpdate = {
   id: string;
   behind: boolean;
   pinned: boolean;
   current_sha: string;
   latest_sha: string | null;
+  latest_ref?: string | null;
   error?: string | null;
 };
 
@@ -237,6 +259,10 @@ export type SlashCommand = {
   name: string;
   description: string;
   usage?: string;
+  // What the token dispatches to (server-resolved: "workflow" | "subagent" | "skill" |
+  // "plugin_command"…) — shown as a badge in the composer palette so the operator knows
+  // what kind of thing /name runs (#1660). Client-registered commands carry none.
+  kind?: string;
 };
 
 export type SettingsField = {
@@ -279,6 +305,34 @@ export type SettingsGroup = {
   // Plugins surface fold this group into that plugin's Installed row.
   plugin_id?: string;
   guide_url?: string;  // ADR 0059 — optional setup-guide link rendered next to the group
+};
+
+// External secrets manager (ADR 0080) — GET /api/secrets/status + POST /api/secrets/sync.
+// Names only, never secret values; `vars` are the env vars the hydrator currently owns.
+export type SecretsStatus = {
+  enabled: boolean;
+  provider: string;
+  host: string;
+  project_id: string;
+  environment: string;
+  path: string;
+  ok: boolean;
+  error: string;
+  error_kind: string;
+  fetched_at: string;
+  applied: number;
+  shadowed: string[];
+  refresh_seconds: number;
+  vars: string[];
+};
+
+// POST /api/secrets/test — fetch-only connection probe; applies nothing.
+export type SecretsTestResult = {
+  ok: boolean;
+  error: string;
+  error_kind: string;
+  count: number;
+  names: string[];
 };
 
 export type WorkflowSummary = {
@@ -332,6 +386,14 @@ export type GoalState = {
   condition: string;
   status: string;
   verifier?: { type?: string } & Record<string, unknown>;
+  // Completion contract (ADR 0073) — a structured layer OVER the verifier that shapes
+  // each drive-turn continuation prompt (the verifier still decides DONE). All optional;
+  // absent on contract-less goals. Part 2's goal-creation form sets these; the GoalsPanel
+  // can surface them.
+  outcome?: string; // the single required end-state (human summary; defaults to condition)
+  constraints?: string[]; // invariants that must NOT change/regress
+  boundaries?: string[]; // files/dirs/systems in scope
+  stop_when?: string; // condition under which the agent pauses and asks the operator
   mode?: "drive" | "monitor";
   iteration?: number;
   max_iterations?: number;
@@ -358,6 +420,7 @@ export type WatchState = {
   last_reason?: string;
   last_evidence?: string;
   last_checked?: number | null; // last out-of-band verifier check (epoch seconds)
+  finished_at?: number | null; // met/expired time (epoch seconds); the met path sets THIS, not last_checked
   created_at?: number;
 };
 
@@ -385,12 +448,15 @@ export type Subagent = {
 };
 
 // A live wired tool (Agent → Tools): its source (core/plugin/mcp) + the subsystem
-// category it's grouped under in the console.
+// category it's grouped under in the console. `enabled: false` = present in the
+// assembled catalog but dropped by the tools.disabled denylist (still listed so the
+// operator can toggle it back on).
 export type ToolInfo = {
   name: string;
   description: string;
   source: "core" | "plugin" | "mcp";
   category?: string;
+  enabled: boolean;
 };
 
 export type ToolCall = {
@@ -451,7 +517,7 @@ export type ChatPart =
   | { kind: "component"; spec: ComponentSpec };
 
 /** Per-turn token usage + cost, accumulated across the turn's LLM calls — lifted off the
- *  terminal cost-v1 DataPart (A2A ext, ADR 0006). `inputTokens` is the SUM of prompt tokens
+ *  terminal cost-v1 extension (A2A ext, ADR 0006 — URI-keyed artifact metadata). `inputTokens` is the SUM of prompt tokens
  *  across the turn's calls (so a tool-loop turn counts each model call's prompt), NOT the live
  *  context-window fill; it's a per-turn spend/size readout, not a context-fullness gauge. */
 export type TurnUsage = {
@@ -510,7 +576,7 @@ export type ChatMessage = {
    *  shows the server's preview; this lets the card open the FULL report in the document
    *  viewer (fetched by id) instead of forcing a trip to the Activity/Background panel. */
   report?: { jobId: string; title: string };
-  /** This turn's token usage + cost (terminal cost-v1 DataPart). Shown as a small footer
+  /** This turn's token usage + cost (terminal cost-v1 extension metadata). Shown as a small footer
    *  under the answer; absent on user turns and history saved before this shipped. */
   usage?: TurnUsage;
   /** This turn's context-window fill + compaction threshold (terminal context-v1 DataPart).
@@ -539,6 +605,10 @@ export type HitlPayload = {
   steps?: HitlFormStep[];
   question?: string; // ask_human shape
   detail?: string; // approval shape — the command/action being approved
+  // #1701 Slice 2: set when this input-required is a PLUGIN composer-form (not a graph
+  // interrupt). The console redeems the answers via POST /api/chat/commands/submit with
+  // this id instead of resuming the agent graph.
+  plugin_callback_id?: string;
 };
 
 
@@ -712,9 +782,76 @@ export type KnowledgeChunk = {
   source_type: string | null;
   finding_type: string | null;
   created_at: string | null;
+  // BM25/RRF relevance — the backend always sends it (null on plain listings).
+  score?: number | null;
   // Tier (ADR 0041 / bd-2wu): "private" | "commons" — present only when the store is
   // layered (commons ∪ private); null otherwise. Drives the tier badge + promote/unshare.
   tier?: "private" | "commons" | null;
+};
+
+// One hot-memory row (GET /api/memory/hot): a knowledge chunk plus whether it's
+// inside the CURRENT per-turn injection window (the newest ~100 domain="hot"
+// chunks under the character budget). Absent on backends that predate the field
+// (or custom stores without get_hot_memory_entries) → unknown; the console only
+// draws the "not injecting" badge on an explicit `false`.
+export type MemoryHotChunk = KnowledgeChunk & { injecting?: boolean };
+
+// Memory inspector (ADR 0069 D7) — the delivery-layer audit surface.
+// One session-summary digest row (GET /api/memory/sessions) — the same
+// derivation the <prior_sessions> digest injects, so the list can't drift
+// from what the agent is actually told.
+export type MemorySessionDigest = {
+  session_id: string;
+  timestamp: string;
+  surface: string; // chat | background | a2a | …
+  topic: string;
+  message_count: number;
+  size_bytes?: number;
+  // Whether this session is in the CURRENT <prior_sessions> digest window (the
+  // ~10 newest under the token cap, background:* excluded). Absent on older
+  // backends → unknown; only an explicit `false` draws the "not in digest" badge.
+  in_digest?: boolean;
+  // Detail-only fields (GET /api/memory/sessions/{id}):
+  trace_id?: string | null;
+  rendered?: string; // the full render recall_session returns
+};
+
+// One per-model-call injection record (GET /api/memory/injections, ADR 0069 D6):
+// which memory items entered which turn — the poisoning-forensics trail.
+export type MemoryInjectionRow = {
+  id: number;
+  ts: string;
+  session_id: string;
+  digest_session_ids: string[];
+  hot_chunk_ids: number[];
+  rag_chunk_ids: number[];
+  approx_tokens: number;
+};
+
+// The RESOLVED detail for one injection record (GET /api/memory/injections/{id}):
+// the id arrays turned into their referenced content, grouped for the detail
+// dialog. An item whose underlying chunk was pruned/deleted comes back
+// `unavailable` (the dialog shows "no longer stored") rather than dropping it.
+export type InjectionPastSession = { id: string; title: string | null };
+export type InjectionMemoryItem = {
+  id: number;
+  heading: string | null;
+  snippet: string | null;
+  unavailable: boolean;
+};
+export type InjectionDocItem = {
+  id: number;
+  source: string | null;
+  snippet: string | null;
+  unavailable: boolean;
+};
+export type MemoryInjectionDetail = {
+  ts: string;
+  session_id: string;
+  past_sessions: InjectionPastSession[];
+  memories: InjectionMemoryItem[];
+  docs: InjectionDocItem[];
+  approx_tokens: number;
 };
 
 // Delegate registry (ADR 0025) — the agents & endpoints the agent can talk to.
@@ -754,6 +891,10 @@ export type FleetAgent = {
   bundle: string; // "" for a Basic agent
   a2a?: string; // the agent's own A2A endpoint (focus-independent)
   host?: boolean; // the instance serving this console — can't be stopped/removed from itself
+  // Only ever set on the `host` entry, by the instance itself: this instance is a workspace
+  // member SPAWNED by another hub's supervisor (its instance root carries a workspace.yaml).
+  // Consoles reaching a member directly use it to gate hub-only affordances (#1708).
+  member?: boolean;
   remote?: boolean; // a REMOTE member (ADR 0042 §I) — proxied by URL, no start/stop from here
   url?: string; // the remote member's base URL
   // App version (pyproject [project].version). Always set on the host (hub) entry;
@@ -769,10 +910,86 @@ export type FleetStatus = { agents: FleetAgent[] };
 export type DiscoveredAgent = { name: string; url: string; host: string; port: number };
 
 export type Archetype = {
-  id: string; // "basic", or a bundle id e.g. "pm-stack"
+  id: string; // "basic"/"custom", or a bundle id e.g. "product-stack"
   label: string;
   icon: string; // lucide-react icon name
   blurb: string;
   bundle: string | null; // null = Basic; else the bundle git URL
   soul: string; // base SOUL.md the wizard seeds when this archetype is picked ("" = none)
 };
+
+// What an archetype's bundle would set up — the read-only pre-install peek
+// served by GET /api/archetypes/{id}/preview. `bundle: null` = code-free persona.
+export type ArchetypePreviewMember = {
+  id: string | null;
+  builtin: boolean;
+  ref?: string | null;
+  url?: string | null;
+  name?: string;
+  version?: string;
+  description?: string;
+  requires_pip?: string[];
+  capabilities?: Record<string, unknown>;
+  views?: string[];
+  skills?: { name: string; description: string }[];
+  error?: string; // member unreachable — the rest of the preview still renders
+};
+export type ArchetypePreview = {
+  id: string;
+  bundle: {
+    kind: "bundle" | "plugin";
+    id?: string;
+    name?: string;
+    description?: string;
+    verified_against?: string;
+    enabled?: string[];
+    members: ArchetypePreviewMember[];
+  } | null;
+};
+
+// Developer flags (ADR 0068) — the /api/flags payload the Developer panel renders.
+export type FlagTier = "off" | "dev" | "beta" | "on";
+export type FlagChannel = "prod" | "beta" | "dev";
+export type FlagInfo = {
+  id: string;
+  description: string;
+  tier: FlagTier;
+  owner: string;
+  remove_by: string;
+  enabled: boolean; // channel-resolved (before any device-local override)
+  source: "channel" | "env";
+};
+export type FlagsPayload = { channel: FlagChannel; flags: FlagInfo[] };
+
+// A recorded SOUL.md persona snapshot (#1691). `saved_at` is ISO-8601 UTC (or "" if
+// unparseable); `is_current` marks the one whose text matches the live persona.
+export type SoulVersion = {
+  id: string;
+  saved_at: string;
+  size: number;
+  preview: string;
+  is_current: boolean;
+};
+
+// Managed Node runtime (ADR 0085) — the /api/runtime/node payload. `source` is which
+// Node would actually launch npx today (a user's own install wins over a managed one);
+// `install` tracks any in-flight provisioning the card polls.
+export type NodeRuntimeStatus = {
+  source: "system" | "managed" | null;
+  version: string | null;
+  bin_dir: string | null;
+  managed: boolean;
+  managed_version: string | null;
+  system: boolean;
+  supported: boolean;
+  target_version: string;
+};
+
+export type NodeInstallState = {
+  state: "idle" | "running" | "done" | "error";
+  pct: number;
+  message: string;
+  error: string | null;
+};
+
+export type NodeRuntimePayload = { node: NodeRuntimeStatus; install: NodeInstallState };

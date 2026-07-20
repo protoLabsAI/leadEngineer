@@ -27,6 +27,52 @@ from pathlib import Path
 from graph.subagents.config import SUBAGENT_REGISTRY
 
 
+# The autonomous operating model (ADR 0079). You are not just a request/response bot — you are a
+# long-horizon operator that manages its own work over time. Your four durable primitives compose
+# into ONE loop; this section is what turns "five separate tools" into "a system that runs itself".
+_OPERATING_MODEL = """
+# Operating model
+
+You operate as a long-horizon autonomous agent, not a one-shot responder. You hold objectives
+across turns and drive them to done — observing your own state, planning, acting, and correcting.
+
+Your durable working-state is shown to you each turn in a `<working_state>` block:
+your **active goal + its plan**, your **open tasks**, your **active watches**, and your
+**pending schedules**. Read it first — it is what you are responsible for.
+
+Run this loop:
+
+- **Observe** — read `<working_state>` and why you are awake (an operator asked, a schedule
+  fired, or a watch tripped — stated at the top of the turn). Take in what changed.
+- **Orient** — keep your **plan** current with `update_goal_plan` (it is your world-model:
+  what's done, what's next, what failed — persisted and fed back to you every turn). Break the
+  goal into concrete **tasks** with `task_create`; the task board is the goal's backlog.
+- **Decide** — pick the next concrete step. Decide whether to do it now, or, if it depends on
+  something that isn't ready, to hand it off (below).
+- **Act** — do the step (directly or by delegating with `task`). Update/close tasks as you go.
+
+Compose your primitives — they are one system, not four:
+
+- **Goal** (`set_goal`) — your standing objective. A deterministic verifier decides DONE, never
+  your own say-so; keep working until it passes, or call `abandon_goal` if it's truly out of scope.
+- **Tasks** (`task_create`/`task_update`/`task_close`) — the goal's backlog. Decompose the goal
+  into tasks and drive them down; this is your board (NOT any built-in todo tool).
+- **Schedule** (`schedule_task`) — do something *later* or on a cadence (a follow-up, a recurring
+  sweep). The prompt you schedule must be self-contained.
+- **Watch** (`create_watch`) — supervise an external *condition* (a deploy, CI, a metric, a peer's
+  PR); when it trips you're brought back to react. Hold as many as you need, in parallel.
+
+**Do not spin waiting on async work.** When your next step depends on something in flight — a
+build, a delegated peer agent, CI, a review — do NOT burn turns polling it. Set a **watch** on
+the condition (or a **schedule** for a known time, or `wait` for a short countdown) and END the
+turn. You'll be resumed with context when it's actually ready. Persisting means yielding and
+coming back, not looping.
+
+**Self-correct.** If your plan isn't producing progress, change the approach and say so in the
+plan. If you're blocked, record what's blocking you. Don't repeat an action that already failed.
+""".strip()
+
+
 def _read_file(path: str | Path) -> str:
     """Read a file if it exists, return empty string otherwise."""
     p = Path(path)
@@ -54,11 +100,28 @@ def build_system_prompt(
     """
     parts = []
 
-    # 1. Identity — prefer the runtime workspace (entrypoint.sh copies
-    # config/SOUL.md to /sandbox/SOUL.md at container start). Fall back
-    # to the repo source so local `python -m server` runs without a
-    # /sandbox mount still pick up persona edits made via the drawer.
-    soul = _read_file(f"{workspace}/SOUL.md")
+    # 1. Identity — the instance's OWN persona. Prefer the canonical live SOUL:
+    # ``instance_paths().soul_path`` = ``<instance_root>/config/SOUL.md`` — the path
+    # ``config_io.read_soul``/``write_soul`` use and the persona drawer edits, and
+    # PROTOAGENT_HOME-aware. This is what makes a FLEET MEMBER load ITS OWN persona:
+    # a member is spawned directly by the supervisor (not via entrypoint.sh, which
+    # only the primary runs to copy config/SOUL.md → /sandbox/SOUL.md), and it
+    # inherits the hub's default ``workspace`` (/sandbox), so the legacy
+    # ``{workspace}/SOUL.md`` read below resolved the HUB's file — a placeholder for
+    # the member — leaving it with NO identity (it then collapses onto whatever the
+    # injected team context foregrounds — the hub agent). Reading the instance's own
+    # config/SOUL.md fixes members and also gives the primary its real persona
+    # regardless of the entrypoint copy. Fall back to the legacy runtime copy
+    # (``{workspace}/SOUL.md``), then the repo/bundle default.
+    soul = ""
+    try:
+        from infra.paths import instance_paths
+
+        soul = _read_file(instance_paths().soul_path)
+    except Exception:  # noqa: BLE001 — path resolution must never break prompt building
+        soul = ""
+    if not soul:
+        soul = _read_file(f"{workspace}/SOUL.md")
     if not soul:
         soul = _read_file(Path(__file__).parent.parent / "config" / "SOUL.md")
     if soul:
@@ -84,6 +147,11 @@ def build_system_prompt(
     # 3. Dynamic context (typically from KnowledgeMiddleware)
     if context:
         parts.append(f"\n# Context\n\n{context}")
+
+    # 3.5 Operating model — the autonomous doctrine (ADR 0079). Core, always shipped: it
+    # teaches the agent to compose its four durable primitives (goal · tasks · schedule ·
+    # watch) into ONE self-managing OODA loop, instead of treating each as an isolated tool.
+    parts.append(_OPERATING_MODEL)
 
     # 4. Operator guidelines — OVERRIDE THIS in your fork
     parts.append("""
@@ -114,7 +182,8 @@ def _build_projects_section(projects) -> str:
         "",
         "You operate on these project workspaces via the filesystem tools "
         "(`list_projects`, `read_file`, `list_dir`, `find_files`, `search_files`, "
-        "and — in read-write projects — `write_file`/`edit_file`). All paths are "
+        "and — in read-write projects — `write_file`/`edit_file`, plus `delete_file`, "
+        "which always asks first and is off in no-delete projects). All paths are "
         "fenced to these roots; you cannot read or write outside them.",
         "",
     ]
@@ -174,8 +243,11 @@ def _build_subagent_section() -> str:
             "immediately with a job id and the result is delivered back to you automatically on a",
             "later turn, so the conversation stays live instead of freezing on a multi-minute",
             "delegation. Use foreground (the default) only when you need the result to finish your",
-            "current reply. Once you background a task, do NOT poll it or spawn a duplicate — you",
-            "will be notified when it completes.",
+            "current reply. This is a general discipline for ANY background delegation (the",
+            "`task` subagent tool AND, e.g., a fleet `delegate_to`): once you background the",
+            "work, END your turn — do NOT try to wait/poll for it or spawn a duplicate. Each",
+            "result is delivered back to you automatically on a later turn; synthesize the",
+            "replies when they arrive (on a fan-out, wait for ALL of them first).",
         ]
     )
 

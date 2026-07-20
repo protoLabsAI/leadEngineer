@@ -1,0 +1,82 @@
+/* mobile-native.css — the app-owned remainder of the touch-input layer.
+   ────────────────────────────────────────────────────────────────────────────
+   This file used to carry the whole touch floor, every block tagged [DS] or [APP]
+   pending the design-system fix. `@protolabsai/ui` 0.57 ships that floor
+   (`styles/touch.css`), so all [DS] blocks are gone: composer/input font-size,
+   tap-highlight + `touch-action` on `.pl-*`, `:active` press states, 44px hit areas
+   on the composer/dialog/tab-strip controls, overscroll containment on the DS
+   overlays, and `env(safe-area-*)` on `.pl-mobilenav` / `.pl-drawer`.
+
+   What remains is what the DS cannot own: bare element selectors (it only styles its
+   own classes) and console-specific components.
+
+   GATE — this now keys on `@media (hover: none)` to match the DS, NOT on a width
+   breakpoint. These are input-capability concerns: a mouse user in a narrow window
+   doesn't need 44px targets, and a tablet past 767px very much does. That is a
+   deliberate split from the SHELL, which keys on width (`useIsMobile`, 767px) because
+   "is this a phone-shaped viewport" is a layout question, not an input one.
+
+   Two edges move as a result, both in the right direction: a narrow desktop window
+   loses touch sizing it never needed, and a >767px touch device gains the floor it
+   always should have had. */
+
+@media (hover: none) {
+  /* iOS Safari zooms the viewport on focus of any control under 16px. The DS covers
+     its own `.pl-*` classes; these bare selectors catch everything else — theme-base.css
+     sets `body { font-size: 14px }` and the `button,input,textarea,select { font: inherit }`
+     reset propagates it into every native control the DS doesn't style. 16px is the
+     threshold, not a design choice. */
+  input,
+  textarea,
+  select {
+    font-size: 16px;
+  }
+
+  /* Generic tap behaviour for console-owned controls and bare anchors/buttons (the DS
+     covers `.pl-btn`/`.pl-iconbtn`/etc). `manipulation` drops the double-tap-zoom
+     gesture, which is where tap latency comes from. */
+  a,
+  button,
+  [role="button"] {
+    -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
+  }
+
+  /* Press feedback for console-owned controls. Without it a tap on a drawer row gives no
+     acknowledgement at all — `:hover` never fires on touch. Opacity rather than transform,
+     so a press never reflows a list. */
+  .app-drawer-item:active,
+  .util-btn:active,
+  .fleet-switcher-trigger:active,
+  .composer-model-select:active {
+    opacity: 0.6;
+  }
+
+  /* Console-owned controls under the 44px HIG minimum. Hit area grows via an ::after
+     overlay rather than the box, so the topbar and composer bar keep their density.
+     (`.fleet-switcher-trigger` was 57x19; `.composer-model-select` ~125x23 — and the
+     latter reads as plain text until :hover, so on touch it had no affordance at all.) */
+  .fleet-switcher-trigger,
+  .composer-model-select {
+    position: relative;
+  }
+  .fleet-switcher-trigger::after,
+  .composer-model-select::after {
+    content: "";
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    min-width: 44px;
+    min-height: 44px;
+    width: 100%;
+    height: 100%;
+  }
+
+  /* Console-owned scrollers — without containment a flick past the end rubber-bands the
+     page behind them. (The DS contains its own overlay bodies and the conversation.) */
+  .app-drawer-body,
+  .slash-menu {
+    overscroll-behavior: contain;
+  }
+}

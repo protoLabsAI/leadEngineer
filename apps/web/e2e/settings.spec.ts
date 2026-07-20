@@ -54,10 +54,13 @@ test("the settings dialog lists the domain groups (host, no scope toggle)", asyn
     // Agent group
     "Identity",
     "Operator & access",
+    // "Devices" is NOT here — gated behind the `settings.devices` developer flag, default
+    // OFF (ADR 0068). Its absence from this list IS the assertion that the gate holds.
     "Model",
     "Behavior",
     "Knowledge",
-    "Integrations",
+    "Secrets", // ADR 0080 — external secrets manager
+    "Plugins",
     // Capabilities group (sharing knobs live on each manager's chip, not a separate panel)
     "Tools",
     "MCP",
@@ -72,6 +75,7 @@ test("the settings dialog lists the domain groups (host, no scope toggle)", asyn
     "Theme",
     "Chat",
     "Keyboard",
+    "Developer", // ADR 0068 — shown off prod (the mock serves channel "dev")
   ]);
   await section(page, "Behavior");
   await expect(page.locator(".pl-accordion__title").first()).toBeVisible();
@@ -110,7 +114,7 @@ test("Model shows the agent's Model + Routing fields", async ({ page }) => {
   await openSettings(page);
   await section(page, "Model");
   await expect(page.locator(".pl-accordion__title").first()).toBeVisible();
-  expect(await page.locator(".pl-accordion__title").allTextContents()).toEqual(["Model", "Routing"]);
+  expect(await page.locator(".pl-accordion__title").allTextContents()).toEqual(["Model", "Favorite models", "Routing"]);
   await expandAllGroups(page);
   await expect(page.locator('.setting-row[data-key="routing.aux_model"] input')).toHaveValue("protolabs/fast");
   await expect(page.locator('.setting-row[data-key="model.api_key"] input')).toHaveAttribute("placeholder", /set/);

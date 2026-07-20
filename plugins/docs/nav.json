@@ -54,6 +54,10 @@
           "title": "Watches"
         },
         {
+          "path": "guides/lifecycle-events.md",
+          "title": "System lifecycle events"
+        },
+        {
           "path": "guides/file-github-issues.md",
           "title": "File GitHub issues (/issue)"
         },
@@ -68,6 +72,10 @@
         {
           "path": "guides/acp-runtime.md",
           "title": "Run on a coding agent (ACP runtime)"
+        },
+        {
+          "path": "guides/hermes.md",
+          "title": "Run on Hermes (preset)"
         }
       ]
     },
@@ -171,6 +179,10 @@
           "title": "Command palette (⌘K)"
         },
         {
+          "path": "guides/developer-flags.md",
+          "title": "Developer flags (gate pre-release features)"
+        },
+        {
           "path": "guides/phone-access.md",
           "title": "Access from your phone (LAN / Tailscale)"
         },
@@ -192,6 +204,10 @@
           "title": "Deploy in Docker (seed + UI override)"
         },
         {
+          "path": "guides/deploy-proxmox.md",
+          "title": "Deploy on Proxmox (reusable LXC template)"
+        },
+        {
           "path": "guides/releasing.md",
           "title": "Releasing"
         },
@@ -202,6 +218,10 @@
         {
           "path": "guides/sandboxing.md",
           "title": "Sandboxing & egress"
+        },
+        {
+          "path": "guides/exposing-protoagent.md",
+          "title": "Expose to the world"
         },
         {
           "path": "guides/observability.md",
@@ -619,6 +639,86 @@
         {
           "path": "adr/0068-developer-flags-and-panel.md",
           "title": "0068 — Developer flags & the Developer panel (gating pre-release functionality)"
+        },
+        {
+          "path": "adr/0069-memory-delivery-layer.md",
+          "title": "ADR 0069 — Memory delivery layer: attributed digest, provenance, trust tiers"
+        },
+        {
+          "path": "adr/0070-background-results-push-resume.md",
+          "title": "ADR 0070 — Background results: push-resume, indexed reports, disposable workers"
+        },
+        {
+          "path": "adr/0071-plugin-permissions-trust-model.md",
+          "title": "ADR 0071 — Plugin permissions: a trust-and-consent model, not a runtime sandbox"
+        },
+        {
+          "path": "adr/0072-fleet-seed-team-via-config.md",
+          "title": "0072 — Fleet seed: declare a team in config (team-via-config)"
+        },
+        {
+          "path": "adr/0073-goal-completion-contracts.md",
+          "title": "0073 — Goal completion contracts"
+        },
+        {
+          "path": "adr/0074-system-lifecycle-events.md",
+          "title": "0074 — System lifecycle events"
+        },
+        {
+          "path": "adr/0075-external-interfaces-cli-mcp-api.md",
+          "title": "0075 — External interfaces: a first-class `protoagent` CLI + tightened MCP / API / model onboarding"
+        },
+        {
+          "path": "adr/0076-managed-git-acp-delegates.md",
+          "title": "0076 — Managed git for `acp` delegates: framework-owned branch/commit/push/PR"
+        },
+        {
+          "path": "adr/0077-adversarial-code-review-workflow.md",
+          "title": "0077 — Adversarial code-review workflow + the findings convention"
+        },
+        {
+          "path": "adr/0078-fleet-pr-review-qa-tier.md",
+          "title": "0078 — Fleet PR review as a protoAgent tier: harvest Quinn, keep the panel"
+        },
+        {
+          "path": "adr/0079-autonomous-operating-model.md",
+          "title": "0079 — Autonomous operating model (goals · tasks · scheduling · watches → one OODA loop)"
+        },
+        {
+          "path": "adr/0080-external-secrets-manager.md",
+          "title": "0080 — External secrets manager: env hydration with pluggable providers (Infisical first)"
+        },
+        {
+          "path": "adr/0081-self-authored-persona-edit-soul.md",
+          "title": "0081 — Self-authored persona: a guarded `edit_soul` tool"
+        },
+        {
+          "path": "adr/0082-per-chat-acp-runtime.md",
+          "title": "0082 — Per-chat ACP runtime: hot-swap a coding agent like a model"
+        },
+        {
+          "path": "adr/0083-cowork-mode-archetype.md",
+          "title": "0083 — Cowork mode: a prepackaged knowledge-worker archetype"
+        },
+        {
+          "path": "adr/0084-computer-use-cua-driver.md",
+          "title": "0084 — Computer use: an out-of-process driver, and the fence it voids"
+        },
+        {
+          "path": "adr/0085-managed-node-runtime.md",
+          "title": "0085 — Managed Node.js runtime, provisioned on demand"
+        },
+        {
+          "path": "adr/0086-chat-first-mobile-shell.md",
+          "title": "ADR 0086 — Chat-first mobile shell (amends ADR 0035 D6)"
+        },
+        {
+          "path": "adr/0087-device-pairing-and-per-device-tokens.md",
+          "title": "ADR 0087 — Device pairing: per-device revocable tokens + short-TTL QR codes"
+        },
+        {
+          "path": "adr/0088-per-finding-inline-review-threads.md",
+          "title": "0088 — Per-finding inline review threads: finding-granular GitHub-native memory"
         },
         {
           "path": "adr/index.md",

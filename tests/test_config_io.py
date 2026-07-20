@@ -19,6 +19,8 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock
 
+from graph.settings_schema import FIELDS
+
 import httpx
 import pytest
 
@@ -129,33 +131,14 @@ def test_config_to_dict_mirrors_yaml_shape() -> None:
     # too). discord/google are NOT here — they're plugin sections, present only
     # when their plugin is enabled (surfaced via plugin_config), and a default
     # LangGraphConfig() carries no plugin_config.
-    assert set(d.keys()) == {
-        "model",
-        "subagents",
-        "middleware",
-        "knowledge",
-        "skills",
-        "commons",
-        "mcp",
-        "plugins",
-        "identity",
-        "auth",
-        "runtime",
-        "operator",
-        "agent_runtime",
-        "checkpoint",
-        "compaction",
-        "goal",
-        "operator_mcp",
-        "prompt_cache",
-        "routing",
-        "telemetry",
-        # Box runtime (Host layer, ADR 0047 D8).
-        "network",
-        "fleet",
-        # Egress allowlist (ADR 0008) — surfaced in Settings ▸ Box ▸ Network.
-        "egress",
-    }
+    # config_to_dict is FIELDS-driven, so the top-level sections it emits are exactly the
+    # schema's top-level keys, plus two legacy sections config_io §B emits that have no
+    # FIELDS entry (subagents.researcher and the plugins.* knobs). Deriving from FIELDS
+    # means a new field doesn't require re-typing the section list here.
+    # lifecycle_hooks (ADR 0074) is a top-level list emitted by config_io §B (like the
+    # subagents/plugins knobs), not a FIELDS-typed field — so it joins the legacy set.
+    _LEGACY_SECTIONS = {"subagents", "plugins", "lifecycle_hooks"}
+    assert set(d.keys()) == {f.key.split(".", 1)[0] for f in FIELDS} | _LEGACY_SECTIONS
     assert d["model"]["name"] == cfg.model_name
     assert d["model"]["temperature"] == cfg.temperature
     # Secrets are redacted out of the UI-facing dict.
@@ -346,6 +329,116 @@ def test_write_soul_writes_instance_soul(monkeypatch, tmp_path: Path) -> None:
     target = home / "config" / "SOUL.md"
     assert target in written
     assert target.read_text() == "hello world"
+
+
+def test_soul_revision_hashes_the_current_persona(monkeypatch, tmp_path: Path) -> None:
+    """soul_revision() is a short SHA-1 of the effective persona — for tagging telemetry."""
+    import hashlib
+
+    from graph import config_io
+
+    home = tmp_path / "home"
+    (home / "config").mkdir(parents=True)
+    (home / "config" / "SOUL.md").write_text("persona text", encoding="utf-8")
+    monkeypatch.setenv("PROTOAGENT_HOME", str(home))
+
+    assert config_io.soul_revision() == hashlib.sha1(b"persona text").hexdigest()[:8]
+
+
+def test_soul_revision_empty_when_no_persona(monkeypatch, tmp_path: Path) -> None:
+    from graph import config_io
+
+    monkeypatch.setenv("PROTOAGENT_HOME", str(tmp_path / "empty"))
+    monkeypatch.setattr(config_io, "soul_source_path", lambda: tmp_path / "no-seed.md")
+    assert config_io.soul_revision() == ""
+
+
+# ── ensure_live_soul (persona seed / placeholder heal) ───────────────────────
+
+# A minimal stand-in for the shipped starter SOUL — its whole job is to be
+# replaced, so the marker is the signal that a live SOUL was never authored.
+_PLACEHOLDER = "# Soul\n\n**Replace this file.** Starter persona doc.\n"
+
+
+def test_ensure_live_soul_seeds_when_absent(monkeypatch, tmp_path: Path) -> None:
+    """No live SOUL → seed the baked persona so it's present + console-editable."""
+    from graph import config_io
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("PROTOAGENT_HOME", str(home))
+    source = tmp_path / "SOUL-source.md"
+    source.write_text("I am Jon, the GTM strategist.", encoding="utf-8")
+    monkeypatch.setattr(config_io, "soul_source_path", lambda: source)
+
+    assert config_io.ensure_live_soul() is True
+    assert (home / "config" / "SOUL.md").read_text(encoding="utf-8") == "I am Jon, the GTM strategist."
+
+
+def test_ensure_live_soul_heals_placeholder(monkeypatch, tmp_path: Path) -> None:
+    """A live SOUL still carrying the starter placeholder is un-authored: replace
+    it with the baked persona (the bug — a placeholder shadowing a baked soul)."""
+    from graph import config_io
+
+    home = tmp_path / "home"
+    (home / "config").mkdir(parents=True)
+    (home / "config" / "SOUL.md").write_text(_PLACEHOLDER, encoding="utf-8")
+    monkeypatch.setenv("PROTOAGENT_HOME", str(home))
+    source = tmp_path / "SOUL-source.md"
+    source.write_text("real persona", encoding="utf-8")
+    monkeypatch.setattr(config_io, "soul_source_path", lambda: source)
+
+    assert config_io.ensure_live_soul() is True
+    assert (home / "config" / "SOUL.md").read_text(encoding="utf-8") == "real persona"
+
+
+def test_ensure_live_soul_does_not_clobber_authored(monkeypatch, tmp_path: Path) -> None:
+    """A real (non-placeholder) live SOUL is never overwritten — seed-not-force."""
+    from graph import config_io
+
+    home = tmp_path / "home"
+    (home / "config").mkdir(parents=True)
+    (home / "config" / "SOUL.md").write_text("operator-authored persona", encoding="utf-8")
+    monkeypatch.setenv("PROTOAGENT_HOME", str(home))
+    source = tmp_path / "SOUL-source.md"
+    source.write_text("baked persona", encoding="utf-8")
+    monkeypatch.setattr(config_io, "soul_source_path", lambda: source)
+
+    assert config_io.ensure_live_soul() is False
+    assert (home / "config" / "SOUL.md").read_text(encoding="utf-8") == "operator-authored persona"
+
+
+def test_ensure_live_soul_seeds_from_seed_soul_env(monkeypatch, tmp_path: Path) -> None:
+    """PROTOAGENT_SEED_SOUL (a baked persona-as-code file) wins over the bundle."""
+    from graph import config_io
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("PROTOAGENT_HOME", str(home))
+    bundle = tmp_path / "SOUL-source.md"
+    bundle.write_text("from bundle", encoding="utf-8")
+    seed = tmp_path / "my-persona.md"
+    seed.write_text("from seed env", encoding="utf-8")
+    monkeypatch.setattr(config_io, "soul_source_path", lambda: bundle)
+    monkeypatch.setenv("PROTOAGENT_SEED_SOUL", str(seed))
+
+    assert config_io.ensure_live_soul() is True
+    assert (home / "config" / "SOUL.md").read_text(encoding="utf-8") == "from seed env"
+
+
+def test_ensure_live_soul_wont_seed_placeholder_over_placeholder(monkeypatch, tmp_path: Path) -> None:
+    """When the bundle itself is still the starter placeholder there's nothing real
+    to seed — leave the live placeholder untouched rather than rewrite it."""
+    from graph import config_io
+
+    home = tmp_path / "home"
+    (home / "config").mkdir(parents=True)
+    (home / "config" / "SOUL.md").write_text(_PLACEHOLDER, encoding="utf-8")
+    monkeypatch.setenv("PROTOAGENT_HOME", str(home))
+    source = tmp_path / "SOUL-source.md"
+    source.write_text(_PLACEHOLDER, encoding="utf-8")
+    monkeypatch.setattr(config_io, "soul_source_path", lambda: source)
+
+    assert config_io.ensure_live_soul() is False
+    assert (home / "config" / "SOUL.md").read_text(encoding="utf-8") == _PLACEHOLDER
 
 
 # ── Gateway model listing ────────────────────────────────────────────────────

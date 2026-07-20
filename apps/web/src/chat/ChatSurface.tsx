@@ -1,14 +1,16 @@
 import "./chat.css";
 import { Badge, Button, Empty } from "@protolabsai/ui/primitives";
+import { Spinner } from "@protolabsai/ui/data";
 import { Switch } from "@protolabsai/ui/forms";
 import { Conversation, Message, PromptInput } from "@protolabsai/ui/ai";
 import { TabBar } from "@protolabsai/ui/navigation";
-import { Check, TerminalSquare } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
-import type { MouseEvent as ReactMouseEvent } from "react";
+import { Check, EyeOff, TerminalSquare } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent } from "react";
 import { useQuery } from "@tanstack/react-query";
 
 import { openContextMenu } from "../contextMenu";
+import { useIsMobile } from "../lib/useIsMobile";
 import { useKbIntents } from "../keybindings/intents";
 import { api } from "../lib/api";
 import { errMsg } from "../lib/format";
@@ -23,13 +25,19 @@ import {
   effectiveReasoningEffort,
 } from "./chat-store";
 import "./coreSlashCommands"; // registers /new, /clear, /effort via the slash-command seam (ADR 0061)
-import { findSlashCommand, registeredSlashCommands } from "../ext/slashRegistry";
+import { findSlashCommand, registeredSlashCommands, slashTokenAt } from "../ext/slashRegistry";
+import type { ComposerFormSpec } from "../ext/slashRegistry";
+import { useFlagPredicate } from "../flags/flags";
 import { registeredComposerActions } from "../ext/composerRegistry";
 import { ChatMessageView } from "./ChatMessageView";
 import { ComposerModelSelect } from "./ComposerModelSelect";
+import { useServerTurn, useServerTurnSessions } from "./server-turn-store";
 import { filesFromTransfer, isLargePaste, pastedTextFile } from "./paste";
 import { inputHistory, pushInputHistory } from "./inputHistory";
-import { addComponent, addToolRef, appendReasoning, appendText } from "./parts";
+import { finalizeStoppedMessages, resolveStopTarget } from "./stopTurn";
+import { addComponent, addToolRef, appendReasoning, appendText, replaceText } from "./parts";
+import { createStreamWatchdog } from "./streamWatchdog";
+import { ADD_SELECTOR, isIncognitoAddClick, trackShiftHeld } from "./shiftCue";
 
 function messageId() {
   return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -105,6 +113,11 @@ export function ChatSurface({
   active?: boolean;
 }) {
   const chat = useChatState();
+  const mobile = useIsMobile(); // hides the tab strip — MobileShell's SessionSheet replaces it
+  // Sessions with a server-initiated turn in flight (push-resume / scheduled / watch) — those
+  // turns don't touch sessionStatusMap, so without this their tab would read idle. Read once
+  // here (the tab bar can't call the per-session hook inside its .map).
+  const serverTurnSessions = useServerTurnSessions();
   const currentSession = chat.sessions.find((session) => session.id === chat.currentSessionId) || null;
   const [pendingClose, setPendingClose] = useState<string | null>(null);
   const [harvestOnDelete, setHarvestOnDelete] = useState(false);
@@ -123,26 +136,27 @@ export function ChatSurface({
     chatStore.deleteSession(id);
   }
 
-  // Quick-delete: Shift+click a tab's ✕ → delete with NO confirm dialog and NO harvest.
-  // While Shift is held the ✕ shows as a red trashcan (the `--del` class → CSS) to signal it.
-  const [shiftDel, setShiftDel] = useState(false);
-  useEffect(() => {
-    const sync = (e: KeyboardEvent) => setShiftDel(e.shiftKey);
-    const clear = () => setShiftDel(false);
-    window.addEventListener("keydown", sync);
-    window.addEventListener("keyup", sync);
-    window.addEventListener("blur", clear);
-    return () => {
-      window.removeEventListener("keydown", sync);
-      window.removeEventListener("keyup", sync);
-      window.removeEventListener("blur", clear);
-    };
-  }, []);
+  // Tab-strip Shift cues. While Shift is held the DS TabBar signals both Shift+click gestures:
+  // the "+" becomes the incognito EyeOff (Shift+click → new incognito chat, #1697/#1744) and the
+  // hovered ✕ becomes a red trashcan (Shift+click → quick-delete, no confirm/harvest, #1373).
+  // One "is Shift held" signal drives both, via the `--incognito`/`--del` wrapper classes → CSS.
+  const [shiftHeld, setShiftHeld] = useState(false);
+  useEffect(() => trackShiftHeld(setShiftHeld), []);
   // The DS TabBar's onClose always opens the confirm dialog, so intercept the close-button
   // click in the CAPTURE phase (before the DS button's own onClick) when Shift is down and
   // delete directly. Maps the clicked ✕ to its session by sibling index (DOM = sessions order).
   function onTabBarClickCapture(e: ReactMouseEvent) {
     if (!e.shiftKey) return;
+    // Shift+click the add "+" → new INCOGNITO session (#1697): the click-path twin of the
+    // tab context menu's "New incognito chat" (same createSession({incognito:true})
+    // semantics). Intercepted in the capture phase so the DS button's own onClick (the
+    // plain add) never fires; a plain click is untouched.
+    if (isIncognitoAddClick(e.target, e.shiftKey)) {
+      e.preventDefault();
+      e.stopPropagation();
+      chatStore.createSession({ incognito: true });
+      return;
+    }
     const closeBtn = (e.target as HTMLElement).closest(".pl-tabbar__close");
     if (!closeBtn) return;
     const tabEl = closeBtn.closest(".pl-tabbar__tab") as HTMLElement | null;
@@ -155,24 +169,46 @@ export function ChatSurface({
     closeSession(session.id, false); // false = no knowledge harvest
   }
 
-  // Right-click a chat tab → context menu (ADR 0036). The DS TabBar exposes no per-tab
-  // context-menu hook, so we delegate from the tab-bar wrapper and map the clicked tab to its
-  // session by sibling index (DOM order tracks the `items` = sessions order). Close reuses the
-  // confirm dialog; Rename fires the TabBar's inline editor via a synthetic dblclick on the tab.
-  function onTabBarContextMenu(e: ReactMouseEvent) {
+  // Keyboard twin of the Shift+click incognito gesture (#1697): Shift+Enter/Space on the
+  // focused "+" also creates an incognito session. Keyboard activation synthesizes the
+  // button's click AFTER keydown (Enter) / on keyup (Space), and its modifier state isn't
+  // reliable across browsers — so intercept at keydown-capture and preventDefault, which
+  // stops the synthetic click (and thus the DS onAdd) from ever firing.
+  function onTabBarKeyDownCapture(e: ReactKeyboardEvent) {
+    if (!e.shiftKey || (e.key !== "Enter" && e.key !== " ")) return;
+    if (!(e.target as HTMLElement).closest(ADD_SELECTOR)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.repeat) return; // held key auto-repeats keydown — only the first press creates a session
+    chatStore.createSession({ incognito: true });
+  }
+
+  // Right-click a chat tab → context menu (ADR 0036). The DS TabBar's `onTabContextMenu`
+  // (@protolabsai/ui@0.53.0) hands us the session id directly — no sibling-index DOM sniffing.
+  // Rename opens the TabBar's inline editor via a synthetic dblclick on the tab element (the DS
+  // exposes no start-rename API); we grab that element off the event, not to recover WHICH tab
+  // (the hook gives us the id) but only to fire the editor.
+  function onTabContextMenu(id: string, e: ReactMouseEvent) {
     const tabEl = (e.target as HTMLElement).closest(".pl-tabbar__tab") as HTMLElement | null;
-    if (!tabEl) {
-      openContextMenu("chat-tab", e, { onNew: () => chatStore.createSession() });
-      return;
-    }
-    const tabs = Array.from((e.currentTarget as HTMLElement).querySelectorAll(".pl-tabbar__tab"));
-    const session = chat.sessions[tabs.indexOf(tabEl)];
-    if (!session) return;
+    const target = chat.sessions.find((s) => s.id === id);
     openContextMenu("chat-tab", e, {
-      sessionId: session.id,
+      sessionId: id,
+      incognito: !!target?.incognito,
       onNew: () => chatStore.createSession(),
-      onRename: () => tabEl.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })),
-      onClose: () => setPendingClose(session.id),
+      onNewIncognito: () => chatStore.createSession({ incognito: true }),
+      onToggleIncognito: () => chatStore.setSessionIncognito(id, !target?.incognito),
+      onRename: () => tabEl?.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })),
+      onClose: () => setPendingClose(id),
+    });
+  }
+
+  // Right-click EMPTY tab-bar space (not a tab) → just the "New chat" affordance. onTabContextMenu
+  // owns per-tab; this catches the background only, and bails on tab hits so the two never both fire.
+  function onTabBarBackgroundContextMenu(e: ReactMouseEvent) {
+    if ((e.target as HTMLElement).closest(".pl-tabbar__tab")) return; // a tab — onTabContextMenu owns it
+    openContextMenu("chat-tab", e, {
+      onNew: () => chatStore.createSession(),
+      onNewIncognito: () => chatStore.createSession({ incognito: true }),
     });
   }
 
@@ -183,21 +219,46 @@ export function ChatSurface({
           `responsive` collapses to a DS-native <select> + add in a narrow panel
           (container query). The status dot rides the `icon` slot — wide-strip only:
           the collapsed <option> can't host markup, matching the old behavior. */}
+      {/* Suppressed on phones: the `responsive` collapse is a <select>, a desktop idiom that
+          reads as a form control rather than a thread switcher. The chat-first shell puts the
+          session title in its header and opens SessionSheet on tap instead (MobileShell). */}
+      {mobile ? null : (
       <div
-        className={`chat-tabbar-wrap${shiftDel ? " chat-tabbar-wrap--del" : ""}`}
-        onContextMenu={onTabBarContextMenu}
+        className={`chat-tabbar-wrap${shiftHeld ? " chat-tabbar-wrap--del chat-tabbar-wrap--incognito" : ""}`}
+        onContextMenu={onTabBarBackgroundContextMenu}
         onClickCapture={onTabBarClickCapture}
+        onKeyDownCapture={onTabBarKeyDownCapture}
       >
         <TabBar
           ariaLabel="Chat sessions"
           responsive
           activeId={chat.currentSessionId ?? ""}
           items={chat.sessions.map((session) => {
-            const status = chat.sessionStatusMap[session.id] || "idle";
+            const fg = chat.sessionStatusMap[session.id] || "idle";
+            // Foreground streaming already lights the dot; also surface a background
+            // server-turn as a pulsing "processing" dot so an unfocused tab doing work
+            // doesn't read idle. error > streaming > processing > idle.
+            const status =
+              fg === "error"
+                ? "error"
+                : fg === "streaming"
+                  ? "streaming"
+                  : serverTurnSessions.has(session.id)
+                    ? "processing"
+                    : "idle";
             return {
               id: session.id,
               label: session.title,
-              icon: <span className={`session-dot ${status}`} title={status} />,
+              // Incognito rides the icon slot next to the status dot — the tab-level
+              // "this thread leaves no memory" indicator (ADR 0069 D3b).
+              icon: session.incognito ? (
+                <span className="session-tab-icons">
+                  <span className={`session-dot ${status}`} title={status} />
+                  <EyeOff size={12} className="session-incognito-icon" aria-label="incognito" />
+                </span>
+              ) : (
+                <span className={`session-dot ${status}`} title={status} />
+              ),
             };
           })}
           onSelect={(id) => chatStore.switchSession(id)}
@@ -205,9 +266,22 @@ export function ChatSurface({
           onRename={(id, label) => chatStore.renameSession(id, label)}
           onReorder={(next) => chatStore.reorderSessions(next.map((t) => t.id))}
           onAdd={() => chatStore.createSession()}
-          addLabel="New chat"
+          onTabContextMenu={onTabContextMenu}
+          // The DS TabBar renders this as the + button's native title/aria-label — the
+          // hover hint for the Shift+click incognito gesture (#1697). Shift+Enter is the
+          // keyboard twin (onTabBarKeyDownCapture), so the label teaches both paths.
+          addLabel="New chat — Shift+click for incognito (Shift+Enter when focused)"
+          // NOT wired to ui@0.58's `addDisabled`, deliberately. The store reuses a pristine
+          // blank rather than duplicating it, so a plain click on an already-blank tab is a
+          // no-op — but this "+" is a DUAL-gesture control (Shift+click / Shift+Enter opens
+          // an INCOGNITO chat, #1697), and a disabled button fires no events, so dimming it
+          // would kill that gesture too. Disabling only when BOTH creates are no-ops is
+          // correct but fires so rarely it doesn't fix the wart. The store guard already
+          // prevents the pile-up; a live-but-inert plain click is the residue.
+          // MobileShell/SessionSheet have no such conflict and DO disable their buttons.
         />
       </div>
+      )}
 
       <div className="chat-session-pool">
         {chat.activeSessions.map((sessionId) => (
@@ -274,10 +348,25 @@ function ChatSessionSlot({
   // a spinner/"working…" strip above the composer — the inline indicators cover it now.
   const [, setStatusMessage] = useState("");
   const [taskId, setTaskId] = useState("");
-  const [hitl, setHitl] = useState<HitlPayload | null>(null);
+  const [hitl, setHitlState] = useState<HitlPayload | null>(null);
+  // Ref mirror for async closures (reconcileSteer runs after an await — the render
+  // closure's `hitl` is stale by then). Always set both via updateHitl.
+  const hitlRef = useRef<HitlPayload | null>(null);
+  const updateHitl = (payload: HitlPayload | null) => {
+    hitlRef.current = payload;
+    setHitlState(payload);
+  };
   const abortRef = useRef<AbortController | null>(null);
+  // Client composer-form (#1701): a form a CLIENT command opens in the composer (e.g.
+  // `/effort`'s picker), rendered through the same HitlForm but resolved LOCALLY — no
+  // agent round-trip. Kept DISTINCT from the agent `hitl` interrupt so the two never
+  // collide; the agent interrupt takes precedence when both somehow exist.
+  const [composerForm, setComposerForm] = useState<ComposerFormSpec | null>(null);
   // Transient "copied ✓" feedback on a message's copy action.
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  // The message a "Rewind to here" is pending confirmation on (null = dialog closed).
+  // Rewind is destructive (discards everything below), so it goes through a confirm.
+  const [pendingRewind, setPendingRewind] = useState<ChatMessage | null>(null);
   // Mid-turn steering: user messages queued WHILE a turn streams (optimistic),
   // reconciled at turn-end. The ref mirrors the state so the post-stream reconcile
   // (a stale render closure) reads the live queue.
@@ -310,6 +399,10 @@ function ChatSessionSlot({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [composerFocusNonce]);
   const status = chat.sessionStatusMap[sessionId] || "idle";
+  // A server-initiated turn (background push-resume / scheduled / watch fire, #1767) is
+  // running into THIS session — the browser can't stream it, so show a labelled typing
+  // indicator. Suppressed while this tab is itself streaming (its own spinner covers it).
+  const serverTurnLabel = useServerTurn(sessionId);
 
   // Pending file attachments. Each is uploaded to /api/knowledge/attach on pick;
   // the backend tiers it (inline small / index large) and returns a `context`
@@ -329,21 +422,11 @@ function ChatSessionSlot({
     const kind: "file" | "image" = file.type.startsWith("image/") ? "image" : "file";
     setAttachments((a) => [...a, { id, name: file.name, kind, status: "uploading" }]);
 
-    // An image on a text-only model with NO describe model can't be read at all (the file
-    // pipeline extracts text — no OCR) — so short-circuit with a clear, actionable error
-    // instead of a cryptic "unsupported file type" (#1374). When a describe model IS
-    // configured (#1381), the image falls through to the pipeline, which describes it.
-    if (kind === "image" && !visionModel && !imageDescribe) {
-      const msg =
-        "This model can't see images. Switch to a vision-capable model — or set an image-description model in Settings ▸ Knowledge — to send a screenshot.";
-      setAttachments((a) => a.map((x) => (x.id === id ? { ...x, status: "error", error: msg } : x)));
-      onError(msg);
-      return;
-    }
-
-    // Native vision: a vision model sees the image directly — base64 it and send
-    // it as a multimodal part, no pipeline round-trip.
-    if (kind === "image" && visionModel) {
+    // Images always ride the turn natively as multimodal parts: a vision model
+    // sees them directly, and on a text-only model the server still bridges them
+    // into the media store so image tools can act on them by id (#1969) — the
+    // old hard error (#1374) is gone.
+    if (kind === "image") {
       try {
         const b64 = await fileToBase64(file);
         setAttachments((a) =>
@@ -357,6 +440,22 @@ function ChatSessionSlot({
         const msg = errMsg(e);
         setAttachments((a) => a.map((x) => (x.id === id ? { ...x, status: "error", error: msg } : x)));
         onError(`Couldn't read ${file.name}: ${msg}`);
+        return;
+      }
+      // A configured describe model (#1381) still adds a textual description for a
+      // text-only chat model — best-effort context alongside the native part; a
+      // describe failure never sinks the already-ready attachment.
+      if (visionModel || !imageDescribe) return;
+      try {
+        const form = new FormData();
+        form.append("file", file);
+        form.append("session_id", sessionId);
+        const r = await api.attachToChat(form);
+        if (r.enabled && r.context) {
+          setAttachments((a) => a.map((x) => (x.id === id ? { ...x, context: r.context } : x)));
+        }
+      } catch {
+        // native attachment already succeeded; description is additive
       }
       return;
     }
@@ -382,20 +481,52 @@ function ChatSessionSlot({
   }
 
   // Slash-command autocomplete. Commands the server handles (e.g. /goal) are
-  // fetched once; the dropdown is active while typing "/name" (before a space).
+  // fetched once; the dropdown is active while typing a "/name" token (before a space).
   const [commands, setCommands] = useState<SlashCommand[]>([]);
   const [slashIndex, setSlashIndex] = useState(0);
   const [slashDismissed, setSlashDismissed] = useState(false);
+  // The "/name" token the caret currently sits in ({query, start}), or null. Recomputed
+  // from the LIVE textarea caret (not just the draft) so the popover triggers MID-INPUT —
+  // typing "/" at any cursor position opens it, not only when "/" is char 0 (#1530).
+  const [slashCtx, setSlashCtx] = useState<{ query: string; start: number; end: number } | null>(null);
+  // Keeps the keyboard-selected item scrolled into view during ↑/↓ nav (#1528).
+  const activeSlashRef = useRef<HTMLButtonElement | null>(null);
 
   useEffect(() => {
     api.chatCommands().then((r) => setCommands(r.commands)).catch(() => {});
   }, []);
 
-  const slashQuery = useMemo(() => {
-    if (slashDismissed || !draft.startsWith("/")) return null;
-    const after = draft.slice(1);
-    return after.includes(" ") ? null : after; // closes once a space is typed
-  }, [draft, slashDismissed]);
+  // Re-parse the slash token from the textarea's current value + caret. Called on input,
+  // on caret moves (native keyup/click/select/focus listeners below), and after any
+  // programmatic caret change — so the popover state tracks the caret wherever it is.
+  const refreshSlash = useCallback(() => {
+    const ta = textareaRef.current;
+    if (!ta) return;
+    setSlashCtx(slashTokenAt(ta.value, ta.selectionStart ?? ta.value.length));
+  }, []);
+
+  // Caret moves that don't fire onChange (arrow keys, clicks, selection, focus) still need
+  // to re-evaluate the popover so "/" mid-input opens/closes as the caret enters/leaves a token.
+  useEffect(() => {
+    const ta = textareaRef.current;
+    if (!ta) return;
+    ta.addEventListener("keyup", refreshSlash);
+    ta.addEventListener("click", refreshSlash);
+    ta.addEventListener("select", refreshSlash);
+    ta.addEventListener("focus", refreshSlash);
+    return () => {
+      ta.removeEventListener("keyup", refreshSlash);
+      ta.removeEventListener("click", refreshSlash);
+      ta.removeEventListener("select", refreshSlash);
+      ta.removeEventListener("focus", refreshSlash);
+    };
+  }, [refreshSlash]);
+
+  const slashQuery = slashDismissed ? null : slashCtx?.query ?? null;
+
+  // Developer-flag gate (ADR 0068): a registered command tagged with `flag:` is listed
+  // and dispatched only while its flag resolves ON — flag-off, it's as if unregistered.
+  const flagOn = useFlagPredicate();
 
   const slashMatches = useMemo(() => {
     if (slashQuery === null) return [];
@@ -404,16 +535,33 @@ function ChatSessionSlot({
     // comes from the slash-command registry — core (/new, /clear, /effort) AND any fork-
     // registered commands — so neither is hardcoded here.
     const all: SlashCommand[] = [
-      ...registeredSlashCommands().map((c) => ({ name: c.name, description: c.description, usage: c.usage })),
+      ...registeredSlashCommands()
+        .filter((c) => !c.flag || flagOn(c.flag))
+        .map((c) => ({ name: c.name, description: c.description, usage: c.usage })),
       ...commands,
     ];
-    return all.filter(
+    // Dedup by token: a command that exists BOTH as a client command and a server skill
+    // (e.g. /goal, /clear) must appear once — the client entry (listed first) wins.
+    const seen = new Set<string>();
+    const unique = all.filter((c) => {
+      const n = c.name.toLowerCase();
+      if (seen.has(n)) return false;
+      seen.add(n);
+      return true;
+    });
+    return unique.filter(
       (c) => !q || c.name.toLowerCase().includes(q) || c.description.toLowerCase().includes(q),
     );
-  }, [slashQuery, commands]);
+  }, [slashQuery, commands, flagOn]);
 
   const slashActive = slashMatches.length > 0;
   const slashSel = slashActive ? Math.min(slashIndex, slashMatches.length - 1) : 0;
+
+  // Auto-scroll the keyboard-selected item into view during ↑/↓ nav so it never hides
+  // below the popover's scroll edge (standard listbox behavior, #1528).
+  useEffect(() => {
+    if (slashActive) activeSlashRef.current?.scrollIntoView({ block: "nearest" });
+  }, [slashSel, slashActive]);
 
   // Post a local SYSTEM NOTE to the thread (e.g. a /effort confirmation, a status line, a
   // warning) — never sent to the agent, just shown so the operator sees a local action took
@@ -440,27 +588,60 @@ function ChatSessionSlot({
     const [verb, ...rest] = raw.split(/\s+/);
     const cmd = findSlashCommand(verb);
     if (!cmd) return false;
+    if (cmd.flag && !flagOn(cmd.flag)) return false; // flag-off ⇒ as if unregistered
     return cmd.run({
       rest: rest.join(" ").trim(),
       sessionId: session?.id ?? null,
       noteToThread,
       setDraft,
       focusComposer: () => textareaRef.current?.focus(),
+      // Open a form in the composer panel, resolved locally (#1701) — /effort's picker.
+      openForm: setComposerForm,
+      // Registry-enumerating commands (/help) see the HOST's visibility rules + the live
+      // server command list — never a hardcoded copy of either.
+      flagOn,
+      serverCommands: commands,
     });
   }
 
   function completeCommand(cmd: SlashCommand) {
-    // A client command runs on pick; a server skill fills the draft to edit + send.
+    // Replace ONLY the "/name" token the caret is in — surrounding text is preserved so a
+    // command can be completed at the start, middle, or end of the draft (#1530). Fall back
+    // to the whole draft if the token is somehow unknown (defensive).
+    const token = slashCtx;
+    const start = token ? token.start : 0;
+    const end = token ? token.end : draft.length;
+    // Place the caret + re-sync the popover after React commits the new value.
+    const settleCaret = (pos: number) => {
+      requestAnimationFrame(() => {
+        const ta = textareaRef.current;
+        if (!ta) return;
+        // A form the command opened (e.g. /model's picker — possibly ASYNC, after a
+        // schema fetch) owns focus on appear (#1978) — don't yank it back. Checked at
+        // fire time against the DOM: state/refs can't see an openForm that hasn't
+        // happened yet. Either race order converges on the form keeping focus.
+        if (document.activeElement?.closest(".hitl-float")) return;
+        ta.focus();
+        ta.selectionStart = ta.selectionEnd = pos;
+        refreshSlash();
+      });
+    };
+    // A client command runs on pick — drop just its token from the draft (keeping any
+    // surrounding text); a server skill inserts "/name " to edit + send.
     if (runClientSlash(cmd.name)) {
-      setDraft("");
+      setDraft(draft.slice(0, start) + draft.slice(end));
       setSlashIndex(0);
       setSlashDismissed(true);
+      setSlashCtx(null);
+      settleCaret(start);
       return;
     }
-    setDraft(`/${cmd.name} `);
+    const insert = `/${cmd.name} `;
+    setDraft(draft.slice(0, start) + insert + draft.slice(end));
     setSlashIndex(0);
     setSlashDismissed(true); // a space follows, so it would close anyway
-    textareaRef.current?.focus();
+    setSlashCtx(null);
+    settleCaret(start + insert.length);
   }
 
   // Runs BEFORE the DS PromptInput's Enter-to-submit (via its onKeyDown seam):
@@ -508,7 +689,10 @@ function ChatSessionSlot({
           // caret to end so the next keystroke edits the recalled text (readline behaviour)
           requestAnimationFrame(() => {
             const t = textareaRef.current;
-            if (t) t.selectionStart = t.selectionEnd = val.length;
+            if (t) {
+              t.selectionStart = t.selectionEnd = val.length;
+              refreshSlash(); // keep the slash popover in sync with the moved caret
+            }
           });
         };
         if (event.key === "ArrowUp" && onFirstLine) {
@@ -546,6 +730,7 @@ function ChatSessionSlot({
         setDraft(`${draft.slice(0, start)}\n${draft.slice(end)}`);
         requestAnimationFrame(() => {
           ta.selectionStart = ta.selectionEnd = start + 1;
+          refreshSlash(); // keep the slash popover in sync with the moved caret
         });
       }
     }
@@ -631,6 +816,15 @@ function ChatSessionSlot({
 
   async function send() {
     if (!session || !canSend) return;
+    // A HITL form/question/approval is open (#1560): a fresh send would race the
+    // pending form — the server holds unmarked messages anyway — so queue it as a
+    // steer instead. It folds into the agent's context right AFTER the form
+    // response (submit or dismiss), with the same queued-bubble + ✕ affordances
+    // as mid-turn steering. Attachments stay in the tray for the next real send.
+    if (hitl) {
+      void queueSteer();
+      return;
+    }
     const text = draft.trim();
     pushInputHistory(text); // record for ↑/↓ recall, then reset nav to the newest
     histIndexRef.current = null;
@@ -650,7 +844,9 @@ function ChatSessionSlot({
     // The model gets the pipeline context prepended + the images natively; the
     // user bubble shows only the typed text + a 📎 list (never a raw doc/data dump).
     const sent = [...piped.map((a) => a.context as string), text].join("\n\n").trim();
-    const names = [...piped, ...nativeImgs].map((a) => a.name).join(", ");
+    // Set-dedupe: a text-only-model image with a describe model is BOTH piped
+    // (context) and native (#1969) — list its name once.
+    const names = [...new Set([...piped, ...nativeImgs].map((a) => a.name))].join(", ");
     const display = text ? `${text}\n\nAttached: ${names}` : `Attached: ${names}`;
     setAttachments([]);
     void runTurn(display, { sendAs: sent, images });
@@ -755,6 +951,14 @@ function ChatSessionSlot({
     const consumed = queued.filter((q) => !remainingIds.has(q.id));
     const unconsumed = queued.filter((q) => remainingIds.has(q.id));
     if (consumed.length) settleConsumed(consumed);
+    // The turn parked on a HITL form (#1560): steers the agent hasn't folded yet stay
+    // QUEUED — the server keeps holding them and folds them in right after the form
+    // response. Re-sending them as a fresh turn here would deliver them BEFORE the
+    // form answer (and abandon the pending interrupt).
+    if (unconsumed.length && hitlRef.current) {
+      setSteerQueue(unconsumed);
+      return;
+    }
     setSteerQueue([]);
     if (unconsumed.length) {
       void runTurn(unconsumed.map((u) => u.text).join("\n\n"));
@@ -796,6 +1000,22 @@ function ChatSessionSlot({
   // then re-run the user message that prompted it via the `hidden` path — no
   // duplicate user bubble, just a fresh streaming assistant. Only offered on the
   // last assistant message when idle.
+  // Drop a local-only errored turn from the transcript (#1695). A hard turn error
+  // parks the assistant bubble at status "error" with the error as content — it's
+  // never backend history (a reload omits it), so removing it here is purely local
+  // and safe. Only errored messages expose the Dismiss action that calls this.
+  function dismissErroredMessage(messageId: string) {
+    if (!session) return;
+    const snap = chatStore.getSnapshot().sessions.find((s) => s.id === session.id);
+    if (!snap) return;
+    chatStore.updateMessages(
+      session.id,
+      snap.messages.filter((m) => m.id !== messageId),
+    );
+    // Clear the session's error dot too (it drove the red status pill).
+    if (status === "error") chatStore.setSessionStatus(session.id, "idle");
+  }
+
   function regenerate(assistantId?: string) {
     if (!assistantId || !session || status === "streaming") return;
     const snap = chatStore.getSnapshot().sessions.find((s) => s.id === session.id);
@@ -826,23 +1046,96 @@ function ChatSessionSlot({
     chatStore.renameSession(created.id, `${baseTitle} (fork)`);
   }
 
+  // Rewind the conversation to a message IN PLACE (vs fork's new tab): discard
+  // everything below it. Destructive + irreversible, so it's gated behind a confirm
+  // (pendingRewind opens the dialog); confirmRewind does the work. The server rewrite
+  // is the point — the LangGraph checkpoint is the agent's real context, so a
+  // client-only trim would leave the agent still "remembering" the discarded turns.
+  function rewindAtMessage(message: ChatMessage) {
+    if (!session || status === "streaming") return;
+    setPendingRewind(message);
+  }
+
+  async function confirmRewind(message: ChatMessage) {
+    if (!session) return;
+    const i = session.messages.findIndex((m) => m.id === message.id);
+    if (i < 0) return;
+    // WHICH occurrence of this exact text the clicked bubble is — client message ids never
+    // appear in the checkpoint, so the server resolves by content; identical replies can
+    // repeat, and this makes it pick the SAME one we clicked (not a later duplicate).
+    const want = (message.content || "").trim();
+    const occurrence = session.messages.slice(0, i).filter((m) => (m.content || "").trim() === want).length;
+    let found: boolean;
+    try {
+      // Roll the agent's live context back on the server FIRST (the checkpoint is
+      // the real memory); the client truncate below just mirrors the result.
+      found = (await api.rewindChatSession(session.id, message.id ?? "", message.content, occurrence)).found;
+    } catch (e) {
+      onError(`Couldn't rewind: ${errMsg(e)}`);
+      return;
+    }
+    // The server couldn't locate the message in the live checkpoint — leave the
+    // client thread intact rather than diverge (the agent would still "remember"
+    // turns the UI had dropped).
+    if (!found) {
+      onError("Couldn't rewind — that message is no longer in the agent's live context.");
+      return;
+    }
+    // Keep the prefix through the selected message; drop everything after it.
+    const snap = chatStore.getSnapshot().sessions.find((s) => s.id === session.id);
+    const base = snap?.messages ?? session.messages;
+    const at = base.findIndex((m) => m.id === message.id);
+    chatStore.updateMessages(session.id, base.slice(0, (at < 0 ? i : at) + 1));
+  }
+
   // Resume a paused (input-required) turn: submitting the HITL form/question
   // sends the response as a follow-up on the same session — the server feeds it
   // to the agent via Command(resume=…). A form response is serialized to JSON.
+  // Redeem a plugin composer-form (#1701 Slice 2): POST the field values to the plugin's
+  // on_submit. A reply becomes a note; a returned form is the next step of a wizard
+  // (re-opened on the same input-required HITL path).
+  async function submitPluginForm(callbackId: string, answers: Record<string, unknown>) {
+    try {
+      const res = await api.submitChatCommandForm({
+        callback_id: callbackId,
+        session_id: session?.id ?? "",
+        answers,
+      });
+      if (res?.form) {
+        updateHitl({ ...res.form, plugin_callback_id: res.callback_id });
+      } else if (res?.reply) {
+        noteToThread(String(res.reply));
+      }
+    } catch (e) {
+      noteToThread(`⚠️ ${e instanceof Error ? e.message : String(e)}`, { tone: "danger" });
+    }
+  }
+
   async function resumeHitl(response: Record<string, unknown> | string) {
+    // A plugin composer-form (#1701 Slice 2) rode the input_required frame but is NOT a
+    // graph interrupt — redeem it via the plugin submit route, never Command(resume).
+    if (hitl?.plugin_callback_id) {
+      const cb = hitl.plugin_callback_id;
+      updateHitl(null);
+      await submitPluginForm(cb, typeof response === "string" ? {} : response);
+      return;
+    }
     // An approval gate (Approve/Deny on, e.g., run_command) isn't conversation — resume
     // the turn but DON'T append an "approved"/"denied" user bubble. The outcome lives on
     // the tool card itself (running → done on approve, error on deny), so the bubble is
     // just noise. A form/question answer IS meaningful content, so those stay visible.
     const silent = hitl?.kind === "approval";
-    setHitl(null);
+    updateHitl(null);
     // For an approval resume, CONTINUE the original assistant message (the one that paused) so the
     // pre- and post-approval tool cards live in ONE bubble / one WorkBlock — otherwise they split
     // across two message bubbles with a gap between them. Forms/questions keep the new-bubble path
     // (their answer is meaningful conversation).
+    // `hitlResume` marks this as THE answer to the pending interrupt (#1560): the server
+    // resumes the parked graph with it, while any other message sent meanwhile is held
+    // and folds in right after.
     void runTurn(
       typeof response === "string" ? response : JSON.stringify(response),
-      silent ? { hidden: true, resumeMessageId: lastAssistantId } : {},
+      silent ? { hidden: true, resumeMessageId: lastAssistantId, hitlResume: true } : { hitlResume: true },
     );
   }
 
@@ -854,11 +1147,17 @@ function ChatSessionSlot({
   // the paused assistant message (matching the approval-resume path) rather than minting a
   // new bubble.
   async function dismissHitl() {
-    setHitl(null);
+    // A plugin composer-form has no parked graph to resume — just close it; its server
+    // callback expires on its own TTL (#1701 Slice 2).
+    if (hitl?.plugin_callback_id) {
+      updateHitl(null);
+      return;
+    }
+    updateHitl(null);
     void runTurn(
       "[dismissed] The operator dismissed this request without providing input. Continue " +
         "without it — proceed using your best judgment, or stop and explain what you need.",
-      { hidden: true, resumeMessageId: lastAssistantId },
+      { hidden: true, resumeMessageId: lastAssistantId, hitlResume: true },
     );
   }
 
@@ -869,6 +1168,8 @@ function ChatSessionSlot({
       sendAs?: string;
       images?: { b64: string; mime: string; name: string }[];
       resumeMessageId?: string;
+      // This message answers the pending HITL interrupt (#1560) — see resumeHitl.
+      hitlResume?: boolean;
     } = {},
   ) {
     if (!session || !content) return;
@@ -919,10 +1220,81 @@ function ChatSessionSlot({
     const controller = new AbortController();
     abortRef.current = controller;
 
+    // Whether the stream delivered an AUTHORITATIVE full-turn text (a replace —
+    // the terminal artifact's append:false canonical re-send, or a terminal task
+    // frame). When the connection drops that frame (a proxy/tailnet blip at turn
+    // end), the settled bubble is only the client's own delta accumulation — any
+    // divergence (a lost or doubly-delivered chunk, #1938) would persist as
+    // done-but-wrong with nothing left to correct it. Track it so the settle path
+    // below can reconcile against the durable task exactly when it's needed.
+    let sawAuthoritativeText = false;
+    let turnTaskId = "";
+
+    // Stalled-stream watchdog (hung-workblock fix). The chat's only "turn done"
+    // signal is the SSE stream closing (onDone) — there is no standalone terminal
+    // event. If the stream stalls open mid-turn — a large answer whose terminal
+    // frames were stranded when the server's producer got cancelled on teardown
+    // (a2a_impl/registry.py), or a proxy/tailnet buffer — the reader blocks
+    // forever, so onDone, the post-stream reconcile below, and `finally` never
+    // run, and the bubble spins "Working…" until reload. Guard it: after
+    // WATCHDOG_IDLE_MS with no frames, consult the durable task (tasks/get). If
+    // it's TERMINAL the server finished and the tail was lost → finalize from the
+    // task and drop the dead socket; if it's still working the turn is just
+    // legitimately quiet (a slow tool) → keep waiting.
+    const WATCHDOG_IDLE_MS = 45_000;
+    let settledByWatchdog = false;
+    const finalizeFromTask = (state: string, text: string) => {
+      const failed = /fail|cancel/i.test(state);
+      const latest = chatStore.getSnapshot().sessions.find((s) => s.id === session.id);
+      if (latest) {
+        const now = Date.now();
+        chatStore.updateMessages(
+          session.id,
+          latest.messages.map((m) => {
+            if (m.id !== assistantId) return m;
+            const toolCalls = m.toolCalls?.map((c) =>
+              c.status === "running"
+                ? { ...c, status: "done" as const, durationMs: c.durationMs ?? (c.startedAt !== undefined ? now - c.startedAt : undefined) }
+                : c,
+            );
+            return {
+              ...m,
+              content: text || m.content,
+              parts: text ? replaceText(m.parts, text, m.content) : m.parts,
+              status: failed ? "error" : "done",
+              toolCalls,
+            };
+          }),
+        );
+      }
+      chatStore.setSessionStatus(session.id, failed ? "error" : "idle");
+      setStatusMessage(failed ? "failed" : "idle");
+    };
+    const watchdog = createStreamWatchdog({
+      idleMs: WATCHDOG_IDLE_MS,
+      getTask: async () => {
+        if (!turnTaskId) throw new Error("task id not surfaced yet");
+        return api.getTask(turnTaskId);
+      },
+      onTerminal: (task) => {
+        if (settledByWatchdog || controller.signal.aborted) return;
+        settledByWatchdog = true;
+        finalizeFromTask(task.state, task.text);
+        controller.abort(); // release the stalled socket; unwinds via catch → finally
+      },
+    });
+    const bumpWatchdog = () => {
+      if (controller.signal.aborted) return;
+      watchdog.bump();
+    };
+    const clearWatchdog = () => watchdog.stop();
+
     try {
+      bumpWatchdog();
       await api.streamChat(sent, session.id, {
         signal: controller.signal,
         onTaskId: (id) => {
+          turnTaskId = id;
           setTaskId(id);
           // Persist the task id on the assistant message so a stuck `streaming`
           // turn can be reconciled against the server task after a reload (below).
@@ -934,7 +1306,10 @@ function ChatSessionSlot({
             );
           }
         },
-        onStatus: setStatusMessage,
+        onStatus: (m) => {
+          bumpWatchdog();
+          setStatusMessage(m);
+        },
         onFailed: (detail) => {
           // The turn failed terminally (e.g. the model 401'd on a bad key).
           // Surface it as an errored assistant message + an actionable hint,
@@ -955,7 +1330,7 @@ function ChatSessionSlot({
           }
         },
         onInputRequired: (payload) => {
-          setHitl(payload);
+          updateHitl(payload);
           // Alert natively if the window is hidden/unfocused (menu-bar-only
           // desktop, or a backgrounded tab) so the form isn't missed.
           notifyIfHidden(
@@ -964,6 +1339,8 @@ function ChatSessionSlot({
           );
         },
         onText: (text, append) => {
+          bumpWatchdog();
+          if (!append) sawAuthoritativeText = true;
           const latest = chatStore.getSnapshot().sessions.find((item) => item.id === session.id);
           if (!latest) return;
           chatStore.updateMessages(
@@ -973,7 +1350,14 @@ function ChatSessionSlot({
                 ? {
                     ...message,
                     content: append ? `${message.content}${text}` : text,
-                    parts: appendText(message.parts, text, append),
+                    // A replace spans the WHOLE turn's text (the terminal frame re-sends
+                    // the full canonical answer, preamble included) — replaceText keeps
+                    // the streamed interleaving when nothing diverged and rebuilds
+                    // otherwise; appendText's open-run rewrite would double a pre-tool
+                    // preamble.
+                    parts: append
+                      ? appendText(message.parts, text, true)
+                      : replaceText(message.parts, text, message.content),
                     status: "streaming",
                   }
                 : message,
@@ -981,6 +1365,7 @@ function ChatSessionSlot({
           );
         },
         onReasoning: (delta) => {
+          bumpWatchdog();
           // Accumulate the streamed scratch_pad two ways: into `reasoning` (the
           // flat block kept for history/persistence) AND into the ordered `parts`,
           // so live turns render thinking inline at the point it occurred — between
@@ -1001,6 +1386,7 @@ function ChatSessionSlot({
           );
         },
         onToolCall: (evt) => {
+          bumpWatchdog();
           // `show_component` is a render directive, not a real action — its output IS the
           // inline component (delivered via onComponent / message.components). Suppress its
           // tool card so it doesn't add noise to the collapsed work timeline (#1323).
@@ -1076,7 +1462,7 @@ function ChatSessionSlot({
           );
         },
         onCost: (usage) => {
-          // This turn's token/cost readout (terminal cost-v1) — pin it to the assistant
+          // This turn's token/cost readout (terminal cost-v1 extension metadata) — pin it to the assistant
           // message so the per-turn footer survives reload with the rest of the message.
           const latest = chatStore.getSnapshot().sessions.find((item) => item.id === session.id);
           if (!latest) return;
@@ -1100,6 +1486,7 @@ function ChatSessionSlot({
           );
         },
         onDone: () => {
+          clearWatchdog();
           const latest = chatStore.getSnapshot().sessions.find((item) => item.id === session.id);
           if (!latest) return;
           const now = Date.now();
@@ -1131,13 +1518,51 @@ function ChatSessionSlot({
         // Read live (not the render-closure session) so an "Approve & don't ask again" that
         // flips bypass on right before this resume turn is carried by it.
         bypassPermissions: chatStore.getSnapshot().sessions.find((s) => s.id === session.id)?.bypassPermissions,
+        // Incognito (ADR 0069 D3b) — per-MESSAGE server-side, so read live and stamp
+        // EVERY send while the tab's toggle is on (a mixed thread would leak earlier
+        // incognito content into a later non-incognito turn's summary).
+        incognito: chatStore.getSnapshot().sessions.find((s) => s.id === session.id)?.incognito,
+        // Marks this message as the answer to the pending HITL interrupt (#1560).
+        hitlResume: opts.hitlResume,
       });
+      // The stream closed without the terminal canonical text (#1938): the settled
+      // bubble is only this client's delta accumulation, so reconcile it against
+      // the durable task — the server's artifact is the source of truth and a
+      // straight REPLACE collapses any doubled/lost-chunk divergence. Skipped on
+      // every healthy turn (the terminal frame sets sawAuthoritativeText).
+      if (!sawAuthoritativeText && turnTaskId) {
+        try {
+          const res = await api.getTask(turnTaskId);
+          if (/completed/i.test(res.state) && res.text) {
+            const latest = chatStore.getSnapshot().sessions.find((item) => item.id === session.id);
+            if (latest) {
+              chatStore.updateMessages(
+                session.id,
+                latest.messages.map((m) =>
+                  m.id === assistantId
+                    ? { ...m, content: res.text, parts: replaceText(m.parts, res.text, m.content) }
+                    : m,
+                ),
+              );
+            }
+          }
+        } catch {
+          // Best-effort — the settled accumulation stands if the task read fails.
+        }
+      }
       chatStore.setSessionStatus(session.id, "idle");
       setStatusMessage("idle");
       void reconcileSteer();
     } catch (exc) {
       if (controller.signal.aborted) {
-        setStatusMessage("stopped");
+        // A user Stop OR a watchdog self-heal (which aborts to free a stalled
+        // socket AFTER finalizing the turn from the durable task). In the watchdog
+        // case the bubble + session state are already settled — don't clobber them
+        // with "stopped"/idle.
+        if (!settledByWatchdog) {
+          setStatusMessage("stopped");
+          chatStore.setSessionStatus(session.id, "idle");
+        }
       } else {
         const message = errMsg(exc);
         onError(message);
@@ -1154,26 +1579,41 @@ function ChatSessionSlot({
         }
         return;
       }
-      chatStore.setSessionStatus(session.id, "idle");
     } finally {
+      clearWatchdog();
       abortRef.current = null;
       setTaskId("");
     }
   }
 
   async function stop() {
-    if (taskId) {
-      try {
-        await api.cancelTask(taskId);
-      } catch {
-        // The local abort below still releases the UI even if the task already finished.
-      }
-    }
+    // Release any locally-owned stream first — the server cancel is an RPC and
+    // must never gate the UI stopping (#1617: Stop appeared dead while a long
+    // reasoning chain streamed).
     abortRef.current?.abort();
+    // The task to cancel: this slot's live turn, or — when the slot re-attached
+    // to a turn it didn't start (reload / remount / the desktop relay, all of
+    // which leave taskId state empty and abortRef null) — the streaming
+    // message's durable taskId. Resolve BEFORE settling bubbles below, which
+    // erases the `streaming` marker the fallback keys off. On desktop the relay
+    // ignores the abort signal entirely, so this server-side cancel is the only
+    // thing that actually halts the turn there.
+    const before = chatStore.getSnapshot().sessions.find((s) => s.id === sessionId);
+    const cancelId = resolveStopTarget(before?.messages || [], taskId);
+    // Settle the thread immediately: no bubble may stay `streaming` after Stop.
+    // The send-loop only finalizes turns it owns; a re-attached turn has none.
+    if (before) chatStore.updateMessages(sessionId, finalizeStoppedMessages(before.messages));
     chatStore.setSessionStatus(sessionId, "idle");
     setStatusMessage("stopped");
     // Drop any optimistic queued-steer bubbles; the user chose to stop.
     setSteerQueue([]);
+    if (cancelId) {
+      try {
+        await api.cancelTask(cancelId);
+      } catch {
+        // Best-effort — the UI is already released; the task may have finished.
+      }
+    }
   }
 
   if (!session) return null;
@@ -1193,7 +1633,9 @@ function ChatSessionSlot({
                 copiedId,
                 onCopy: copyMessage,
                 onFork: forkAtMessage,
+                onRewind: rewindAtMessage,
                 onRegenerate: regenerate,
+                onDismiss: dismissErroredMessage,
                 lastAssistantId,
                 regenDisabled: status === "streaming",
               }}
@@ -1215,24 +1657,18 @@ function ChatSessionSlot({
             <span className="chat-user-text">{q.text}</span>
           </Message>
         ))}
+        {serverTurnLabel && status !== "streaming" ? (
+          // Server-initiated turn in flight (#1767): the same spinner a streaming
+          // assistant shows, plus a label naming the trigger, so a background/scheduled/
+          // watch turn no longer looks like a hung app. Display-only — the real answer
+          // arrives via chat.resumed (ChatResumeWatch).
+          <Message role="assistant">
+            <span className="chat-server-turn">
+              <Spinner size={15} /> {serverTurnLabel}
+            </span>
+          </Message>
+        ) : null}
       </Conversation>
-
-      {hitl && (
-        <HitlForm
-          payload={hitl}
-          busy={status === "streaming"}
-          onSubmit={resumeHitl}
-          onCancel={dismissHitl}
-          onApproveAlways={
-            hitl.kind === "approval" && session
-              ? () => {
-                  chatStore.setSessionBypassPermissions(session.id, true); // turn bypass on for this tab
-                  void resumeHitl("approved"); // …and approve the pending command
-                }
-              : undefined
-          }
-        />
-      )}
 
       <div
         className="composer-wrap"
@@ -1255,12 +1691,54 @@ function ChatSessionSlot({
           }
         }}
       >
+        {/* HITL panel (#1973): floats ABOVE the composer (absolute, anchored to
+            .composer-wrap like the slash menu) so it never reflows the conversation,
+            moves the composer, or jumps the scroll when it appears/resolves. No
+            backdrop by design — answering usually means re-reading (and scrolling)
+            the chat behind it. Other hosts (GoalsPanel) render HitlForm in-flow. */}
+        {(hitl || composerForm) && (
+          <div className="hitl-float">
+            {hitl && (
+              <HitlForm
+                payload={hitl}
+                busy={status === "streaming"}
+                onSubmit={resumeHitl}
+                onCancel={dismissHitl}
+                onApproveAlways={
+                  hitl.kind === "approval" && session
+                    ? () => {
+                        chatStore.setSessionBypassPermissions(session.id, true); // turn bypass on for this tab
+                        void resumeHitl("approved"); // …and approve the pending command
+                      }
+                    : undefined
+                }
+              />
+            )}
+            {/* Client composer-form (#1701) — a locally-resolved form (e.g. /effort's picker),
+                the same HitlForm but with a LOCAL onSubmit. Only when the agent isn't already
+                holding the panel for its own HITL interrupt, so the two never collide. */}
+            {!hitl && composerForm && (
+              <HitlForm
+                payload={composerForm.payload}
+                onSubmit={(answers) => {
+                  composerForm.onSubmit(answers);
+                  setComposerForm(null);
+                }}
+                onCancel={() => {
+                  composerForm.onCancel?.();
+                  setComposerForm(null);
+                }}
+              />
+            )}
+          </div>
+        )}
         <PromptInput
           value={draft}
           onChange={(v) => {
             setDraft(v);
             setSlashDismissed(false); // re-open the menu when the input changes
             histIndexRef.current = null; // typing detaches from history nav (readline)
+            refreshSlash(); // re-parse the "/name" token at the (post-input) caret (#1530)
           }}
           // Idle → send. While a turn streams (`busy`), the field stays live: Enter
           // queues a steer into the running turn (onQueue) without stopping it, and
@@ -1269,11 +1747,10 @@ function ChatSessionSlot({
           busy={status === "streaming"}
           onQueue={() => void queueSteer()}
           onStop={() => void stop()}
-          placeholder={
-            status === "streaming"
-              ? "Steer the agent — your message folds into its work at the next step (Enter to queue)"
-              : "Message protoAgent  (/ for commands · Enter to send · ↑ history · ⌘/Ctrl+Enter for newline)"
-          }
+          // Short hints only (#1699) — key/command discoverability lives in /help now, not
+          // in a placeholder wall of text competing with the message being written. ("Steer
+          // the agent" is also an e2e anchor — chat-steer-cancel.spec.ts.)
+          placeholder={status === "streaming" ? "Steer the agent…" : "Message protoAgent…"}
           inputRef={textareaRef}
           onKeyDown={onComposerKeyDown}
           onPaste={(e) => {
@@ -1322,6 +1799,18 @@ function ChatSessionSlot({
                 </Button>
               ))}
               <ComposerModelSelect />
+              {session?.incognito ? (
+                <button
+                  type="button"
+                  className="composer-incognito-toggle"
+                  title="Incognito is ON for this tab — turns leave no memory (no session summary, no harvest) and inject none. Click to turn it off."
+                  onClick={() => chatStore.setSessionIncognito(session.id, false)}
+                >
+                  <Badge status="neutral">
+                    <EyeOff size={12} /> incognito
+                  </Badge>
+                </button>
+              ) : null}
               {session?.bypassPermissions ? (
                 <button
                   type="button"
@@ -1351,14 +1840,20 @@ function ChatSessionSlot({
                 <button
                   type="button"
                   key={cmd.name}
+                  ref={index === slashSel ? activeSlashRef : undefined}
                   role="option"
                   aria-selected={index === slashSel}
                   className={`slash-item${index === slashSel ? " active" : ""}`}
                   onMouseEnter={() => setSlashIndex(index)}
                   onClick={() => completeCommand(cmd)}
                 >
-                  <span className="slash-name">/{cmd.name}</span>
-                  <span className="slash-desc">{cmd.usage || cmd.description}</span>
+                  <span className="slash-title">
+                    <span className="slash-name">/{cmd.name}</span>
+                    {cmd.kind ? (
+                      <span className="slash-kind">{cmd.kind === "plugin_command" ? "plugin" : cmd.kind}</span>
+                    ) : null}
+                  </span>
+                  <span className="slash-desc">{cmd.description || cmd.usage}</span>
                 </button>
               ))}
             </div>
@@ -1381,6 +1876,22 @@ function ChatSessionSlot({
           }}
         />
       </div>
+
+      <ConfirmDialog
+        open={pendingRewind !== null}
+        title="Rewind to here?"
+        confirmLabel="Rewind"
+        destructive
+        onConfirm={() => {
+          if (pendingRewind) void confirmRewind(pendingRewind);
+          setPendingRewind(null);
+        }}
+        onClose={() => setPendingRewind(null)}
+      >
+        <p style={{ margin: 0 }}>
+          This will discard everything below this message — cannot be undone.
+        </p>
+      </ConfirmDialog>
     </div>
   );
 }

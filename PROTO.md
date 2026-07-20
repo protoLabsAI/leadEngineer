@@ -11,9 +11,15 @@ TypeScript is the console.
 
 ## Run it
 
-- **Server:** `python -m server` (never `python server.py` — single-file launch
-  was retired in ADR 0023 and CI fails on it). Console is served from
-  `apps/web/dist`; `/healthz` is the readiness probe.
+- **Server:** `protoagent serve` — or `python -m server`, the module form the
+  frozen sidecar uses (never `python server.py`; single-file launch was retired in
+  ADR 0023 and CI fails on it). The **`protoagent`** command (ADR 0075) is the
+  discoverable front door: `protoagent --help` lists the management subcommands
+  (`plugin` / `workspace` / `fleet` / `skills` / `config`) plus lifecycle
+  (`up` / `down` / `status` / `serve` / `setup`); `protoagent up` runs the instance
+  detached and `protoagent status` reports it. Both front doors route through the
+  same dispatcher (`server/cli.py::dispatch`), so `python -m server <sub>` keeps
+  working. Console is served from `apps/web/dist`; `/healthz` is the readiness probe.
 - **Isolated dev instance (don't stomp prod data):** `scripts/dev.sh` runs a
   sandboxed instance via `PROTOAGENT_INSTANCE=dev` (ADR 0065 two-tier paths) on
   `:7871` — its whole root is `~/.protoagent/dev/` (config + every store under it),
@@ -22,6 +28,18 @@ TypeScript is the console.
   chat/tasks/knowledge. The default instance is `~/.protoagent/default/` on `:7870`,
   untouched. `scripts/dev-reset.sh` wipes just the sandbox. Use this for feature
   testing instead of the default instance.
+- **Spinning up a throwaway test server while the user's real instance(s) run
+  (e.g. an agent booting a PR build for review): FULLY isolate it — own box root
+  too, not just an instance id.** Plain `dev.sh` shares the box root (`~/.protoagent`),
+  which is data-safe but trips the desktop's co-residence warning (#1552) and can
+  collide on box-level resources (mDNS advertise, scheduler owner-lock). Instead:
+  `PROTOAGENT_BOX_ROOT=/tmp/pa-<name> PROTOAGENT_INSTANCE=<name> python -m server
+  --port <free>` — nothing under `~/.protoagent` is shared or touched. Tradeoff: a
+  fresh box root does **not** inherit box config (`host-config.yaml` gateway/model
+  defaults), so seed a gateway in that instance if the test needs model-backed
+  features; pure-console/UI review works as-is. (Serving a worktree's own
+  `apps/web/dist`: `cd <worktree> && … python -m server` — `_bundle_root()` anchors
+  to the loaded `server/` package, so it serves that checkout's build.)
 - **Factory-reset the default instance:** `scripts/reset.sh` wipes the **prod**
   instance back to a clean slate (next boot runs the setup wizard) — for testing the
   fresh-user flow via CLI (there is no in-app reset). **Always `--dry-run` first** to
@@ -31,14 +49,23 @@ TypeScript is the console.
   `--keep-secrets` (keep gateway creds), `--include-dev`, `--force` (stop a bound
   server first). *(Reset-script rewrite for the ADR-0065 single-subtree layout is a
   follow-up; see [the env-vars gotcha](#house-rules--gotchas-that-bite).)*
-- **See where state lives:** `python -m server config explain` (or
-  `GET /api/config/explain`) prints this instance's id, both roots (box + instance),
+- **See where state lives:** `protoagent config explain` (or `python -m server
+  config explain`, or `GET /api/config/explain`) prints this instance's id, both roots (box + instance),
   every resolved path, and the per-field settings cascade with provenance (secrets
   redacted) — the way to answer "where is my config / where did my key go".
 - **Python deps:** managed with `uv` (`pyproject.toml [project.dependencies]` is
   the source of truth; `uv.lock` is tracked). `uv sync` to install.
 - **Console deps:** `npm ci` at the repo root (npm workspaces; the web app is
-  `@protoagent/web`).
+  `@protoagent/web`). **Changing/bumping a dependency requires npm ≥ 11**
+  (`npm install -g npm@11`) — see the npm-10 no-op gotcha below.
+- **Console dev loop (frontend):** `npm run dev` (HMR) / `npm run preview` (built dist) serve
+  the console on `:5173` and **proxy all backend calls (`/api`, `/a2a`, events, `/agents`,
+  `/plugins`, `/_ds`) to `PROTOAGENT_API_BASE`, default `http://127.0.0.1:7871`** — the
+  ISOLATED dev instance from `scripts/dev.sh`, **not** the default/prod `:7870` the desktop app
+  runs. So the correct loop is *`scripts/dev.sh` (backend, :7871) + `npm run dev` (frontend)* —
+  both isolated, so dev testing never touches your `~/.protoagent` data. Vite prints a loud red
+  guard if you ever point `PROTOAGENT_API_BASE` at `:7870`. (Historically it defaulted to
+  `:7870`, which silently crossed dev traffic into the prod/desktop instance.)
 
 ## Must pass before opening a PR
 
@@ -49,6 +76,7 @@ before the PR, not after. CI is the merge gate; a red PR is wasted cycles.
 |------|---------|
 | Lint | `ruff check .` (pinned `ruff==0.15.10`) |
 | Import contracts | `lint-imports` (pinned `import-linter==2.11`) |
+| Attribution in sync | `python scripts/gen_attribution.py --check` (regenerate with `uv sync && uv run python scripts/gen_attribution.py` after a dep bump) |
 | Python tests | `python -m pytest tests/ -q` |
 | Lean-image smoke | `python scripts/live_smoke.py` |
 | Web unit | `npm run test:unit --workspace @protoagent/web` |
@@ -85,6 +113,25 @@ These are the failures that actually recur — read them before you edit.
   accessor or use `instance_paths().store("<name>")`. Identity comes from env only —
   never config-file content. `config explain` prints the resolved layout.
 
+- **npm 10 silently no-ops workspace dependency bumps — use npm ≥ 11.** With a
+  dep resolved under `apps/web/node_modules/` (e.g. `@protolabsai/ui`, nested
+  because its pinned `@protolabsai/design` conflicts with the hoisted one),
+  npm 10's arborist keeps the old version through **every** supported command —
+  root `npm install` after a range bump, `npm install <pkg>@<v> -w
+  @protoagent/web`, `npm update <pkg> -w` — even when the locked version no
+  longer satisfies the manifest range. No error, nothing changes (repro'd
+  three ways, 2026-07-12). npm 11 (`npm install -g npm@11`) resolves the same
+  bump correctly with a plain root `npm install`. The two arborists also
+  disagree about peer-stub reachability, so **npm 10's `ci` rejects an
+  npm-11-generated lockfile** ("Missing: @types/react@… from lock file") —
+  which is why every CI job touching the root lockfile pins `npm install -g
+  npm@11` before `npm ci` (**the Dockerfile web-builder stage too** — node:20-slim
+  ships npm 10; missing it broke every GHCR publish + the v0.101.0 release
+  build until fixed) and the checks/desktop-build/marketing-deploy/docs
+  workflows). Keep new workflows consistent. After any dep bump, regenerate
+  `THIRD_PARTY_LICENSES.md` (`uv run python scripts/gen_attribution.py`) or
+  the attribution gate fails.
+
 - **No unused variables.** ruff selects `F` (pyflakes); `F841` (assigned-but-
   unused) **fails CI** and `ruff check --fix` does **not** auto-fix it. Don't
   leave dead locals in code or tests. (Style rules `E402/E501/E702/E731/E741`
@@ -100,8 +147,10 @@ These are the failures that actually recur — read them before you edit.
 
 - **Import layering (enforced by `lint-imports`).** `graph/` and the infra
   packages (`a2a_impl/ observability/ security/ infra/ tools/ knowledge/
-  events/ scheduler/ runtime/`) must **never** import `server/` or
-  `operator_api/`; `operator_api/` must never import `server/`. The
+  events/ scheduler/ runtime/ ops/`) must **never** import `server/` or
+  `operator_api/`; `operator_api/` must never import `server/`. (`ops/` is the
+  ADR 0075 D2 shared-operation layer — one op wrapping a core, called by the CLI,
+  REST, and MCP adapters; being neutral is what lets all three import it.) The
   `ignore_imports` lists in `pyproject.toml [tool.importlinter]` are a
   **burndown list** of grandfathered violations — remove entries, never add to
   them. import-linter sees function-level (lazy) imports too, so you can't hide

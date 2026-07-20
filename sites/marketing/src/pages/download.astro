@@ -17,6 +17,8 @@ const version = latest.version.replace(/^v/, ''); // 0.62.0
 const tag = latest.version.startsWith('v') ? latest.version : `v${latest.version}`;
 // Stable mac asset name: protoAgent-<bare-version>-aarch64-apple-darwin.dmg
 const dmgUrl = `${repo}/releases/download/${tag}/protoAgent-${version}-aarch64-apple-darwin.dmg`;
+// The Windows build needs further work and testing before we hand it out, so
+// Windows visitors get the notify-me gate below (not a live setup.exe) for now.
 
 const subscribeAction = `https://buttondown.com/api/emails/embed-subscribe/${BUTTONDOWN_USER}`;
 const subscribePopup = `https://buttondown.com/${BUTTONDOWN_USER}`;
@@ -24,7 +26,7 @@ const subscribePopup = `https://buttondown.com/${BUTTONDOWN_USER}`;
 
 <BaseLayout
   title="Download protoAgent"
-  description="Download protoAgent — the lean, A2A-native operator agent for macOS. Apple Silicon, signed & notarized. Windows and Linux in testing."
+  description="Download protoAgent — the lean, A2A-native operator agent for macOS. Apple Silicon, signed & notarized. Windows and Linux coming soon."
 >
   <!-- Detect the OS before paint so the right block is visible with no flash. -->
   <script is:inline>
@@ -138,9 +140,9 @@ const subscribePopup = `https://buttondown.com/${BUTTONDOWN_USER}`;
       <div class="card p-6 mb-10">
         <h2 class="text-lg font-semibold mb-2">The desktop app is macOS-only for now</h2>
         <p class="text-zinc-400 text-sm">
-          We build signed Windows and Linux installers on every release, but we’re still testing them
-          before we hand them out. Drop your email below and we’ll tell you the moment your platform is
-          ready — or run protoAgent from source today.
+          Windows and Linux builds are coming soon — we build them on every release but are still
+          testing them before we hand them out. Drop your email below and we’ll tell you the moment
+          your platform is ready — or run protoAgent from source today.
         </p>
       </div>
     </div>
@@ -149,8 +151,8 @@ const subscribePopup = `https://buttondown.com/${BUTTONDOWN_USER}`;
     <div class="card p-6 mb-10">
       <h2 class="text-lg font-semibold mb-1">Get notified about Windows &amp; Linux</h2>
       <p class="text-zinc-400 text-sm mb-5">
-        The desktop app is macOS-only while we test the Windows and Linux builds. Leave your email and
-        we’ll let you know the moment they ship.
+        The desktop app is macOS-only while we finish testing the Windows and Linux builds. Leave
+        your email and we’ll let you know the moment they ship.
       </p>
       <form
         action={subscribeAction}

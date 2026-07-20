@@ -60,6 +60,10 @@ type UIState = {
   // One-shot: the FleetSwitcher's "+ New agent" deep-link routes to Host/App ▸ Fleet
   // and asks the fleet panel to open the new-agent picker on mount, then clears it.
   fleetStartNew: boolean;
+  // One-shot: a chat tool card's "Manage" deep-link (#1803) routes to Capabilities ▸ Tools
+  // carrying the tool name, so the Tools panel filters + highlights that row on mount, then
+  // clears it. Ephemeral (partialized out) — it accompanies the also-ephemeral settings overlay.
+  toolsTarget: string | null;
   // Global settings overlay (the Global home; opened from the header drawer or a
   // command-palette deep-link). EPHEMERAL — partialized out of persistence so a refresh
   // never reopens it. The section deep-links a Global section (e.g. "telemetry").
@@ -73,6 +77,16 @@ type UIState = {
   configurePlugin?: { id: string; name: string };
   openPluginConfig: (id: string, name: string) => void;
   closePluginConfig: () => void;
+  // Rail context-menu plugin actions (#1521 / #1522, ADR 0036). A right-click "Update
+  // available" / "Uninstall…" on a plugin's rail icon records the target here; a root
+  // PluginRailManage mount fires the update mutation or renders the uninstall confirm.
+  // EPHEMERAL — partialized out of persistence so a refresh never re-triggers one.
+  pluginUpdate?: { id: string; name: string };
+  requestPluginUpdate: (id: string, name: string) => void;
+  clearPluginUpdate: () => void;
+  pluginUninstall?: { id: string; name: string };
+  requestPluginUninstall: (id: string, name: string) => void;
+  clearPluginUninstall: () => void;
   rightCollapsed: boolean;
   leftCollapsed: boolean;
   rightWidth: number;
@@ -117,6 +131,9 @@ type UIState = {
   setPluginsTab: (t: PluginsTab) => void;
   setSettingsSection: (s: string) => void;
   setFleetStartNew: (b: boolean) => void;
+  setToolsTarget: (name: string | null) => void;
+  // Deep-link a chat tool card → Capabilities ▸ Tools, focused on that tool (#1803).
+  openToolSettings: (name: string) => void;
   setRightCollapsed: (b: boolean) => void;
   setLeftCollapsed: (b: boolean) => void;
   setRightWidth: (w: number) => void;
@@ -127,6 +144,13 @@ type UIState = {
   // bus activity shows a rail dot until opened. Persisted so the dot survives a refresh.
   pluginDots: Record<string, boolean>;
   setPluginDot: (key: string, on: boolean) => void;
+  // Background event delivery (#1640) — surface keys whose iframe subscribed with
+  // `background: true` over the bridge. App keeps these views MOUNTED (hidden) when
+  // another surface is active, so the bridge keeps relaying bus events to them.
+  // EPHEMERAL — partialized out: the page re-requests on every load, and persisting it
+  // would silently keep iframes alive from boot that the operator never opened.
+  pluginBackground: Record<string, boolean>;
+  setPluginBackground: (key: string, on: boolean) => void;
   // Chat display: show the per-turn token/cost + context-window footer under each answer
   // (#1372). On by default; operators who want a cleaner transcript turn it off (this device).
   showChatUsage: boolean;
@@ -138,7 +162,7 @@ type UIState = {
 // persisted `railOrder` is missing it (see the action). Keep ids in sync with
 // CORE_SURFACES (apps/web/src/app/coreSurfaces.tsx).
 const DEFAULT_RAIL_ORDER: { left: string[]; right: string[]; bottom: string[]; hidden: string[] } = {
-  left: ["chat", "knowledge"],
+  left: ["chat", "knowledge", "memory"],
   right: ["work"],
   bottom: [],
   hidden: [],
@@ -299,6 +323,7 @@ export const useUI = create<UIState>()(
       // Box section, so it can't be the universal default (a fleet member has no Box group).
       settingsSection: "identity",
       fleetStartNew: false,
+      toolsTarget: null,
       globalSettingsOpen: false,
       globalSettingsSection: undefined,
       openGlobalSettings: (section) => set({ globalSettingsOpen: true, globalSettingsSection: section }),
@@ -306,6 +331,12 @@ export const useUI = create<UIState>()(
       configurePlugin: undefined,
       openPluginConfig: (id, name) => set({ configurePlugin: { id, name } }),
       closePluginConfig: () => set({ configurePlugin: undefined }),
+      pluginUpdate: undefined,
+      requestPluginUpdate: (id, name) => set({ pluginUpdate: { id, name } }),
+      clearPluginUpdate: () => set({ pluginUpdate: undefined }),
+      pluginUninstall: undefined,
+      requestPluginUninstall: (id, name) => set({ pluginUninstall: { id, name } }),
+      clearPluginUninstall: () => set({ pluginUninstall: undefined }),
       rightCollapsed: false,
       leftCollapsed: false,
       rightWidth: 360,
@@ -383,9 +414,15 @@ export const useUI = create<UIState>()(
           arrs[target].push(id);
           return { railOrder: arrs };
         }),
+      // The mobile navigation stack (ADR 0086 D1): "chat" = the root view, any other id =
+      // that surface pushed over it. Not a rail id — the mobile shell reads only this.
       mobileActive: "chat",
       setMobileActive: (mobileActive) => set({ mobileActive }),
-      quickBar: ["chat", "knowledge", "plugins"],
+      // Retired on mobile by ADR 0086 D1 (the bottom quick-bar is gone; chat is the root).
+      // Kept as inert persisted state pending a separate cleanup. The old default listed
+      // "plugins" — a surface folded into Settings long ago — and since MobileNav silently
+      // dropped ids it couldn't resolve, every fresh install rendered a 2-tab bottom bar.
+      quickBar: ["chat", "knowledge", "memory"],
       toggleQuickBar: (id) =>
         set((s) => {
           if (s.quickBar.includes(id)) return { quickBar: s.quickBar.filter((x) => x !== id) };
@@ -423,6 +460,12 @@ export const useUI = create<UIState>()(
       setPluginsTab: (pluginsTab) => set({ pluginsTab }),
       setSettingsSection: (settingsSection) => set({ settingsSection }),
       setFleetStartNew: (fleetStartNew) => set({ fleetStartNew }),
+      setToolsTarget: (toolsTarget) => set({ toolsTarget }),
+      // Land on Capabilities ▸ Tools with the panel focused on this tool (#1803): set the
+      // one-shot target AND open the settings overlay on the Tools section in one atomic set
+      // (mirrors openGlobalSettings's body — the store creator exposes only `set`).
+      openToolSettings: (name) =>
+        set({ toolsTarget: name, globalSettingsOpen: true, globalSettingsSection: "tools" }),
       setRightCollapsed: (rightCollapsed) => set({ rightCollapsed }),
       setLeftCollapsed: (leftCollapsed) => set({ leftCollapsed }),
       // The DS AppShell is a CONTROLLED width: during a divider drag it streams transient
@@ -445,6 +488,15 @@ export const useUI = create<UIState>()(
           else delete next[key];
           return { pluginDots: next };
         }),
+      pluginBackground: {},
+      setPluginBackground: (key, on) =>
+        set((s) => {
+          if (Boolean(s.pluginBackground[key]) === on) return s; // no-op → no rerender
+          const next = { ...s.pluginBackground };
+          if (on) next[key] = true;
+          else delete next[key];
+          return { pluginBackground: next };
+        }),
       showChatUsage: true,
       setShowChatUsage: (showChatUsage) => set({ showChatUsage }),
     }),
@@ -454,8 +506,10 @@ export const useUI = create<UIState>()(
       version: 14, // …v12 Settings→utility pill · v13 railOrder.hidden bucket · v14 drop dead settingsScope (domain-first IA, ADR 0048)
       migrate: (persisted: unknown) => migrateUiState(persisted) as never,
       // Ephemeral overlay state — dropped from persistence so a refresh never reopens it
-      // (the Global settings overlay + the per-plugin Configure dialog).
-      partialize: ({ globalSettingsOpen: _o, globalSettingsSection: _s, configurePlugin: _c, ...rest }) => rest,
+      // (the Global settings overlay, the per-plugin Configure dialog, the pending
+      // rail-menu Update/Uninstall action, and the per-session background-delivery set
+      // (#1640) — a view's page re-requests it on every load).
+      partialize: ({ globalSettingsOpen: _o, globalSettingsSection: _s, toolsTarget: _tt, configurePlugin: _c, pluginUpdate: _pu, pluginUninstall: _pun, pluginBackground: _pb, ...rest }) => rest,
     },
   ),
 );

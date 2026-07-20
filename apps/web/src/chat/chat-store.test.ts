@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
+  dedupeMessages,
   ensureActiveSessions,
   mergeSessions,
   sanitizePersisted,
@@ -8,6 +9,7 @@ import {
   type ChatSession,
   type ChatState,
 } from "./chat-store";
+import type { ChatMessage } from "../lib/types";
 
 // ensureActiveSessions is the LRU that decides which chat sessions stay mounted.
 // Its load-bearing invariant: it must NEVER evict a session that is mid-stream
@@ -175,6 +177,9 @@ describe("persist debouncing", () => {
   it("reorderSessions keeps a session the caller omitted (defensive)", async () => {
     const { chatStore } = await freshStore();
     const first = chatStore.getSnapshot().currentSessionId!;
+    // `first` has to be USED or createSession reuses it instead of making `b` — two
+    // pristine blanks are interchangeable and the store now collapses them.
+    chatStore.updateMessages(first, [{ role: "user", content: "hi" }]);
     const b = chatStore.createSession();
 
     chatStore.reorderSessions([b.id]); // omit `first`
@@ -336,6 +341,60 @@ describe("mergeSessions", () => {
     const incoming = [mkSession("extra", { createdAt: 9999 })];
     expect(mergeSessions(local, incoming)).toHaveLength(MAX_SESSIONS);
   });
+
+  // #1938: two mounts interleaving writes during a long streaming turn. The merge is
+  // whole-session (never message-level), so no interleaving may yield a session whose
+  // messages array carries the same entry twice — the streamed reply renders once.
+  it("interleaved two-tab writes during a streaming turn never duplicate a message entry", () => {
+    const user: ChatMessage = { id: "m-u", role: "user", content: "generate a frog", createdAt: 1, status: "done" };
+    const streamingCopy = mkSession("x", {
+      updatedAt: 100,
+      messages: [user, { id: "m-a", role: "assistant", content: "Here you", createdAt: 2, status: "streaming", taskId: "t1" }],
+    });
+    // The sibling mount reconciled the SAME message to done (higher clock) while
+    // this tab still owns the live stream…
+    const reconciledCopy = mkSession("x", {
+      updatedAt: 200,
+      messages: [user, { id: "m-a", role: "assistant", content: "Here you go — a frog.", createdAt: 2, status: "done", taskId: "t1" }],
+    });
+    const midTurn = mergeSessions([streamingCopy], [reconciledCopy], { streamingIds: new Set(["x"]) });
+    expect(midTurn).toHaveLength(1);
+    expect(midTurn[0].messages.filter((m) => m.id === "m-a")).toHaveLength(1);
+    expect(midTurn[0].messages[1].content).toBe("Here you"); // live stream stays authoritative
+
+    // …then the turn ends (streaming exemption lifted): newest whole-session copy
+    // wins — still exactly one assistant entry, never a stacked pair.
+    const settled = mergeSessions([{ ...streamingCopy, updatedAt: 300, messages: reconciledCopy.messages }], [reconciledCopy]);
+    expect(settled).toHaveLength(1);
+    expect(settled[0].messages.filter((m) => m.id === "m-a")).toHaveLength(1);
+  });
+});
+
+// #1938 defense-in-depth: whatever interleaving produces a duplicated entry upstream,
+// the store boundary (updateMessages / sanitizePersisted on load) collapses it.
+describe("dedupeMessages", () => {
+  const msg = (id: string, content: string): ChatMessage => ({ id, role: "assistant", content, createdAt: 1, status: "done" });
+
+  it("returns the same array when there is nothing to collapse (hot path)", () => {
+    const list = [msg("a", "one"), msg("b", "two")];
+    expect(dedupeMessages(list)).toBe(list);
+  });
+
+  it("collapses a duplicated id keeping the LAST occurrence", () => {
+    const out = dedupeMessages([msg("a", "stale"), msg("b", "mid"), msg("a", "fresh")]);
+    expect(out.map((m) => m.content)).toEqual(["mid", "fresh"]);
+  });
+
+  it("leaves id-less legacy entries untouched even with equal content", () => {
+    const legacy = { role: "assistant", content: "same", createdAt: 1, status: "done" } as ChatMessage;
+    expect(dedupeMessages([legacy, { ...legacy }])).toHaveLength(2);
+  });
+
+  it("collapses persisted duplicates on load via sanitizePersisted", () => {
+    const s = mkSession("a", { messages: [msg("m1", "old copy"), msg("m1", "new copy")] });
+    const out = sanitizePersisted({ sessions: [s], currentSessionId: "a" });
+    expect(out?.sessions[0].messages.map((m) => m.content)).toEqual(["new copy"]);
+  });
 });
 
 describe("cross-tab persistence", () => {
@@ -389,5 +448,94 @@ describe("cross-tab persistence", () => {
     window.dispatchEvent(new StorageEvent("storage", { key: "some.other.key", newValue: "{}" }));
     window.dispatchEvent(new StorageEvent("storage", { key: "protoagent.chat.sessions", newValue: null }));
     expect(chatStore.getSnapshot().sessions.map((s) => s.id)).toEqual(before);
+  });
+});
+
+// Incognito threads (ADR 0069 D3b): the flag lives ON the session (persisted with it)
+// so ChatSurface can stamp metadata.incognito onto EVERY send while it's on — the
+// backend flag is per-message, and a mixed thread would leak earlier incognito content
+// into a later non-incognito turn's summary.
+describe("incognito sessions", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+    vi.resetModules(); // fresh module-level store per test
+  });
+
+  it("createSession({incognito:true}) marks the new session; default stays unmarked", async () => {
+    const { chatStore } = await import("./chat-store");
+    const plain = chatStore.createSession();
+    expect(plain.incognito).toBeUndefined();
+    const priv = chatStore.createSession({ incognito: true });
+    expect(priv.incognito).toBe(true);
+    const snap = chatStore.getSnapshot();
+    expect(snap.sessions.find((s) => s.id === priv.id)?.incognito).toBe(true);
+    expect(snap.currentSessionId).toBe(priv.id); // new tab becomes current, as always
+  });
+
+  it("setSessionIncognito toggles on and off (off drops the key entirely)", async () => {
+    const { chatStore } = await import("./chat-store");
+    const s = chatStore.createSession();
+    chatStore.setSessionIncognito(s.id, true);
+    expect(chatStore.getSnapshot().sessions.find((x) => x.id === s.id)?.incognito).toBe(true);
+    chatStore.setSessionIncognito(s.id, false);
+    expect(chatStore.getSnapshot().sessions.find((x) => x.id === s.id)?.incognito).toBeUndefined();
+  });
+
+  it("the incognito flag persists with the session (survives a reload)", async () => {
+    const first = await import("./chat-store");
+    const s = first.chatStore.createSession({ incognito: true });
+    first.flushChatPersist();
+    vi.resetModules(); // "reload": a fresh module re-reads localStorage
+    const second = await import("./chat-store");
+    expect(second.chatStore.getSnapshot().sessions.find((x) => x.id === s.id)?.incognito).toBe(true);
+  });
+  // ── Blank-session reuse (no "+" spam) ─────────────────────────────────────────
+  // "+" is a primary action in the chat-first mobile header, so it's trivially easy to
+  // tap repeatedly and pile up identical empty tabs the operator then closes one by one.
+
+  it("createSession reuses an unused blank instead of piling up duplicates", async () => {
+    const { chatStore } = await import("./chat-store");
+    const first = chatStore.createSession();
+    const before = chatStore.getSnapshot().sessions.length;
+    const again = chatStore.createSession();
+    expect(again.id).toBe(first.id); // same session handed back
+    expect(chatStore.getSnapshot().sessions.length).toBe(before); // nothing added
+  });
+
+  it("a used session is never reused — createSession makes a real one", async () => {
+    const { chatStore } = await import("./chat-store");
+    const s = chatStore.createSession();
+    chatStore.updateMessages(s.id, [{ role: "user", content: "hi" }]);
+    const before = chatStore.getSnapshot().sessions.length;
+    const next = chatStore.createSession();
+    expect(next.id).not.toBe(s.id);
+    expect(chatStore.getSnapshot().sessions.length).toBe(before + 1);
+  });
+
+  it("reusing a blank on another tab SWITCHES to it (the visible feedback)", async () => {
+    const { chatStore } = await import("./chat-store");
+    const used = chatStore.createSession();
+    chatStore.updateMessages(used.id, [{ role: "user", content: "hi" }]);
+    const blank = chatStore.createSession(); // only creates because `used` is now used
+    chatStore.switchSession(used.id);
+    const got = chatStore.createSession();
+    expect(got.id).toBe(blank.id);
+    expect(chatStore.getSnapshot().currentSessionId).toBe(blank.id);
+  });
+
+  it("an incognito request never reuses a plain blank (they are different kinds)", async () => {
+    const { chatStore } = await import("./chat-store");
+    const plain = chatStore.createSession();
+    const priv = chatStore.createSession({ incognito: true });
+    expect(priv.id).not.toBe(plain.id);
+    expect(priv.incognito).toBe(true);
+  });
+
+  it("a RENAMED empty session is not reused — naming it is intent", async () => {
+    const { chatStore } = await import("./chat-store");
+    const s = chatStore.createSession();
+    chatStore.renameSession(s.id, "Ideas");
+    const next = chatStore.createSession();
+    expect(next.id).not.toBe(s.id);
   });
 });

@@ -4,8 +4,10 @@ import {
   Clock,
   Database,
   Globe,
+  Hourglass,
   Network,
   Search,
+  SlidersHorizontal,
   Square,
   Wrench,
 } from "lucide-react";
@@ -15,7 +17,9 @@ import type { ReactNode } from "react";
 import { ToolCard, ToolCardList, ToolCardSummary, ToolSection } from "@protolabsai/ui/tool-card";
 
 import type { ToolCall } from "../lib/types";
+import { useUI } from "../state/uiStore";
 import { ToolValue } from "./tool-renderers";
+import { humanizeSeconds, parseWaitInput } from "./waitInfo";
 
 /** Map a tool name to a recognizable icon; falls back to a generic wrench. */
 function iconFor(name: string): LucideIcon {
@@ -24,6 +28,7 @@ function iconFor(name: string): LucideIcon {
   if (name === "fetch_url") return Globe;
   if (name === "current_time") return Clock;
   if (name === "task") return Network; // subagent delegation
+  if (name === "wait") return Hourglass; // deliberate yield-and-resume (#1914)
   if (name.startsWith("memory")) return Database;
   return Wrench;
 }
@@ -32,8 +37,24 @@ function iconFor(name: string): LucideIcon {
  *  (`task → researcher`), read from the call's args, so the roster is visible at a
  *  glance without expanding. The subagent type rides in `input` from the start frame,
  *  so it shows while the delegation is still running; falls back to the bare name until
- *  the args parse. */
+ *  the args parse. A `wait` surfaces its duration the same way (`wait · ~5 minutes`,
+ *  #1914) — the card is collapsed by default, so the header is where "the agent yielded
+ *  deliberately" has to read at a glance. */
 function cardLabel(call: ToolCall): ReactNode {
+  if (call.name === "wait") {
+    // A failed schedule ("Error: …" output) keeps the bare label — its card already
+    // reads as an error; an ETA would claim a wait that never got scheduled.
+    const failed = call.status === "error" || /^error\b/i.test((call.output ?? "").trim());
+    const info = failed ? null : parseWaitInput(call.input);
+    if (info) {
+      return (
+        <>
+          wait <span className="tool-wait-eta">· ~{humanizeSeconds(info.seconds)}</span>
+        </>
+      );
+    }
+    return call.name;
+  }
   if (call.name !== "task" || !call.input) return call.name;
   try {
     const args = JSON.parse(call.input) as { subagent_type?: unknown };
@@ -214,17 +235,21 @@ function ToolGroup({
         ) : null}
         {call.output ? (
           <ToolSection label="result" copyText={call.output}>
-            <ToolValue raw={call.output} role="output" tool={call.name} />
+            {/* `input` rides along for output renderers that need both sides — the `wait`
+                waiting block derives its duration/resume-plan from the args (#1914). */}
+            <ToolValue raw={call.output} role="output" tool={call.name} input={call.input} />
           </ToolSection>
         ) : null}
         {nestedCards ? <div className="pl-toolcard__children">{nestedCards}</div> : null}
       </>
     ) : undefined;
 
+  const openToolSettings = useUI((s) => s.openToolSettings);
+
   // A running subagent delegation can be aborted (Tier 2): Stop cancels just this
   // `task`, the lead keeps working. Lives in the DS ToolCard header `actions` slot
   // (a sibling of the disclosure toggle, so it doesn't expand the card).
-  const actions =
+  const stopBtn =
     onCancelDelegation && call.name === "task" && call.status === "running" ? (
       <button
         type="button"
@@ -239,7 +264,34 @@ function ToolGroup({
         <Square size={11} />
         <span>Stop</span>
       </button>
-    ) : undefined;
+    ) : null;
+
+  // "Manage" deep-link (#1803): the moment you spot a tool you don't want, jump straight to
+  // its row in Capabilities ▸ Tools to disable it or change its policy — no hunting through a
+  // separate settings panel. A deep-link, not an inline toggle, so Tools settings stays the
+  // single source of truth for wiring. Sits in the same header actions slot as Stop; quiet
+  // until hover so the card reads as activity first, curation on intent.
+  const manageBtn = (
+    <button
+      type="button"
+      className="pl-iconbtn tool-manage-btn"
+      title={`Manage “${call.name}” in Tools settings`}
+      aria-label={`Manage ${call.name} in Tools settings`}
+      onClick={(e) => {
+        e.stopPropagation();
+        openToolSettings(call.name);
+      }}
+    >
+      <SlidersHorizontal size={11} />
+    </button>
+  );
+
+  const actions = (
+    <>
+      {stopBtn}
+      {manageBtn}
+    </>
+  );
 
   // A running count of the subagent's tools, in the header — so a collapsed delegation
   // reads "task → researcher · 3 tools" at a glance without expanding.

@@ -50,6 +50,7 @@ knowledge:
 | `temperature` | `0.2` | Sampling temperature. |
 | `max_tokens` | `32768` | Per-call output cap. 32k headroom for the Qwen models we run. |
 | `max_iterations` | `50` | Upper bound on tool-call loops per task. |
+| `favorites` | `[]` | Pinned go-to models for the chat `/model` quick-switch — the inline picker offers these, in this order, instead of the gateway's full list. Manage (add/remove/reorder) in Settings ▸ Model ▸ Favorite models. Empty = `/model` shows every gateway model with a hint to pin favorites. |
 | `request_timeout` | `120.0` | Per-call gateway timeout (seconds) — bounds a hung/slow gateway so a turn fails cleanly. |
 | `max_retries` | `2` | Transient-retry cap on the LLM client (→ `llm_max_retries`). |
 | `top_p` | _(unset)_ | Nucleus sampling. Standard OpenAI param; sent only when set. |
@@ -73,7 +74,33 @@ auth:
   federation_token: fed-...   # optional (ADR 0066) — semi-trusted peers get THIS, not `token`
 ```
 
-`LangGraphConfig.from_yaml` overlays this file on top of the main config at load time. Precedence for each secret: **`secrets.yaml` → main YAML value → env var** (`OPENAI_API_KEY` / `A2A_AUTH_TOKEN`). So env-injected deployments (e.g. `infisical run`) work unchanged — just leave `secrets.yaml` absent. Every config save also strips any secret keys the main YAML might still carry, so a checkout converges to secret-free. The `/api/config` endpoint redacts both fields to `""`; runtime status reports only whether a key is set (`model.api_key_configured`), never the value.
+`LangGraphConfig.from_yaml` overlays this file on top of the main config at load time. Precedence for each secret: **`secrets.yaml` → main YAML value → env var** (`OPENAI_API_KEY` / `A2A_AUTH_TOKEN`). So env-injected deployments (e.g. `infisical run`) work unchanged — just leave `secrets.yaml` absent. Every config save also strips any secret keys the main YAML might still carry, so a checkout converges to secret-free — and the strip **relocates, never drops**: an inline value `secrets.yaml` doesn't already hold (e.g. a hand-seeded `model.api_key` on a fresh instance with no secrets file yet) is written to the overlay in the same save, an existing overlay value is never overwritten by a stale inline copy, and if the overlay write fails the key stays inline rather than being lost (#1645). The `/api/config` endpoint redacts both fields to `""`; runtime status reports only whether a key is set (`model.api_key_configured`), never the value.
+
+### External secrets manager (ADR 0080)
+
+Instead of hand-maintaining env vars (or wrapping the process in `infisical run`), the server can **pull secrets from Infisical itself** and export them as env vars — at boot, on every config reload, and on a refresh interval, so rotation lands without a restart. Enable it with the `secrets_manager` section (or Settings ▸ Secrets manager, which includes a connection test and a sync-now button):
+
+```yaml
+secrets_manager:
+  enabled: true
+  provider: infisical
+  host: https://us.infisical.com   # or your self-hosted URL
+  project_id: "<project id>"
+  environment: prod                # the dev sandbox instance can point at `dev`
+  path: /
+  recursive: true
+  refresh_seconds: 300             # 0 = fetch only at boot / config reload
+  required: false                  # true = refuse to boot when the manager is unreachable
+  override_env: false              # true = manager values beat pre-existing env vars
+```
+
+Semantics — deliberately boring:
+
+- **Fetched values land in the env fallback tier.** The precedence above is unchanged: `secrets.yaml` → main YAML → env; the manager merely populates env. An env var you exported yourself always shadows the manager (flip `override_env` for rotation-wins), and only vars the hydrator *set itself* are ever updated or removed on refresh.
+- **Bootstrap credentials stay local** — the universal-auth machine identity (`client_id` / `client_secret`) is the one pair that can't come from the manager. It resolves like any core secret: `secrets_manager.client_id/client_secret` in `secrets.yaml` (where the Settings UI stores them, never echoed back) → main YAML → the `INFISICAL_CLIENT_ID` / `INFISICAL_CLIENT_SECRET` env vars. The recommended posture: *secrets.yaml holds only the machine identity; every other credential lives in the manager.* Fetched values can never overwrite the bootstrap pair or `PROTOAGENT_*` instance identity.
+- **Failures don't take the boot down** — a fetch error logs one warning and the server continues with whatever the env already has; set `required: true` to fail fast instead. `PROTOAGENT_NO_SECRETS_HYDRATE=1` disables hydration entirely (debugging escape hatch). Nothing is ever cached to disk.
+- **Operator surface:** `GET /api/secrets/status` (last outcome + which env vars are manager-owned — names, never values), `POST /api/secrets/sync`, `POST /api/secrets/test`.
+- Scope the machine identity least-privilege in Infisical (that project, that environment, read-only). Values are also registered with the audit-log redaction layer, so a manager-sourced credential echoed by a tool is scrubbed by exact match.
 
 ### Federation token — operator vs peer (ADR 0066)
 
@@ -207,7 +234,7 @@ execute_code:
 
 ```yaml
 tools:
-  disabled: []              # core tool names to DROP (a fork's denylist)
+  disabled: []              # tool names to DROP (the operator's denylist)
   deferred:
     enabled: false          # OFF by default — the full tool set is shown
     keep: []                # always-on tool names; empty = built-in base
@@ -215,7 +242,7 @@ tools:
 
 | Key | Default | What |
 |---|---|---|
-| `disabled` | `[]` | Core tool names to **drop** from the agent without editing `get_all_tools` — a fork keeps what it wants by listing the rest. Live-reloadable. Plugins still ADD tools on top (see [Plugins](/guides/plugins)). ([ADR 0005](../adr/0005-tool-pollution-and-progressive-disclosure.md)) |
+| `disabled` | `[]` | Tool names to **drop** from the agent at graph build — covers the **fully assembled** set: core, plugin, MCP, the delegation tools, and the filesystem tools (so `disabled: [run_command]` removes shell access for this agent). Live-reloadable — in the console, **every row at Settings ▸ Capabilities ▸ Tools carries an on/off switch** that edits this list (a toggled-off tool stays listed, dimmed, so it can be re-enabled). Plugins still ADD tools on top (see [Plugins](/guides/plugins)). ([ADR 0005](../adr/0005-tool-pollution-and-progressive-disclosure.md)) |
 | `deferred.enabled` | `false` | Withhold most tool schemas; expose them via `search_tools`. |
 | `deferred.keep` | `[]` | Tool names always shown. Empty → built-in base (keyless core + `task`/`task_batch`/`run_workflow`/`save_workflow` + `search_tools`). `search_tools` is always kept regardless. |
 
@@ -243,8 +270,9 @@ Fenced multi-project filesystem toolset ([ADR 0007](../adr/0007-directory-aware-
 ```yaml
 filesystem:
   enabled: true                  # ON by default
-  allow_run: true                # run_command available (ON); HITL-gated below
+  allow_run: true                # run_command available (ON); HITL-gated below — false = never built
   run_requires_approval: true    # each run_command pauses for operator approval
+  bypass_allowed: true           # false = /bypass can't skip the approval gate
   projects:
     - { name: orbis, path: /Users/kj/dev/ORBIS, write: false }   # read-only monitor
     - { name: pixelgen, path: /Users/kj/dev/pixelgen, write: true }
@@ -252,12 +280,15 @@ filesystem:
 
 | Key | Default | What |
 |---|---|---|
-| `enabled` | `true` | Expose the fs tools (`list_projects`/`read_file`/`list_dir`/`find_files`/`search_files`/`write_file`/`edit_file`). Off → no fs tools. |
-| `allow_run` | `true` | Also expose `run_command` (fenced `cwd`, but arbitrary argv — dual-use, like `execute_code`). |
+| `enabled` | `true` | Expose the fs tools (`list_projects`/`read_file`/`list_dir`/`find_files`/`search_files`/`write_file`/`edit_file`/`delete_file`). Off → no fs tools. |
+| `allow_run` | `true` | Also expose `run_command` (fenced `cwd`, but arbitrary argv — dual-use, like `execute_code`). **`false` is the per-agent kill switch**: the tool is never built, so the model can't see or call it. |
 | `run_requires_approval` | `true` | Each `run_command` call pauses for HITL operator approval (A2A `input-required`). Drop to `false` to let commands run unattended. |
-| `projects` | `[]` | Managed workspaces: `{name, path, write}`. **Empty falls back to a default `workspace` dir** (so the tools are usable out of the box). **Every path is fenced under a project root** (`..`/symlink escapes refused); `write:false` makes a project read-only; invalid paths are skipped. |
+| `bypass_allowed` | `true` | Permit the per-tab `/bypass` chat toggle to skip the approval gate. `false` = approvals enforced regardless of caller-supplied metadata. |
+| `projects` | `[]` | Managed workspaces: `{name, path, write, no_delete}`. **Empty falls back to a default `workspace` dir** (so the tools are usable out of the box). **Every path is fenced under a project root** (`..`/symlink escapes refused); `write:false` makes a project read-only; `write:true` + `no_delete:true` is read-write-no-delete (create/edit, never delete — the third Cowork mount mode); invalid paths are skipped. |
 
-**Security:** the project roots are the **hard fence** — every tool resolves paths under a root and refuses escapes; `write_file`/`edit_file` need `write:true`; the agent's own repo is not a project unless you add it. All mutations are audited. See ADR 0007 §4.
+The four toggles are editable per agent in the console via the **Shell & filesystem** chip on **Settings ▸ Capabilities ▸ Tools** (hot-reload — a save rebuilds the graph). `tools.disabled: [run_command]` (above) is an equivalent per-tool route — in the console, that's the `run_command` row switch in the same panel's Filesystem group.
+
+**Security:** the project roots are the **hard fence** — every tool resolves paths under a root and refuses escapes; `write_file`/`edit_file` need `write:true`; `delete_file` additionally needs `no_delete:false` and **always** pauses for approval (a permanent-delete floor the `/bypass` toggle can't skip); the agent's own repo is not a project unless you add it. All mutations are audited. See ADR 0007 §4 and ADR 0083 D5.
 
 ## `egress`
 
@@ -310,7 +341,7 @@ routing:
 
 **Goal mode** (`graph/goals/`) lets you give the agent a *testable outcome* it self-drives toward. After each terminal turn (the agent stops with a final answer), the goal's **verifier** decides whether it's met; if not, the agent is re-invoked with a continuation prompt — carrying the verifier's evidence and the running plan the agent records with the `update_goal_plan` tool — until the verifier passes, the iteration budget runs out (`exhausted`), or the goal is flagged `unachievable` (a no-progress streak, or the agent calling the `abandon_goal` tool). Unlike a pure-LLM "are we done?" check, completion is backed by a real verifier.
 
-The machinery is wired when `enabled`, but **no goal is active until one is set** via the `/goal` control message (works over A2A / the React console / OpenAI-compat) or the `/api/goal/{session_id}` endpoints. State is persisted per session under `GOAL_PATH` → `/sandbox/goals` → `~/.protoagent/goals`.
+The machinery is wired when `enabled`, but **no goal is active until one is set** via the `/goal` control message (works over A2A / the React console / OpenAI-compat) or the `/api/goals/{session_id}` endpoints. State is persisted per session under `GOAL_PATH` → `/sandbox/goals` → `~/.protoagent/goals`.
 
 ```yaml
 goal:
@@ -347,12 +378,12 @@ Only read when `middleware.knowledge` is `true`.
 |---|---|---|
 | `db_path` | `/sandbox/knowledge/agent.db` | SQLite file path. Falls back to `~/.protoagent/knowledge/agent.db` automatically when the configured path isn't writable (e.g. running locally without `/sandbox`). Override at runtime with `KNOWLEDGE_DB_PATH`. |
 | `scope` | `""` (→ `scoped`) | Tier ([ADR 0041](../adr/0041-workspaces-and-tiered-stores.md)): `scoped` (private, **default**) · `shared` (the whole store is the host-level commons) · `layered` (read commons ∪ private, write private, operator-`promote`d). The commons lives at `commons.path`/knowledge.db and is host-level + un-scoped (every agent reading the same `commons.path` shares it). A shared/layered fleet must share one `embed_model` — the commons is stamped with it and a mismatched agent serves the commons tier **FTS5-only** (no incompatible-vector fusion). |
-| `embeddings` | `true` | Hybrid `HybridKnowledgeStore` (FTS5 keyword + vector similarity, RRF-fused). `false` = keyword-only FTS5. (ADR 0021.) |
+| `embeddings` | `false` | Opt-in hybrid `HybridKnowledgeStore` (FTS5 keyword + vector similarity, RRF-fused); off = keyword-only FTS5. Off by default so a fresh install never depends on a gateway embedding route (#1681). |
 | `embed_model` | `qwen3-embedding` | Gateway embedding model used when `embeddings` is on — must be a model your gateway serves (not the chat model). |
 | `facts` | `true` | Extract semantic facts during the conversation-harvest pass. |
-| `top_k` | `5` | Results per query fed into state. |
+| `top_k` | `10` | RAG hits auto-injected into the prompt per turn. |
 
-The bundled store is hybrid by default — FTS5 keyword search fused with vector similarity (RRF), with an embedding circuit breaker that falls back to FTS5 on an outage; set `embeddings: false` for keyword-only. One `chunks` table; the `domain` column distinguishes operator-set notes (`memory_ingest`), daily-log entries (`daily_log`), and conversation findings extracted by `conversation_harvest` (`domain='finding'`).
+The bundled store is keyword-only FTS5 by default; once your gateway serves `embed_model`, opt in with `embeddings: true` for hybrid search — keyword fused with vector similarity (RRF), with an embedding circuit breaker that falls back to FTS5 on an outage. One `chunks` table; the `domain` column distinguishes operator-set notes (`memory_ingest`), always-on hot facts (`hot`), episodic summaries stored by `conversation_harvest` (`conversation`), and extracted facts (`fact`).
 
 **Hot memory** — chunks stored under `domain='hot'` are *always-on*: `KnowledgeMiddleware` injects them into context every turn (vs. retrieved-on-relevance), re-read each turn so a freshly-added hot fact is seen immediately. Set one with `memory_ingest(content, domain="hot")` for facts the agent should never forget (operator preferences, standing constraints).
 
@@ -429,6 +460,19 @@ checkpoint:
 | `prune_interval_hours` | `6` | How often the background pruner runs. |
 | `harvest_enabled` | `true` | On thread retire, harvest its history into the knowledge store before purging. |
 
+## `background`
+
+Background subagent jobs (`task(run_in_background=true)`, [ADR 0050](/adr/0050-background-subagents-reactive-notifications)) and how their results are delivered ([ADR 0070](/adr/0070-background-results-push-resume)).
+
+```yaml
+background:
+  auto_resume: true
+```
+
+| Key | Default | What |
+|---|---|---|
+| `auto_resume` | `true` | When a background job finishes, immediately run a turn in the session that spawned it — its `<task-notification>` drains into that turn and the agent briefs the operator. `false` restores pull-only delivery (the report waits for the session's next manual turn; the ADR 0050 Activity idle-wake covers autonomous reaction instead). Never fires for canceled jobs, incognito-spawned jobs, or jobs spawned from another background turn. |
+
 ## `workflows`
 
 Declarative multi-step recipes over subagents ([ADR 0002](../adr/0002-reusable-subagent-workflows.md)) — the `run_workflow` / `save_workflow` tools.
@@ -454,6 +498,8 @@ Drop-in [plugins](../guides/plugins.md) (manifest + `register()`) that contribut
 | `disabled` | `[]` | Plugin `id`s to force **OFF** even when their manifest says `enabled: true` — the way a fork drops a bundled first-party plugin (e.g. `discord`, `google`) without deleting its directory or editing core. |
 | `dir` | `""` | Override the writable plugins root (default `<config-dir>/plugins`). |
 | `sources.allow` | `[]` | Optional allowlist of host/org globs for git-URL installs (e.g. `[github.com/yourorg/*]`); empty = any URL (gated install). (ADR 0027.) |
+| `update_policy` | `{}` | Opt-in background auto-updates, keyed by plugin `id`. Each value is `{track, when}`: a non-empty `track` **arms** the plugin (the ref comes from `plugins.lock`); `when` is `idle` (default — defer while a chat turn is/was just in flight) or `always`. A SHA-pinned plugin is never auto-updated. Empty = manual-only (the default). (#1720; see the [Plugins guide](../guides/plugins.md#keeping-plugins-current).) |
+| `autoupdate_interval_hours` | `6` | Cadence of the auto-update sweep in hours; `0` disables the loop. Only plugins in `update_policy` are ever touched. |
 
 Plugins load from two roots — bundled (`plugins/`, e.g. `hello`, `discord`, `google`, `plugin-devkit`) and writable (`<config-dir>/plugins/`, where git-URL installs land); live overrides bundled by `id`. Plugin tools that shadow a core/MCP tool are skipped. `GET /api/runtime/status` reports `plugins[]` (`id`, `enabled`, `loaded`, `tools`, `skills`, `views`, routes/surfaces/subagents counts). Plugins are installable from a git URL (`python -m server plugin install <url>`) — see [Install & publish plugins](../guides/plugin-registry.md) — and a repo can ship tools, subagents, skills, workflows, and console views. See the [Plugins guide](../guides/plugins.md).
 

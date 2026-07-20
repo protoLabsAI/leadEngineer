@@ -29,7 +29,10 @@ manifest + capabilities, install, uninstall.
 
 **Installing from the console AUTO-ENABLES + runs the plugin** (trust-by-default):
 it's added to `plugins.enabled` and hot-reloaded, so its tools, console views and
-background surfaces come up live — no separate enable step and no restart. The
+background surfaces come up live — no separate enable step and no restart. Its
+declared settings are live too: the row's **Configure** dialog carries the plugin's
+config fields immediately after install (both the Discover directory and
+install-from-URL — no page refresh needed, #1643). The
 console flashes a one-time "this runs code on your machine" confirm for unofficial
 sources first (official `protoLabsAI/*` installs skip it; "don't show again" flips to
 full trust). Only install code you trust — for untrusted code, use an MCP server.
@@ -143,8 +146,9 @@ control command** — the generalized form of the core `/goal`. The handler is
 the turn (the model never runs), or `None` to pass the message through. It is
 **user-only by design** — not an agent tool — so a plugin can expose a write
 action (file an issue, open a PR) that the model can't trigger autonomously. Close
-over `registry.config` to read your own settings. Precedence is `goal` > plugin
-command > workflow > subagent > skill; `goal` is reserved.
+over `registry.config` to read your own settings. Precedence is `goal` >
+`lifecycle` > plugin command > workflow > subagent > skill; `goal` and `lifecycle`
+are reserved core tokens (a plugin can't claim either).
 
 `skills/` and `workflows/` are **data**, so they're auto-discovered from those
 conventional subdirs — no boilerplate. **Console views** (a rail icon + page) are
@@ -161,6 +165,13 @@ repository: https://github.com/owner/my-plugin
 requires_pip: ["httpx>=0.27"]
 min_protoagent_version: "0.20.0"
 ```
+
+`min_protoagent_version` is enforced at load: the plugin is refused when it needs a
+newer host. The host version it's compared against is the same shared resolver the
+A2A agent card advertises (`infra.paths.package_version()` — the repo
+`pyproject.toml` on a source checkout, installed package metadata on wheel/frozen
+installs), so the gate and the card always agree — a dev checkout's stale
+editable-install metadata can no longer refuse a valid plugin (#1644).
 
 ## Get listed in the directory
 

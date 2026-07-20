@@ -5,10 +5,13 @@
 // — no Python, no langgraph, no model, no network. Specs import the same
 // constants to assert against, so the contract can't drift between the two.
 
-export const TOOL_CALL_MIME = "application/vnd.protolabs.tool-call-v1+json";
-export const COST_MIME = "application/vnd.protolabs.cost-v1+json";
+// The two SDK extensions ride the message/artifact METADATA keyed by their extension URI
+// (protolabs-a2a 0.3.0); the template-local ones below stay MIME-typed DataParts.
+export const TOOL_CALL_EXT_URI = "https://proto-labs.ai/a2a/ext/tool-call-v1";
+export const COST_EXT_URI = "https://proto-labs.ai/a2a/ext/cost-v1";
 export const CONTEXT_MIME = "application/vnd.protolabs.context-v1+json";
 export const COMPONENT_MIME = "application/vnd.protolabs.component-v1+json";
+export const HITL_MIME = "application/vnd.protolabs.hitl-v1+json";
 
 export const RUNTIME_STATUS = {
   setup_complete: true,
@@ -111,7 +114,7 @@ export const FLEET = {
 
 export const ARCHETYPES = [
   { id: "basic", label: "Basic", icon: "Sparkles", blurb: "A plain agent — add tools later.", bundle: null, soul: "# Identity\n\nI am a general-purpose agent." },
-  { id: "pm-stack", label: "Project Manager", icon: "LayoutGrid", blurb: "PM tools + board.", bundle: "https://github.com/protoLabsAI/pm-stack", soul: "# Identity\n\nI am a project-management agent." },
+  { id: "product-stack", label: "Product Manager", icon: "Compass", blurb: "Research, strategy, and specs — rendered inline.", bundle: "https://github.com/protoLabsAI/product-stack", soul: "# Identity\n\nI am a product-management agent." },
   { id: "custom", label: "Custom", icon: "PenLine", blurb: "Write your own — fill in a template.", bundle: null, soul: "# Identity\n\n_Describe your agent in one paragraph._" },
 ];
 
@@ -175,6 +178,45 @@ export const GOALS = {
   ],
 };
 
+// Watches (ADR 0067) — varied statuses so the Work overview card renders an active
+// count, a met-today pulse fragment, and tinted status badges. Times are epoch SECONDS.
+// Mirror the controller's write order: the met path sets `finished_at` and skips the
+// `last_checked` update, so a finished watch's last_checked is the PREVIOUS check.
+// "met today" derives from finished_at on the local day of NOW, so a bare `now - 600`
+// lands on YESTERDAY in the first 10 minutes after local midnight and the pulse
+// fragment vanishes (work-overview.spec flaked exactly there) — clamp it into today.
+const NOW_SEC = Math.floor(Date.now() / 1000);
+const TODAY_START_SEC = Math.floor(new Date().setHours(0, 0, 0, 0) / 1000);
+const MET_AT_SEC = Math.max(NOW_SEC - 600, TODAY_START_SEC);
+export const WATCHES = {
+  enabled: true,
+  watches: [
+    {
+      id: "watch-1",
+      condition: "CI is green on main",
+      status: "active",
+      verifier: { type: "llm" },
+      last_checked: NOW_SEC - 120,
+    },
+    {
+      id: "watch-2",
+      condition: "The staging deploy finishes",
+      status: "met",
+      verifier: { type: "llm" },
+      last_checked: MET_AT_SEC - 300,
+      finished_at: MET_AT_SEC,
+    },
+    {
+      id: "watch-3",
+      condition: "Inbox zero before Friday",
+      status: "expired",
+      verifier: { type: "llm" },
+      last_checked: Math.floor(Date.now() / 1000) - 7500,
+      finished_at: Math.floor(Date.now() / 1000) - 7200,
+    },
+  ],
+};
+
 export const NOTES_WORKSPACE = {
   version: 1,
   workspaceVersion: 1,
@@ -212,6 +254,16 @@ export const SETTINGS_SCHEMA = [
     ],
   },
   {
+    // Favorite models (#1957) — the /model quick-switch pins. PINNED ORDER deliberately
+    // REVERSES the gateway options order, so an e2e can prove the picker is favorites-driven
+    // (cards fast-first) and exercise the up/down reorder buttons (a 2-item ordered list).
+    section: "Favorite models",
+    category: "Model",
+    fields: [
+      { key: "model.favorites", label: "Favorites", type: "string_list", section: "Favorite models", restart: false, description: "Pinned go-to models for the chat /model quick-switch.", options: ["protolabs/reasoning", "protolabs/fast"], options_source: "models", value: ["protolabs/fast", "protolabs/reasoning"], default: [], scope: "agent", source: "agent" },
+    ],
+  },
+  {
     section: "Routing",
     category: "Model",
     fields: [
@@ -235,6 +287,25 @@ export const SETTINGS_SCHEMA = [
       { key: "runtime.autostart_on_boot", label: "Autostart on boot", type: "bool", section: "Runtime", restart: true, description: "Install/remove the boot LaunchAgent.", options: [], value: false, default: false, scope: "agent", source: "agent" },
     ],
   },
+  // The per-agent run_command controls + the operator tool denylist — edited via the
+  // Tools panel's QuickSetting chips (no generic Capabilities panel renders these).
+  {
+    section: "Filesystem",
+    category: "Capabilities",
+    fields: [
+      { key: "filesystem.enabled", label: "Filesystem tools", type: "bool", section: "Filesystem", restart: false, description: "", options: [], value: true, default: true, scope: "agent", source: "agent" },
+      { key: "filesystem.allow_run", label: "Allow run_command", type: "bool", section: "Filesystem", restart: false, description: "", options: [], value: true, default: true, scope: "agent", source: "agent", depends_on: { key: "filesystem.enabled" } },
+      { key: "filesystem.run_requires_approval", label: "Require approval per command", type: "bool", section: "Filesystem", restart: false, description: "", options: [], value: true, default: true, scope: "agent", source: "agent", depends_on: { key: "filesystem.allow_run" } },
+      { key: "filesystem.bypass_allowed", label: "Allow /bypass", type: "bool", section: "Filesystem", restart: false, description: "", options: [], value: true, default: true, scope: "agent", source: "agent", depends_on: { key: "filesystem.run_requires_approval" } },
+    ],
+  },
+  {
+    section: "Tools",
+    category: "Capabilities",
+    fields: [
+      { key: "tools.disabled", label: "Disabled tools", type: "string_list", section: "Tools", restart: false, description: "", options: [], value: [], default: [], scope: "agent", source: "agent" },
+    ],
+  },
   // A plugin-contributed group (ADR 0019/0059) — tagged with plugin_id so the
   // Plugins surface folds it into the "Demo Plugin" Installed row (Configure).
   {
@@ -245,7 +316,37 @@ export const SETTINGS_SCHEMA = [
       { key: "demo.greeting", label: "Greeting", type: "string", section: "Demo Plugin", restart: false, description: "Shown by the demo tool.", options: [], value: "hello", default: "hello", scope: "agent", source: "agent" },
     ],
   },
+  {
+    // External secrets manager (ADR 0080) — its own "Secrets" category / sidenav section.
+    section: "Secrets manager",
+    category: "Secrets",
+    fields: [
+      { key: "secrets_manager.enabled", label: "Pull secrets from a manager", type: "bool", section: "Secrets manager", restart: false, description: "", options: [], value: true, default: false, scope: "agent", source: "agent" },
+      { key: "secrets_manager.host", label: "Server URL", type: "string", section: "Secrets manager", restart: false, description: "", options: [], value: "https://us.infisical.com", default: "https://us.infisical.com", scope: "agent", source: "agent", depends_on: { key: "secrets_manager.enabled" } },
+      { key: "secrets_manager.project_id", label: "Project ID", type: "string", section: "Secrets manager", restart: false, description: "", options: [], value: "proj-1", default: "", scope: "agent", source: "agent", depends_on: { key: "secrets_manager.enabled" } },
+      { key: "secrets_manager.client_secret", label: "Machine identity client secret", type: "secret", section: "Secrets manager", restart: false, description: "Stored in secrets.yaml, never echoed back.", options: [], value: "", is_set: true, scope: "agent", source: "agent", depends_on: { key: "secrets_manager.enabled" } },
+    ],
+  },
 ];
+
+// External secrets manager (ADR 0080) — GET /api/secrets/status. Sync (POST) answers
+// with one more owned var (ROTATED_KEY) so the e2e can observe a reconcile.
+export const SECRETS_STATUS = {
+  enabled: true,
+  provider: "infisical",
+  host: "https://us.infisical.com",
+  project_id: "proj-1",
+  environment: "prod",
+  path: "/",
+  ok: true,
+  error: "",
+  error_kind: "",
+  fetched_at: "2026-07-12T00:00:00+00:00",
+  applied: 2,
+  shadowed: [],
+  refresh_seconds: 300,
+  vars: ["DISCORD_BOT_TOKEN", "OPENAI_API_KEY"],
+};
 
 /** The model list a freshly-probed gateway returns from POST /api/config/models (#1386) — a
  *  DIFFERENT set than model.name's saved options, so the e2e can prove "Get models" refreshes
@@ -282,6 +383,12 @@ const MARKDOWN_SMOKE_ANSWER = [
   "### H3 heading",
   "",
   "A paragraph with **bold**, *italic*, `inline code`, ~~strike~~, and a [link](https://example.com).",
+  "",
+  // An inline image on the production shape — a server-relative signed /media URL
+  // (data: URLs are stripped by the renderer's URL hardening) — so the DS MarkdownImage
+  // chrome (#1960 action cluster + Lightbox) AND the mediaUrls rehype rewrite get e2e
+  // coverage. The mock serves a 320×180 lavender PNG for any GET /media/*.
+  "![a lavender rectangle](/media/e2e-image.png?sig=mock)",
   "",
   "> A blockquote.",
   "> > Nested blockquote.",
@@ -334,6 +441,81 @@ const DEFAULT_SEARCH_OUTPUT = [
 // matches the real starter-tool string format the per-tool renderer expects.
 function scenarioFor(prompt) {
   const t = (prompt || "").toUpperCase();
+  if (t.includes("HITL_ASK"))
+    // ask_human free-text interrupt: the turn parks input-required with a hitl-v1
+    // DataPart carrying a plain `question` — the console shows the floating
+    // free-text card (#1973). No tool frames; the terminal artifact text is the
+    // agent's lead-in, then the final frame is `input-required` instead of
+    // `completed` (see buildFrames).
+    return {
+      events: [],
+      answer: "I need one detail before I continue.",
+      hitl: { question: "Which environment should I deploy to — staging or production?" },
+    };
+  if (t.includes("HITL_FORM_PREFILL"))
+    // #1978: an agent form whose schemas carry `default`s — the card opens prefilled
+    // (a default IS an answer, so required-with-default doesn't gate), the proposed
+    // choice card is selected AND focused, and confirming untouched returns the
+    // proposal. Matched BEFORE the bare HITL_FORM (substring).
+    return {
+      events: [],
+      answer: "Confirm the deployment plan.",
+      hitl: {
+        kind: "form",
+        title: "Confirm deployment",
+        description: "I propose these settings — adjust anything, or just confirm.",
+        steps: [
+          {
+            schema: {
+              type: "object",
+              required: ["environment", "strategy"],
+              properties: {
+                environment: { type: "string", title: "Environment", default: "staging" },
+                strategy: {
+                  type: "string",
+                  title: "Strategy",
+                  default: "rolling",
+                  oneOf: [
+                    { const: "blue-green", title: "Blue/green", description: "Swap whole environments" },
+                    { const: "rolling", title: "Rolling", description: "Gradual, zero-downtime" },
+                  ],
+                },
+              },
+            },
+          },
+        ],
+      },
+    };
+  if (t.includes("HITL_FORM"))
+    // request_user_input structured interrupt: a two-step wizard (required text
+    // input, then an optional confirm) — exercises the stepper + Back/Next path
+    // in the floating card.
+    return {
+      events: [],
+      answer: "I need a couple of details before I continue.",
+      hitl: {
+        kind: "form",
+        title: "Deployment details",
+        description: "Tell me where and how to deploy.",
+        steps: [
+          {
+            title: "Target",
+            schema: {
+              type: "object",
+              properties: { environment: { type: "string", title: "Environment" } },
+              required: ["environment"],
+            },
+          },
+          {
+            title: "Confirm",
+            schema: {
+              type: "object",
+              properties: { dry_run: { type: "boolean", title: "Dry run first" } },
+            },
+          },
+        ],
+      },
+    };
   if (t.includes("CALC"))
     return { name: "calculator", input: { expression: "19 * 23" }, output: "19 * 23 = 437", answer: "19 × 23 = 437." };
   if (t.includes("COMPONENT"))
@@ -372,6 +554,9 @@ function scenarioFor(prompt) {
       name: "web_search",
       input: { query: "agent client protocol" },
       output: "1 result(s): Agent Client Protocol — https://agentclientprotocol.com",
+      // The executor streams the post-tool answer as deltas too — the terminal
+      // replace then matches the client's accumulation and keeps interleaving.
+      streamChunks: ["Found it — Agent Client Protocol."],
       answer: "Found it — Agent Client Protocol.",
     };
   if (t.includes("SUBAGENT"))
@@ -477,10 +662,10 @@ export function buildFrames({ rpcId, contextId, taskId, prompt }) {
         state: "working",
         message: {
           role: "agent",
-          parts: [
-            { kind: "text", text },
-            ...(toolEvent ? [{ kind: "data", data: toWire(toolEvent), metadata: { mimeType: TOOL_CALL_MIME } }] : []),
-          ],
+          parts: [{ kind: "text", text }],
+          // tool-call-v1 rides the MESSAGE METADATA keyed by extension URI
+          // (protolabs-a2a 0.3.0), not a DataPart in parts[].
+          ...(toolEvent ? { metadata: { [TOOL_CALL_EXT_URI]: toWire(toolEvent) } } : {}),
         },
       },
       final: false,
@@ -559,22 +744,11 @@ export function buildFrames({ rpcId, contextId, taskId, prompt }) {
       artifact: {
         artifactId: taskId,
         parts: [
-          { kind: "text", text: scenario.answer },
-          {
-            kind: "data",
-            data: {
-              usage: {
-                input_tokens: 12_340,
-                output_tokens: 1_200,
-                cache_read_input_tokens: 8_000,
-                cache_creation_input_tokens: 0,
-              },
-              costUsd: 0.0412,
-              durationMs: 2300,
-              success: true,
-            },
-            metadata: { mimeType: COST_MIME },
-          },
+          // The real terminal frame re-sends the FULL turn text — including any
+          // pre-tool narration (the executor's `accumulated` spans the whole
+          // turn) — not just the post-tool answer.
+          { kind: "text", text: (scenario.preText || "") + scenario.answer },
+          // context-v1 is a template-local extension and stays a DataPart.
           {
             kind: "data",
             data: {
@@ -586,11 +760,47 @@ export function buildFrames({ rpcId, contextId, taskId, prompt }) {
             metadata: { mimeType: CONTEXT_MIME },
           },
         ],
+        // cost-v1 rides the ARTIFACT METADATA keyed by extension URI (protolabs-a2a
+        // 0.3.0), exactly as a2a_impl's executor now emits it — so the per-turn usage
+        // footer (#1372) still renders.
+        metadata: {
+          [COST_EXT_URI]: {
+            usage: {
+              input_tokens: 12_340,
+              output_tokens: 1_200,
+              cache_read_input_tokens: 8_000,
+              cache_creation_input_tokens: 0,
+            },
+            costUsd: 0.0412,
+            durationMs: 2300,
+            success: true,
+          },
+        },
       },
-      append: false,
+      // No `append` key: proto3 omits the bool at false on the real wire, so the
+      // terminal REPLACE frame arrives with `append` absent (#1709). Mirroring that
+      // keeps e2e guarding the console's absent→replace mapping.
       lastChunk: true,
     }),
-    wrap({ kind: "status-update", taskId, contextId, status: { state: "completed" }, final: true }),
+    // A HITL scenario parks instead of completing: the final frame is
+    // `input-required` carrying the hitl-v1 DataPart (form/question payload), the
+    // shape a2a_impl emits when the graph interrupts on ask_human /
+    // request_user_input — the console opens the floating HITL card off it (#1973).
+    scenario.hitl
+      ? wrap({
+          kind: "status-update",
+          taskId,
+          contextId,
+          status: {
+            state: "input-required",
+            message: {
+              role: "agent",
+              parts: [{ kind: "data", data: scenario.hitl, metadata: { mimeType: HITL_MIME } }],
+            },
+          },
+          final: true,
+        })
+      : wrap({ kind: "status-update", taskId, contextId, status: { state: "completed" }, final: true }),
   );
   return frames;
 }
@@ -687,7 +897,131 @@ export const KNOWLEDGE_CHUNKS = [
     created_at: "2026-06-02T09:00:00+00:00",
     tier: "private",   // private to this agent → eligible for Share (promote)
   },
+  // A multi-chunk ingested source (#1575) → renders as one collapsible section
+  // ("… · 3 chunks"). ids 11/12 above stay flat (single/no source), so the
+  // list + promote/unshare specs are unaffected.
+  { id: 13, heading: "", content: "Switchbacks keep the grade walkable.", preview: "Switchbacks keep the grade walkable.",
+    domain: "media", source: "Hiking with Kevin — Christina Mariani", source_type: "youtube", finding_type: null,
+    created_at: "2026-06-04T10:00:00+00:00", tier: null },
+  { id: 14, heading: "", content: "Bring more water than you think.", preview: "Bring more water than you think.",
+    domain: "media", source: "Hiking with Kevin — Christina Mariani", source_type: "youtube", finding_type: null,
+    created_at: "2026-06-04T10:01:00+00:00", tier: null },
+  { id: 15, heading: "", content: "The summit view pays off the climb.", preview: "The summit view pays off the climb.",
+    domain: "media", source: "Hiking with Kevin — Christina Mariani", source_type: "youtube", finding_type: null,
+    created_at: "2026-06-04T10:02:00+00:00", tier: null },
 ];
+
+// Memory inspector (ADR 0069 D7) — session-summary digest rows, hot-memory chunks,
+// and the per-turn injection record the Memory surface renders.
+// Delivery-truth fields are MIXED on purpose: in_digest/injecting true, false,
+// and ABSENT (a backend predating the fields) — the badge specs assert that only
+// an explicit `false` draws a badge and absent fields degrade gracefully.
+export const MEMORY_SESSIONS = [
+  {
+    session_id: "chat-1750000000000-abc123",
+    timestamp: "2026-06-30T18:00:00+00:00",
+    surface: "chat",
+    topic: "plan the memory hardening rollout",
+    message_count: 12,
+    size_bytes: 2048,
+    in_digest: true,
+  },
+  {
+    session_id: "sched-hourly-report",
+    timestamp: "2026-06-30T17:00:00+00:00",
+    surface: "background",
+    topic: "compile the hourly ops report",
+    message_count: 4,
+    size_bytes: 512,
+    in_digest: false,
+  },
+  {
+    // Legacy row: no in_digest / size_bytes — renders with no badge, no size.
+    session_id: "a2a-legacy-noflags",
+    timestamp: "2026-06-29T12:00:00+00:00",
+    surface: "a2a",
+    topic: "row from a backend without delivery flags",
+    message_count: 2,
+  },
+];
+
+export const MEMORY_SESSION_RENDERED =
+  '<session id="chat-1750000000000-abc123" timestamp="2026-06-30T18:00:00+00:00">\n' +
+  "  <messages>\n" +
+  "    <user>plan the memory hardening rollout</user>\n" +
+  "    <assistant>Here is the phased plan…</assistant>\n" +
+  "  </messages>\n" +
+  "</session>";
+
+export const MEMORY_HOT = [
+  {
+    id: 31, heading: "Operator timezone", content: "The operator works in US/Pacific.",
+    preview: "The operator works in US/Pacific.",
+    domain: "hot", source: "chat-1750000000000-abc123", source_type: "extracted", finding_type: null,
+    created_at: "2026-06-29T10:00:00+00:00", injecting: true,
+  },
+  {
+    id: 32, heading: "", content: "Weekly report goes out Fridays at 9am.",
+    preview: "Weekly report goes out Fridays at 9am.",
+    domain: "hot", source: "console", source_type: "operator", finding_type: null,
+    created_at: "2026-06-28T09:00:00+00:00", injecting: false,
+  },
+  {
+    // Legacy row: no `injecting` field — renders with no badge.
+    id: 33, heading: "", content: "Legacy row predating the injection-window field.",
+    preview: "Legacy row predating the injection-window field.",
+    domain: "hot", source: null, source_type: null, finding_type: null,
+    created_at: "2026-06-27T08:00:00+00:00",
+  },
+];
+
+export const MEMORY_INJECTIONS = [
+  {
+    id: 7,
+    ts: "2026-06-30T18:05:00+00:00",
+    session_id: "chat-1750000000000-abc123",
+    digest_session_ids: ["sched-hourly-report"],
+    hot_chunk_ids: [31, 32],
+    rag_chunk_ids: [11],
+    approx_tokens: 420,
+  },
+  {
+    id: 6,
+    ts: "2026-06-30T17:01:00+00:00",
+    session_id: "sched-hourly-report",
+    digest_session_ids: [],
+    hot_chunk_ids: [31],
+    rag_chunk_ids: [],
+    approx_tokens: 120,
+  },
+];
+
+// Resolved detail (GET /api/memory/injections/{id}) keyed by record id — the ids
+// above turned into their referenced content for the click-through dialog. Row 7
+// exercises every group (a pruned doc is marked unavailable).
+export const MEMORY_INJECTION_DETAILS = {
+  7: {
+    ts: "2026-06-30T18:05:00+00:00",
+    session_id: "chat-1750000000000-abc123",
+    approx_tokens: 420,
+    past_sessions: [{ id: "sched-hourly-report", title: "send the hourly report" }],
+    memories: [
+      { id: 31, heading: "Operator timezone", snippet: "The operator works in US/Pacific.", unavailable: false },
+      { id: 32, heading: null, snippet: "Weekly report goes out Fridays at 9am.", unavailable: false },
+    ],
+    docs: [{ id: 11, source: null, snippet: null, unavailable: true }],
+  },
+  6: {
+    ts: "2026-06-30T17:01:00+00:00",
+    session_id: "sched-hourly-report",
+    approx_tokens: 120,
+    past_sessions: [],
+    memories: [
+      { id: 31, heading: "Operator timezone", snippet: "The operator works in US/Pacific.", unavailable: false },
+    ],
+    docs: [],
+  },
+};
 
 // Delegate registry (ADR 0025) — types schema + a sample roster for the panel.
 export const DELEGATE_TYPES = {

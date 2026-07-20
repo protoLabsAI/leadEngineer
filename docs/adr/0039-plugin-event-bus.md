@@ -54,6 +54,13 @@ def register(registry):
   (`postMessage {type:"protoagent:event", topic, data}`) and accepts publishes back
   (`{type:"protoagent:publish", topic, data}` → `POST /api/events/publish`). One bus, the browser is
   a mirror; client publishes go *up* to the server then fan back out.
+- *Amended by #1640:* every relayed `protoagent:event` also carries the bus `seq`;
+  `protoagent:subscribe` accepts optional `since` (immediate best-effort replay of retained
+  events newer than that seq — from the console's client-side mirror of the ring buffer,
+  seq-deduped against the live stream) and `background: true` (the console keeps that view
+  mounted-but-hidden so delivery continues off-screen; the notification-dot default is
+  unchanged for everyone else). See the
+  [plugin views guide](../guides/building-react-plugin-views.md#replay-and-hidden-delivery-1640).
 
 ### Tier 3 — The contract (the no-cross-dependency clause)
 
@@ -66,6 +73,16 @@ structurally, not by etiquette:
   tooling), but undeclared subscriptions are allowed — the guard is on *publishing*, which is the
   only direction that can spoof or spam.
 
+> **Grown since (typed event contracts, #1636):** as the first real cross-plugin consumers appeared
+> (a Discord feed subscribing `spacetraders.#`), names-only `emits:` proved to be the composition
+> bottleneck — the consumer reverse-engineers the emitter's payload and silently breaks. An `emits:`
+> entry may now optionally be `{topic, summary?, schema?}` (JSON Schema inline, or a `$ref` to a
+> file inside the plugin repo, read at manifest load). Purely declarative, like `capabilities`: the
+> shapes ride `/api/runtime/status` as a per-plugin `emits_schemas` map (`topic → {summary?,
+> schema?}`) so consumers/console can discover them; nothing validates payloads at publish time, and
+> a broken schema/ref warns and degrades that entry to names-only — never a load failure. A
+> dev-channel warn-on-mismatch validator (developer-flag-gated) remains a possible later slice.
+
 This maps onto the ADR 0038 threat model: **subscribe is safe; publish is the risky direction**, so
 publish is the gated one (namespace-stamped, rate-limited for iframes).
 
@@ -75,6 +92,13 @@ publish is the gated one (namespace-stamped, rate-limited for iframes).
   that surface isn't open ⇒ a dot on its rail icon, cleared on open. No badge endpoints, no polling.
 - **artifact-plugin v0.2.0.** `show_artifact` emits `artifact.created` ⇒ the dot lights even when the
   panel is closed. (History/download are local plugin features, unrelated to the bus.)
+
+> **Grown since:** the dominant server-side subscriber pattern turned out to be *event →
+> agent turn* ("when X happens, have the agent react" — engine emissions, watch trips).
+> That composition — `subscribe_handler` + prompt-from-payload + `run_in_session` with an
+> idempotent job id and thread-safe burst debouncing — ships as consumption-SDK sugar:
+> `graph.sdk.react_on(topic, *, prompt, job_id, session=…, debounce_s=…)` (#1633,
+> ADR 0043). Pure composition; no new bus semantics or persistent state.
 
 ## Options considered
 

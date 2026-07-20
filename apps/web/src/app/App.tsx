@@ -6,7 +6,6 @@ import {
   BookOpen,
   Boxes,
   CalendarClock,
-  CircleAlert,
   FileText,
   Gauge,
   Inbox,
@@ -57,14 +56,17 @@ import {
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
-import { lazy, Suspense, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type { ComponentType, LazyExoticComponent, MouseEvent as ReactMouseEvent, ReactNode } from "react";
 import { FleetTurnWatch } from "./FleetTurnWatch";
 import { UpdateNotice } from "./UpdateNotice";
 import { BackgroundWatch } from "./BackgroundWatch";
 import { ChatResumeWatch } from "./ChatResumeWatch";
+import { ServerTurnWatch } from "./ServerTurnWatch";
 import { BackgroundJobs } from "./BackgroundJobs";
 import { ProtoLabsIcon } from "./ProtoLabsIcon";
+import { bootGatePhase } from "./bootGate";
+import { dedupeRailById } from "./rail";
 import { AuthGate } from "./AuthGate";
 import { authRequired, subscribeAuth } from "../lib/auth";
 import { TenantGuard } from "./TenantGuard";
@@ -74,11 +76,14 @@ import { Button } from "@protolabsai/ui/primitives";
 import { ActivityWidget } from "../activity/ActivityWidget";
 import { ConfirmDialog, Tooltip } from "@protolabsai/ui/overlays";
 import { InboxWidget } from "../inbox/InboxWidget";
+import { AgentDownBanner } from "./AgentDownBanner";
 import { ChatSlot } from "./ChatSlot";
 import { chatStore, useAnyChatStreaming } from "../chat/chat-store";
 import { KnowledgeStore } from "../knowledge/KnowledgeStore";
+import { MemorySurface } from "../memory/MemorySurface";
 import { SettingsOverlay } from "../settings/SettingsOverlay";
 import { PluginSettingsDialog } from "../plugins/PluginSettingsDialog";
+import { PluginRailManage } from "../plugins/PluginRailManage";
 import { AppDrawer } from "./AppDrawer";
 import { HamburgerMenu } from "./HamburgerMenu";
 import { FleetSwitcher } from "./FleetSwitcher";
@@ -87,7 +92,17 @@ import {
   type RightPanel,
   type Surface,
 } from "../state/uiStore";
-import { api, apiUrl, authToken, is401 } from "../lib/api";
+import {
+  api,
+  apiUrl,
+  authToken,
+  is401,
+  isAgentNotRunning,
+  isAgentUnreachable,
+  currentSlug,
+  agentHref,
+  activateSlugAgent,
+} from "../lib/api";
 import { PluginView, consoleTheme } from "./PluginView";
 import { UtilityWidget } from "./UtilityWidget";
 import { AppShell, Header, UtilityBar } from "@protolabsai/ui/app-shell";
@@ -95,6 +110,9 @@ import { CommandPalette } from "@protolabsai/ui/command-palette";
 import type { PaletteView } from "@protolabsai/ui/command-palette";
 import { Alert } from "@protolabsai/ui/data";
 import { useIsMobile } from "../lib/useIsMobile";
+import { useKeyboardInset } from "../lib/useKeyboardInset";
+import { MobileShell } from "./MobileShell";
+import "./mobile-shell.css";
 import { useActiveTheme } from "../lib/useActiveTheme";
 import { registeredSurfaces } from "../ext"; // build-time fork seam (ADR 0038 D3); also self-loads fork surfaces
 import { ContextMenuRenderer, openContextMenu } from "../contextMenu";
@@ -107,9 +125,9 @@ import { useToast } from "@protolabsai/ui/overlays";
 import { StatusPill } from "./StatusPill";
 import { WorkPanel } from "./WorkPanel";
 import { SetupWizard } from "../setup/SetupWizard";
-import { hostRuntimeStatusQuery, runtimeStatusQuery } from "../lib/queries";
+import { hostRuntimeStatusQuery, installedPluginsQuery, pluginUpdatesQuery, runtimeStatusQuery } from "../lib/queries";
 import { buildViews } from "../lib/viewRegistry";
-import { applyNavIntent, usePaletteRegistry } from "./usePaletteRegistry";
+import { applyNavIntent, openView, usePaletteRegistry } from "./usePaletteRegistry";
 import type { NavIntent } from "./usePaletteRegistry";
 import { PaletteChat } from "./PaletteChat";
 import { CORE_SURFACES } from "./coreSurfaces";
@@ -238,6 +256,7 @@ export function App() {
   const reconcilePluginViews = useUI((s) => s.reconcilePluginViews);
   const reconcileCoreSurfaces = useUI((s) => s.reconcileCoreSurfaces);
   const isMobile = useIsMobile();
+  useKeyboardInset(); // publish `--kb-inset` so the shell lifts clear of the on-screen keyboard
   useActiveTheme(); // apply the focused agent's saved theme on boot + repaint on switch (ADR 0042)
   const mobileActive = useUI((s) => s.mobileActive);
   const setMobileActive = useUI((s) => s.setMobileActive);
@@ -258,6 +277,7 @@ export function App() {
   const configurePlugin = useUI((s) => s.configurePlugin);
   const closePluginConfig = useUI((s) => s.closePluginConfig);
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [sessionSheetOpen, setSessionSheetOpen] = useState(false);
   const [projectPath, setProjectPath] = useLocalStorageState("protoagent.projectPath", "");
   // Shell-level runtime read (ADR 0013): non-suspense useQuery so the topbar
   // always renders; the retry doubles as the desktop sidecar boot-probe. The
@@ -276,6 +296,14 @@ export function App() {
     refetchInterval: (q) => (q.state.data?.graph_loaded ? false : 2500),
   });
   const runtime = runtimeQ.data ?? null;
+
+  // Installed inventory + freshness — feed the rail context-menu plugin actions
+  // (#1521 / #1522) so a plugin icon's menu can show its version and offer Update /
+  // Uninstall. Lightweight + cached (the freshness poll is TTL-cached server-side);
+  // both degrade gracefully (retry:false), so a missing/erroring API just hides the
+  // extra menu items rather than blocking the menu.
+  const installedPluginsQ = useQuery(installedPluginsQuery());
+  const pluginUpdatesQ = useQuery(pluginUpdatesQuery());
 
   // Tenant uid is the HUB's, never the focused agent's (which changes on every fleet
   // swap and would wrongly wipe the chat view). Host-pinned, stable, low-churn.
@@ -329,7 +357,9 @@ export function App() {
         if (!pid) return;
         const own = pluginViewsRef.current.filter((v) => v.key.startsWith(`plugin:${pid}:`));
         const target = d?.view ? own.find((v) => v.key === `plugin:${pid}:${d.view}`) : own[0];
-        if (target) setSurface(target.key);
+        // Route through openView, not setSurface: it resolves the owning dock AND sets
+        // `mobileActive`, so "the AI navigates the UI" works on a phone too.
+        if (target) openView(target.key);
       }),
     [],
   );
@@ -347,7 +377,12 @@ export function App() {
     if (runtime && typeof surface === "string" && surface.startsWith("plugin:") && !activePluginView) {
       setSurface("chat");
     }
-  }, [runtime, surface, activePluginView]);
+    // Same fallback for the mobile stack: a pushed plugin view whose plugin vanished would
+    // otherwise strand the shell on a blank pushed layer with only Back to escape.
+    if (runtime && mobileActive.startsWith("plugin:") && !allPluginViews.some((v) => v.key === mobileActive)) {
+      setMobileActive("chat");
+    }
+  }, [runtime, surface, activePluginView, mobileActive, allPluginViews, setMobileActive]);
   // White-label the window/tab title to the configured identity (default
   // protoAgent), so a fork's title follows its name without a rebuild.
   // brandName() display-cases a bare lower-case slug (e.g. `gina` → `Gina`).
@@ -368,6 +403,27 @@ export function App() {
   // copy/escape-hatch swap. STUCK_AFTER_MS=45s — past it, offer "Continue anyway"
   // so a graph that never compiles can't trap the operator on the loading screen.
   const bootFailed = !runtime && runtimeQ.isError;
+  // Focused fleet agent is DOWN (ADR 0042): a non-host slug whose boot probe keeps failing
+  // past a normal spawn window. Two shapes: a LOCAL peer 409s ("agent not running" — `activate`
+  // didn't bring it up), a REMOTE member 502s (its box is offline / URL wrong — it never 409s,
+  // it isn't a local process). Without this the operator waited out the full ~30 retries for a
+  // generic "isn't responding" gate whose "Continue anyway" just opens a broken app. Detect it
+  // early (≥6 retries ≈ ~6s at the 1s delay) and offer targeted recovery: return to the host
+  // console, or try starting/reaching it again. `failureReason`/`failureCount` are live during
+  // retries (TanStack Query v5), so recovery shows before the probe fully gives up.
+  const focusedSlug = currentSlug();
+  const agentDown =
+    focusedSlug !== "host" &&
+    !runtime &&
+    (isAgentNotRunning(runtimeQ.failureReason) || isAgentUnreachable(runtimeQ.failureReason)) &&
+    runtimeQ.failureCount >= 6;
+  // Focused REMOTE member's stored token is wrong/missing: its proxied boot probe 401s. That's
+  // the MEMBER's credential problem, not the hub's — api.ts already keeps it off the global
+  // AuthGate (which prompts for the HUB token), and the probe's 401 stops the retry loop
+  // immediately (is401), so we surface a targeted "update its token / return to host" recovery
+  // instead of the generic "isn't responding" gate. Host-window 401s stay with the AuthGate.
+  const memberAuthFailed = focusedSlug !== "host" && !runtime && is401(runtimeQ.failureReason);
+  const agentUnreachable = isAgentUnreachable(runtimeQ.failureReason); // 502 (remote) vs 409 (local peer)
   // Token-gated first run (#873): the boot probe itself 401s. The BootGate's
   // "Starting… / isn't responding" copy is wrong for that — and its overlay
   // (z-1900) would cover the AuthGate dialog (z-1000) — so the gate yields to
@@ -381,16 +437,8 @@ export function App() {
     const t = window.setTimeout(() => setBootStuck(true), 45_000);
     return () => window.clearTimeout(t);
   }, [bootReady]);
-  const [error, setError] = useState("");
-
-  // Clear the stale "Load failed" strip once the engine reports ready. The
-  // graph compile (cold start, finishing setup, or a model change) runs inline
-  // on the server loop and freezes it, so concurrent pollers fail and set the
-  // strip — which is otherwise only cleared by a user action. When `graph_loaded`
-  // flips true the connection is healthy again, so that transient error is moot.
-  useEffect(() => {
-    if (engineReady) setError((prev) => (prev ? "" : prev));
-  }, [engineReady]);
+  // Which recovery the boot gate shows (pure precedence — tested in bootGate.test.ts).
+  const gatePhase = bootGatePhase({ memberAuthFailed, agentDown, unreachable: agentUnreachable, bootFailed, bootStuck });
 
   // Adopt the server's default project as the fs working dir if none is set (it
   // seeds the setup wizard's allowed-dirs) once runtime resolves.
@@ -412,6 +460,18 @@ export function App() {
   // Goal completions surface as a toast (goal.achieved / goal.failed on the bus, ADR 0039) so a
   // plain operator notices a terminal goal without writing a plugin hook.
   const toast = useToast();
+
+  // Transient chat/composer errors (attach/image/queue/cancel/rewind) surface as a
+  // toast, not an inline strip — the console toast convention. Global, so an error from
+  // a chat docked on the right/bottom shows too (the old strip only rendered on the left);
+  // an empty string is a no-op (the strip's clear-on-success is moot once toasts auto-dismiss).
+  const onChatError = useCallback(
+    (msg: string) => {
+      if (msg) toast({ tone: "error", message: msg });
+    },
+    [toast],
+  );
+
   useEffect(() => {
     const offDone = onServerEvent("goal.achieved", (d) =>
       toast({ tone: "success", title: "Goal achieved", message: String(d.condition || "the goal") }));
@@ -485,25 +545,17 @@ export function App() {
       // rather than adding a second rail item.
       .filter((s) => s.id !== "chat")
       .map((s): RailItem => ({ id: s.id, label: s.label, icon: s.icon }));
-    return [...ordered, ...extra, ...ext];
+    // `ext` is appended without a placement check, so a fork surface whose id collides with one
+    // already in `ordered`/`extra` would render a second time — a duplicate rail key that desyncs
+    // the DS sortable rail's index→id mapping. Dedup by id (first occurrence wins). (#1755)
+    return dedupeRailById([...ordered, ...extra, ...ext]);
   }
 
   // Right-click the EMPTY rail background (not an icon) → the "Hidden views" restore menu
-  // (ADR 0035/0036). The DS AppShell only fires onRailContextMenu on icons, so we catch the
-  // rail-container right-click here via event delegation (the DS classnames are the contract)
-  // and hand the resolved hidden-surface labels to the `rail-background` menu. An icon click
-  // is handled by its own `rail-surface` menu, so bail when the target is a rail button.
-  const onShellContextMenu = (e: ReactMouseEvent) => {
-    const t = e.target as HTMLElement;
-    if (t.closest(".pl-rail__btn")) return; // an icon — its own menu handles it
-    const railEl = t.closest(".pl-rail") as HTMLElement | null;
-    if (!railEl) return; // not the rail — leave the default menu
-    // Which rail was right-clicked → restore a hidden view to THIS dock (not its default).
-    const side: "left" | "right" | "bottom" = railEl.classList.contains("pl-rail--right")
-      ? "right"
-      : railEl.classList.contains("pl-rail--bottom")
-        ? "bottom"
-        : "left";
+  // (ADR 0035/0036). The DS AppShell's `onRailBackgroundContextMenu` (@protolabsai/ui@0.53.0)
+  // fires on empty rail space with the resolved side — no more DOM/classname delegation.
+  // Icon right-clicks go to `onRailContextMenu` (the `rail-surface` menu) instead.
+  const onRailBackgroundContextMenu = (side: "left" | "right" | "bottom", e: ReactMouseEvent) => {
     const hidden = (railOrder.hidden ?? []).map((id) => ({ id, label: metaFor(id)?.label ?? id }));
     openContextMenu("rail-background", e, { side, hidden });
   };
@@ -582,6 +634,10 @@ export function App() {
       // Settings ▸ Workspace ▸ Memory (ADR 0048 S-C).
       case "knowledge":
         return <KnowledgeStore />;
+      // Memory inspector (ADR 0069 D7) — the delivery-layer audit surface: session
+      // digests, hot memory, per-turn injection record.
+      case "memory":
+        return <MemorySurface />;
       // Settings is no longer a rail surface (2026-06 consolidation) — it's a utility-bar
       // pill opening the settings dialog (SettingsOverlay). Notes is the first-party `notes`
       // plugin (ADR 0034 S4) — rendered via the default
@@ -596,6 +652,82 @@ export function App() {
       }
     }
   }
+
+  // Background event delivery (#1640): a plugin view whose iframe subscribed with
+  // `background: true` stays MOUNTED (hidden) when another surface is active, so the
+  // bridge keeps relaying bus events to it (a live map / dashboard keeps its model warm;
+  // everyone else keeps the unmount + notification-dot default). Session-scoped: the set
+  // only ever contains views the operator opened this session (the page can't ask before
+  // its iframe exists), and it empties on reload.
+  const pluginBackground = useUI((s) => s.pluginBackground);
+  const backgroundViews = allPluginViews.filter((v) => pluginBackground[v.key]);
+  const bgViewsFor = (side: "left" | "right" | "bottom") =>
+    backgroundViews.filter((v) => railOrder[side].includes(v.key));
+  // On mobile every dock's surfaces render in the one mobile pane — keep any DOCKED
+  // background view mounted there (never one parked in the hidden bucket).
+  const bgViewsDocked = backgroundViews.filter(
+    (v) =>
+      railOrder.left.includes(v.key) ||
+      railOrder.right.includes(v.key) ||
+      railOrder.bottom.includes(v.key),
+  );
+
+  // Render a dock's active surface, keeping that dock's background-delivery views
+  // mounted-but-hidden. The active view renders INSIDE its persistent slot (a display
+  // swap, the ChatSlot #613 pattern) so toggling visibility never reloads its iframe.
+  function renderDock(activeId: string, bgViews: typeof allPluginViews): ReactNode {
+    return (
+      <>
+        {bgViews.map((v) => (
+          <div
+            key={v.key}
+            className="plugin-bg-slot"
+            style={{ display: activeId === v.key ? "contents" : "none" }}
+          >
+            <PluginView view={v} />
+          </div>
+        ))}
+        {activeId !== "chat" && !bgViews.some((v) => v.key === activeId)
+          ? renderSurface(activeId)
+          : null}
+      </>
+    );
+  }
+
+  // ── Chat-first mobile shell (ADR 0035 D6 as amended) ──
+  // `mobileActive` doubles as the navigation stack: "chat" = the root, anything else = a
+  // surface pushed over it. One level deep by design — a phone doesn't need a rail of
+  // co-equal surfaces, it needs chat plus somewhere to go and back.
+  const mobileAtRoot = mobileActive === "chat";
+  // Docked background plugin views live in the ROOT layer alongside chat: they're iframes
+  // that must never unmount, and one of them can be the active surface (shown by display
+  // toggle, no pushed layer) — which is why MobileShell inerts on `pushed`, not on back.
+  const mobileIsBgView = bgViewsDocked.some((v) => v.key === mobileActive);
+  const mobileRoot = (
+    <>
+      <ChatSlot
+        onError={onChatError}
+        active={mobileAtRoot}
+        pluginView={chatSlotView}
+        enabledPluginIds={enabledPluginIds}
+      />
+      {bgViewsDocked.map((v) => (
+        <div
+          key={v.key}
+          className="plugin-bg-slot"
+          style={{ display: mobileActive === v.key ? "contents" : "none" }}
+        >
+          <PluginView view={v} />
+        </div>
+      ))}
+    </>
+  );
+  const mobilePushed = mobileAtRoot || mobileIsBgView ? null : renderSurface(mobileActive);
+  const mobileTitle = mobileAtRoot
+    ? ""
+    : ([...railSurfaces("left"), ...railSurfaces("right"), ...railSurfaces("bottom")].find(
+        (s) => s.id === mobileActive,
+      )?.label ?? mobileActive);
 
   // Keep plugin views as first-class railOrder members (ADR 0036) — append new ones, prune gone.
   // Keyed on a stable signature so the effect only fires when the view set actually changes.
@@ -695,7 +827,7 @@ export function App() {
     {/* Command palette (⌘K, ADR 0057) — portals over the shell; the same component
         backs the desktop quick-command (step 4). */}
     <CommandPalette open={paletteOpen} onOpenChange={setPaletteOpen} registry={paletteRegistry} />
-    <div className={`app-shell${isTauriMac ? " is-tauri-mac" : ""}`} onContextMenu={onShellContextMenu}>
+    <div className={`app-shell${isTauriMac ? " is-tauri-mac" : ""}`}>
       {/* protoLabs.studio brand bumper — DS Splash (@protolabsai/ui/splash). Holds
           2.5s then hands off via the View Transitions API cross-fade (the
           protoAgent path); shows once per tab session (sessionStorage
@@ -722,6 +854,11 @@ export function App() {
       {/* wait/scheduled resumes (ADR 0053, bd-k02): a server-fired resume turn lands in
           the chat thread; surface it live in the open tab instead of on next interaction. */}
       <ChatResumeWatch />
+      {/* Server-initiated turns (#1767): background push-resume / scheduled / watch fires
+          hold the connection open for the whole turn but never stream to the browser —
+          drive the chat typing indicator off turn.started/turn.finished so the app doesn't
+          look hung during its longest turns. */}
+      <ServerTurnWatch />
       {/* Tenant guard: if a DIFFERENT backend now owns this origin (the HUB re-keyed —
           a fork booted on the old port), drop the previous tenant's persisted chat view.
           Keyed on the HUB's uid, NOT the focused agent's — switching fleet agents keeps
@@ -742,23 +879,69 @@ export function App() {
           <BootGate
             logo={<ProtoLabsIcon variant="outline" size={56} decorative gradientStroke tone="accent" />}
             title={
-              bootFailed
-                ? `${bootName} isn’t responding`
-                : `Starting ${bootName}…`
+              gatePhase === "memberAuth"
+                ? `Can’t authenticate to “${focusedSlug}”`
+                : gatePhase === "unreachable"
+                  ? `Agent “${focusedSlug}” is unreachable`
+                  : gatePhase === "notRunning"
+                    ? `Agent “${focusedSlug}” isn’t running`
+                    : gatePhase === "failed"
+                      ? `${bootName} isn’t responding`
+                      : `Starting ${bootName}…`
             }
             detail={
-              bootFailed
-                ? "The engine didn’t come up in time. It may still be warming up — give it another moment, then retry."
-                : bootStuck
-                  ? "This is taking longer than usual. The engine may still be compiling, or it may need attention in Settings."
-                  : "Warming up the engine — first launch (and finishing setup) can take up to a minute. Later launches are quick."
+              gatePhase === "memberAuth"
+                ? "This remote member rejected the hub’s stored token (it’s wrong, missing, or was rotated). Return to the host console and update its token in Settings ▸ Agents."
+                : gatePhase === "unreachable"
+                  ? "This remote member didn’t answer. Return to the host console to keep working, or check its URL and token in Settings ▸ Agents."
+                  : gatePhase === "notRunning"
+                    ? "This fleet agent didn’t start. Return to the host console to keep working, or try starting it again."
+                    : gatePhase === "failed"
+                      ? "The engine didn’t come up in time. It may still be warming up — give it another moment, then retry."
+                      : gatePhase === "stuck"
+                        ? "This is taking longer than usual. The engine may still be compiling, or it may need attention in Settings."
+                        : "Warming up the engine — first launch (and finishing setup) can take up to a minute. Later launches are quick."
             }
             action={
-              bootFailed ? (
+              gatePhase === "memberAuth" ? (
+                <Button
+                  variant="primary"
+                  size="sm"
+                  onClick={() => {
+                    window.location.href = agentHref("host");
+                  }}
+                >
+                  Return to host
+                </Button>
+              ) : gatePhase === "unreachable" || gatePhase === "notRunning" ? (
+                <div style={{ display: "flex", gap: 8 }}>
+                  <Button
+                    variant="primary"
+                    size="sm"
+                    onClick={() => {
+                      window.location.href = agentHref("host");
+                    }}
+                  >
+                    Return to host
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => {
+                      void (async () => {
+                        await activateSlugAgent();
+                        void runtimeQ.refetch();
+                      })();
+                    }}
+                  >
+                    {gatePhase === "unreachable" ? "Try again" : "Try to start it"}
+                  </Button>
+                </div>
+              ) : gatePhase === "failed" ? (
                 <Button variant="primary" size="sm" onClick={() => void runtimeQ.refetch()}>
                   Retry
                 </Button>
-              ) : bootStuck ? (
+              ) : gatePhase === "stuck" ? (
                 <Button variant="primary" size="sm" onClick={() => setBootOverride(true)}>
                   Continue anyway
                 </Button>
@@ -779,6 +962,34 @@ export function App() {
           logo is the brand mark, status is the glanceable health light. BASE_URL is "/app/" in
           dev and "./" in the desktop build (assets sit at the root). dragRegion = the Tauri
           window drag region. */}
+      {/* Mobile runs a different SHELL, not a different layout of the same one — chat is the
+          root view and surfaces push over it (ADR 0035 D6 as amended). The DS AppShell can't
+          express that: its mobile branch is a hard early return, and escaping it by dropping
+          `mobileItems`/`quickBarIds` falls through to the desktop tree. So below 768px we own
+          the shell; the DS one still drives every desktop viewport unchanged. */}
+      {isMobile ? (
+        <MobileShell
+          root={mobileRoot}
+          pushed={mobilePushed}
+          title={mobileTitle}
+          showBack={!mobileAtRoot}
+          onBack={() => setMobileActive("chat")}
+          onOpenDrawer={() => setDrawerOpen(true)}
+          sessionSheetOpen={sessionSheetOpen}
+          onSessionSheetChange={setSessionSheetOpen}
+          banners={
+            <>
+              {(runtime?.warnings ?? []).map((w) => (
+                <Alert status="warning" className="shell-warning-banner" key={w}>
+                  {w}
+                </Alert>
+              ))}
+              <AgentDownBanner />
+            </>
+          }
+        />
+      ) : (
+      <>
       <div className="app-topbar">
       <Header
         dragRegion
@@ -792,6 +1003,8 @@ export function App() {
               setFleetStartNew(true);
               openGlobalSettings("fleet");
             }}
+            // "Fleet settings" → the fleet management dialog (no new-agent picker).
+            onManageFleet={() => openGlobalSettings("fleet")}
           />
         }
         org={runtime?.identity?.org || "protoLabs.studio"}
@@ -810,6 +1023,11 @@ export function App() {
           {w}
         </Alert>
       ))}
+
+      {/* Focused fleet member stopped mid-session (the boot gate only catches boot-time
+          down; a runtime stop otherwise surfaces only as plugin views 409-ing). Slim
+          strip with a hub-routed Start; renders nothing on the host or a running agent. */}
+      <AgentDownBanner />
 
       {/* The dual-rail shell is now the DS AppShell (ADR 0035 + #144): rails (drag-to-reorder +
           cross-rail via dnd-kit), resizable right column, mobile shell, and the utility bar — all
@@ -847,14 +1065,31 @@ export function App() {
             else { setBottomPanel(id); setBottomCollapsed(false); }
           }
         }}
+        onRailBackgroundContextMenu={onRailBackgroundContextMenu}
         onRailContextMenu={(side, e, id) => {
           // A plugin view's rail id is `plugin:<pluginId>:<viewId>` — resolve the owning
           // plugin's id + display name so the menu can offer "Configure…" (ADR 0036/0059).
           const pluginId = id.startsWith("plugin:") ? id.split(":")[1] : undefined;
-          const pluginName = pluginId
-            ? (runtime?.plugins?.find((p) => p.id === pluginId)?.name ?? pluginId)
-            : undefined;
-          openContextMenu("rail-surface", e, { id, side, pluginId, pluginName });
+          const rec = pluginId ? runtime?.plugins?.find((p) => p.id === pluginId) : undefined;
+          const pluginName = pluginId ? (rec?.name ?? pluginId) : undefined;
+          // Version + lifecycle affordances (#1521 / #1522): removable = tracked in the
+          // writable plugins dir (git-installed / local copy; in-tree built-ins aren't in
+          // this list and are refused server-side); updatable = the freshness poll says
+          // this plugin is behind its ref. Both feed the Update / Uninstall menu gating.
+          const removable = pluginId ? (installedPluginsQ.data?.plugins ?? []).some((pl) => pl.id === pluginId) : false;
+          const updatable = pluginId
+            ? Boolean((pluginUpdatesQ.data?.plugins ?? []).find((u) => u.id === pluginId)?.behind)
+            : false;
+          openContextMenu("rail-surface", e, {
+            id,
+            side,
+            pluginId,
+            pluginName,
+            pluginVersion: rec?.version,
+            pluginBuiltin: rec?.builtin,
+            pluginRemovable: removable,
+            pluginUpdatable: updatable,
+          });
         }}
         onRailReorder={(next) => {
           // Chat can dock anywhere now — left, right, or the bottom dock. Its slot mounts
@@ -887,36 +1122,33 @@ export function App() {
         quickBarIds={quickBar}
         leftContent={
           <>
-            {error ? (
-              <div className="error-strip" role="alert">
-                <CircleAlert size={16} />
-                <span>{error}</span>
-              </div>
-            ) : null}
             {chatRail === "left" || isMobile ? (
               <ChatSlot
-                onError={setError}
+                onError={onChatError}
                 active={(isMobile ? mobileActive : leftActive) === "chat"}
                 pluginView={chatSlotView}
                 enabledPluginIds={enabledPluginIds}
               />
             ) : null}
-            {(isMobile ? mobileActive : leftActive) !== "chat"
-              ? renderSurface(isMobile ? mobileActive : leftActive)
-              : null}
+            {renderDock(
+              isMobile ? mobileActive : leftActive,
+              isMobile ? bgViewsDocked : bgViewsFor("left"),
+            )}
           </>
         }
         rightContent={
           <>
             {chatRail === "right" ? (
               <ChatSlot
-                onError={setError}
+                onError={onChatError}
                 active={rightActive === "chat"}
                 pluginView={chatSlotView}
                 enabledPluginIds={enabledPluginIds}
               />
             ) : null}
-            {rightActive !== "chat" ? renderSurface(rightActive) : null}
+            {/* On mobile the right dock's surfaces render in the mobile pane instead —
+                pass no bg views here so a background iframe is never mounted twice. */}
+            {renderDock(rightActive, isMobile ? [] : bgViewsFor("right"))}
           </>
         }
         bottomContent={
@@ -926,13 +1158,13 @@ export function App() {
                 surface — or back — never tears down an in-flight stream (#613). */}
             {chatRail === "bottom" ? (
               <ChatSlot
-                onError={setError}
+                onError={onChatError}
                 active={bottomActive === "chat"}
                 pluginView={chatSlotView}
                 enabledPluginIds={enabledPluginIds}
               />
             ) : null}
-            {bottomActive && bottomActive !== "chat" ? renderSurface(bottomActive) : null}
+            {renderDock(bottomActive, isMobile ? [] : bgViewsFor("bottom"))}
           </>
         }
         utilityBar={
@@ -1052,6 +1284,8 @@ export function App() {
           />
         }
       />
+      </>
+      )}
 
       <SetupWizard
         open={runtime?.setup_complete === false}
@@ -1097,6 +1331,16 @@ export function App() {
       onSelectSurface={setMobileActive}
       onOpenGlobal={openGlobalSettings}
       version={runtime?.version}
+      identity={
+        <FleetSwitcher
+          fallbackName={brandName(runtime?.identity?.name)}
+          onNewAgent={() => {
+            setFleetStartNew(true);
+            openGlobalSettings("fleet");
+          }}
+          onManageFleet={() => openGlobalSettings("fleet")}
+        />
+      }
     />
     {/* Global settings overlay — opened from the drawer or a palette deep-link (store-driven). */}
     <SettingsOverlay
@@ -1114,6 +1358,9 @@ export function App() {
         onClose={closePluginConfig}
       />
     )}
+    {/* Rail context-menu plugin actions (#1521 / #1522) — fires an Update, or renders the
+        Uninstall confirm, for a plugin right-clicked on its rail icon. One root mount. */}
+    <PluginRailManage />
     </>
   );
 }

@@ -41,3 +41,67 @@
   color: var(--fg-muted);
   min-width: 0;
 }
+/* The per-row on/off switch must not shrink against a long description. */
+.tools-row .pl-switch {
+  flex-shrink: 0;
+}
+/* Toggled-off rows stay listed (so they can be re-enabled) but read as inert. */
+.tools-row--off .tools-name,
+.tools-row--off .tools-desc {
+  color: var(--fg-muted);
+  opacity: 0.65;
+}
+
+/* Deep-link highlight (#1803): a chat tool card's "Manage" lands on this panel with the row
+   filtered + scrolled into view; a brief accent pulse points the eye at it in a long list.
+   Self-clearing (JS drops the class at ~2.6s); the prefilled search keeps the row in view. */
+.tools-row--target {
+  border-radius: 6px;
+  animation: tools-row-target-pulse 2.6s ease-out;
+}
+@keyframes tools-row-target-pulse {
+  0%,
+  25% {
+    background: color-mix(in srgb, var(--accent, #7c8cff) 22%, transparent);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent, #7c8cff) 45%, transparent);
+  }
+  100% {
+    background: transparent;
+    box-shadow: 0 0 0 2px transparent;
+  }
+}
+
+/* Contextual settings chips above the search (mirrors .mcp-browse-row). */
+.tools-config-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 6px;
+}
+
+/* Work-folder editor — the fenced fs roots (filesystem.projects, ADR 0007) */
+.fs-projects {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 4px 0 12px;
+}
+.fs-projects-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.fs-projects-row > :first-child {
+  flex: 1;
+}
+.fs-projects-write {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--fg-muted);
+  font-size: 12px;
+}
+.fs-projects-actions {
+  display: flex;
+  gap: 8px;
+}

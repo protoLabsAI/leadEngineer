@@ -16,8 +16,9 @@ from graph.settings_schema import (
 def test_schema_groups_and_values():
     cfg = LangGraphConfig()
     groups = build_schema(cfg, model_options=["a", "b"])
-    # Grouped + ordered by domain (ADR 0048): Identity leads, then Model (Model/Routing/Caching).
-    assert [g["section"] for g in groups][:3] == ["Identity", "Model", "Routing"]
+    # Grouped + ordered by domain (ADR 0048): Identity leads, then Model
+    # (Model/Favorite models/Routing/Caching — favorites joined in #1957).
+    assert [g["section"] for g in groups][:4] == ["Identity", "Model", "Favorite models", "Routing"]
     fields = [f for g in groups for f in g["fields"]]
     # Every core FIELD is present — EXCEPT ui_hidden ones, which stay in FIELDS for
     # config round-trip but aren't rendered in the settings UI (e.g. identity.name,
@@ -45,6 +46,10 @@ def test_schema_groups_and_values():
     # The fallback list carries the gateway options too (rendered as combobox rows).
     fallback = next(f for f in fields if f["key"] == "routing.fallback_models")
     assert fallback["type"] == "string_list" and fallback["options"] == ["a", "b"]
+    # The /model favorites (#1957) — same ordered combobox-list treatment, models-backed.
+    favorites = next(f for f in fields if f["key"] == "model.favorites")
+    assert favorites["type"] == "string_list" and favorites["options"] == ["a", "b"]
+    assert favorites["default"] == [] and favorites["scope"] == "agent"
     # #1386 — every CORE entry carries options_source so the console knows which dropdowns to
     # refresh from a freshly-probed gateway ("Get models"). Model-backed → "models"/"models+acp".
     assert all("options_source" in f for f in fields if f["key"] in core_keys)
@@ -53,6 +58,25 @@ def test_schema_groups_and_values():
     # The main-brain runtime select offers native + every ACP agent (incl. gemini).
     runtime = next(f for f in fields if f["key"] == "agent_runtime")
     assert runtime["type"] == "select" and runtime["options"] == ["native", *ACP_MODEL_OPTIONS]
+    assert runtime["options_source"] == "runtime"  # config-aware, not a static enum
+
+
+def test_registered_acp_agent_surfaces_in_runtime_and_aux_selects():
+    """ADR 0033 — a config with a user-registered custom ACP agent surfaces it in the
+    agent_runtime select AND the aux-model dropdowns, and validate_flat accepts it (the
+    runtime select is dynamically sourced, so it carries no rejecting enum — like model.name)."""
+    cfg = LangGraphConfig()
+    cfg.acp_agents = {"myagent": {"command": "my-acp", "args": ["--acp"], "label": "My Agent"}}
+    fields = {f["key"]: f for g in build_schema(cfg, model_options=["a"]) for f in g["fields"]}
+
+    assert fields["agent_runtime"]["options"] == ["native", *ACP_MODEL_OPTIONS, "acp:myagent"]
+    assert fields["routing.aux_model"]["options"] == ["a", *ACP_MODEL_OPTIONS, "acp:myagent"]
+
+    # A custom acp:<id> validates (parity with model.name); before this it was a rejecting enum.
+    assert validate_flat({"agent_runtime": "acp:myagent"})[0] is True
+    # An empty-config schema is unchanged — built-ins only, no drift.
+    base = {f["key"]: f for g in build_schema(LangGraphConfig(), model_options=["a"]) for f in g["fields"]}
+    assert base["agent_runtime"]["options"] == ["native", *ACP_MODEL_OPTIONS]
 
 
 def test_groups_carry_category_in_taxonomy_order():
@@ -237,3 +261,65 @@ def test_core_field_depends_on_passed_through(monkeypatch):
     groups = build_schema(LangGraphConfig())
     entry = next(e for g in groups for e in g["fields"] if e["key"] == "demo.child")
     assert entry["depends_on"] == {"key": "compaction.enabled", "equals": True}
+
+
+def test_filesystem_and_tools_sections_surfaced_under_capabilities():
+    """run_command is fully disableable from Settings (per agent): the filesystem
+    knobs (ADR 0007) + the tools.disabled denylist render under Capabilities, all
+    hot-reload (a save rebuilds the graph), all agent-scoped (leaf overridable)."""
+    groups = build_schema(LangGraphConfig())
+    by_key = {f["key"]: f for g in groups for f in g["fields"]}
+    section_cat = {g["section"]: g["category"] for g in groups}
+    assert section_cat["Filesystem"] == "Capabilities"
+    assert section_cat["Tools"] == "Capabilities"
+
+    for key in (
+        "filesystem.enabled",
+        "filesystem.allow_run",
+        "filesystem.run_requires_approval",
+        "filesystem.bypass_allowed",
+    ):
+        f = by_key[key]
+        assert f["type"] == "bool" and f["section"] == "Filesystem"
+        assert f["restart"] is False  # a settings save rebuilds the graph
+        assert f["scope"] == "agent"  # per-agent kill switch, not box-wide
+        assert f["default"] is True  # matches the shipped LangGraphConfig defaults
+
+    # The gates cascade in the UI: allow_run hides under enabled, approval under
+    # allow_run, bypass under approval (truthy depends_on, #963).
+    assert by_key["filesystem.allow_run"]["depends_on"] == {"key": "filesystem.enabled"}
+    assert by_key["filesystem.run_requires_approval"]["depends_on"] == {"key": "filesystem.allow_run"}
+    assert by_key["filesystem.bypass_allowed"]["depends_on"] == {"key": "filesystem.run_requires_approval"}
+
+    dis = by_key["tools.disabled"]
+    assert dis["type"] == "string_list" and dis["section"] == "Tools"
+    assert dis["default"] == [] and dis["restart"] is False
+
+
+def test_every_core_section_is_mapped_to_a_category():
+    """No core section may fall through to the "Plugins" default (D5).
+
+    `_category_for` defaults an unmapped section to "Plugins" (the Integrations surface) —
+    correct for genuinely plugin-contributed sections, but a trap for CORE ones: `Media` and
+    `Persona` silently filed themselves under Integrations for exactly this reason. This pins
+    the contract: every section declared by a core FIELD must have an explicit
+    `_SECTION_CATEGORY` entry, so a new core section can't strand itself by accident.
+    """
+    from graph.settings_schema import FIELDS, _SECTION_CATEGORY
+
+    core_sections = {f.section for f in FIELDS}
+    unmapped = sorted(core_sections - set(_SECTION_CATEGORY))
+    assert not unmapped, (
+        f"core section(s) {unmapped} have no _SECTION_CATEGORY entry and would default to "
+        f"'Plugins' (Integrations). Map each to its real category."
+    )
+
+
+def test_persona_and_media_are_not_swept_into_plugins():
+    """Regression for D5: the two core sections that used to hit the default."""
+    from graph.settings_schema import _category_for
+
+    assert _category_for("Persona") == "Identity"  # SOUL/self-edit belongs with Identity
+    assert _category_for("Media") == "Plugins"  # interim (no Capabilities panel yet) — but EXPLICIT
+    # A genuinely unknown (plugin) section still gets the Integrations default.
+    assert _category_for("Discord") == "Plugins"

@@ -1,4 +1,5 @@
-import { BarChart3, Bot, BookMarked, Boxes, Brain, Cpu, Database, Gauge, Keyboard, KeyRound, MessageSquare, Network, Palette, Plug, Puzzle, Server, Sparkles, Store, Wrench } from "lucide-react";
+import { BarChart3, Bot, BookMarked, Boxes, Brain, Cpu, Database, FlaskConical, Gauge, Keyboard, KeyRound, Lock, MessageSquare, Network, Palette, Plug, Puzzle, Server, Smartphone, Sparkles, Store, Wrench } from "lucide-react";
+import { useFlagPredicate } from "../flags/flags";
 import type { LucideIcon } from "lucide-react";
 import { useEffect, type ReactNode } from "react";
 
@@ -12,12 +13,17 @@ import { isHostConsole } from "../lib/api";
 import { PluginsSurface } from "../plugins/PluginsSurface";
 import { PlaybooksSurface } from "../playbooks/PlaybooksSurface";
 import { TelemetrySurface } from "../telemetry/TelemetrySurface";
+import { useIsMobile } from "../lib/useIsMobile";
 import { useUI } from "../state/uiStore";
 import { DelegatesSection } from "./DelegatesSection";
 import { FleetSurface } from "./FleetSurface";
 import { KeybindingsPanel } from "./KeybindingsPanel";
 import { ChatSettingsPanel } from "./ChatSettingsPanel";
+import { DeveloperPanel } from "./DeveloperPanel";
+import { developerPanelVisible, useDeveloperChannel } from "../flags/flags";
 import { OverviewPanel } from "./OverviewPanel";
+import { DevicesPanel } from "./DevicesPanel";
+import { SecretsPanel } from "./SecretsPanel";
 import { SettingsCategoryPanel } from "./SettingsCategory";
 import { ThemeSurface } from "./ThemeSurface";
 
@@ -26,17 +32,26 @@ import { ThemeSurface } from "./ThemeSurface";
 // (ADR 0047), never a nav axis. The sidenav splits into labeled groups:
 //
 //   Agent        — what defines the focused agent: Identity · Model · Behavior · Knowledge ·
-//                  Integrations (Plugins). Schema-driven domains carry the ADR 0047 badge.
+//                  Plugins. Schema-driven domains carry the ADR 0047 badge.
 //   Capabilities — what the agent is wired to: Tools · MCP · Skills · Subagents · Delegates.
 //                  Each manager owns its sharing/tier knob via a contextual chip (no extra panel).
 //   Box          — box-wide ops (HOST CONSOLE ONLY): Overview · Fleet · Telemetry. Box-runtime +
 //                  telemetry knobs are chips on Fleet / Telemetry, not a separate empty panel.
 //   This console — device-local prefs (NOT agent config, no cascade): Theme · Chat · Keyboard.
 
-type Section = { id: string; label: string; icon: LucideIcon; render: () => ReactNode };
+type Section = {
+  id: string;
+  label: string;
+  icon: LucideIcon;
+  render: () => ReactNode;
+  /** Developer flag gating this section (ADR 0068). Absent = always shown. A flag-off
+   *  section is filtered from BOTH the nav and the resolvable set, so a persisted id
+   *  pointing at it falls back to the first visible section rather than a blank pane. */
+  flag?: string;
+};
 
 // The Plugins manager (install · enable · configure, plus the Discover directory) — the
-// Integrations domain. Per-plugin config is inline per row (ADR 0059).
+// Plugins domain. Per-plugin config is inline per row (ADR 0059).
 function PluginSettingsHome() {
   const pluginsTab = useUI((s) => s.pluginsTab);
   const setPluginsTab = useUI((s) => s.setPluginsTab);
@@ -63,12 +78,20 @@ const AGENT_SECTIONS: Section[] = [
   // chip-in-a-dialog was unnecessary extra clicking).
   { id: "identity", label: "Identity", icon: Sparkles, render: () => <IdentityPanel /> },
   { id: "access", label: "Operator & access", icon: KeyRound, render: () => <SettingsCategoryPanel category="Identity" title="Operator & access" /> },
+  // Paired devices (ADR 0087) — sits next to access because it IS access: each device holds
+  // its own revocable token rather than sharing the operator bearer.
+  // Behind `settings.devices` (ADR 0068), default OFF — see the flag's description in
+  // runtime/flags.py. The pairing flow stopped the desktop app from starting four times; it
+  // stays hidden until the whole path is exercised in the desktop app itself.
+  { id: "devices", label: "Devices", icon: Smartphone, flag: "settings.devices", render: () => <DevicesPanel /> },
   // id stays "model" (the former "settings"/"Model & Routing"). It now renders ONLY the Model
   // domain (model · routing · caching) instead of the whole Agent category (ADR 0048 C4).
   { id: "model", label: "Model", icon: Cpu, render: () => <SettingsCategoryPanel category="Model" title="Model & routing" /> },
   { id: "behavior", label: "Behavior", icon: Brain, render: () => <SettingsCategoryPanel category="Behavior" title="Behavior" /> },
   { id: "knowledge", label: "Knowledge", icon: Database, render: () => <SettingsCategoryPanel category="Knowledge" title="Knowledge" /> },
-  { id: "plugins", label: "Integrations", icon: Puzzle, render: () => <PluginSettingsHome /> },
+  // External secrets manager (ADR 0080) — schema fields + the status/test/sync card.
+  { id: "secrets", label: "Secrets", icon: Lock, render: () => <SecretsPanel /> },
+  { id: "plugins", label: "Plugins", icon: Puzzle, render: () => <PluginSettingsHome /> },
 ];
 
 // CAPABILITIES — what the agent is wired to (rich bespoke managers). Each manager owns its own
@@ -103,6 +126,9 @@ const CONSOLE_SECTIONS: Section[] = [
 // command). The Box group is gated to the host console.
 export function SettingsSurface({ initialSection }: { only?: "host" | "workspace"; initialSection?: string } = {}) {
   const onHost = isHostConsole();
+  // On phones the two-column shell can't fit a 200px rail + readable content, so collapse
+  // the SideNav to its DS <select> (mobile only — the desktop rail is deliberately a tablist).
+  const isMobile = useIsMobile();
   const persistedSection = useUI((s) => s.settingsSection);
   const setSection = useUI((s) => s.setSettingsSection);
 
@@ -111,24 +137,39 @@ export function SettingsSurface({ initialSection }: { only?: "host" | "workspace
     if (initialSection) setSection(initialSection);
   }, [initialSection, setSection]);
 
+  // The Developer panel (ADR 0068) joins "This console" only off prod — a dev build, a
+  // non-prod channel, or an explicit ?dev/?flag: reveal — so production operators never see it.
+  const channel = useDeveloperChannel();
+  const consoleSections: Section[] = developerPanelVisible(channel)
+    ? [...CONSOLE_SECTIONS, { id: "developer", label: "Developer", icon: FlaskConical, render: () => <DeveloperPanel /> }]
+    : CONSOLE_SECTIONS;
+
+  // Drop flag-off sections everywhere they'd be reachable — nav, active-id resolution, and
+  // the ⌘K/deep-link path that reads the same persisted id.
+  const flagOn = useFlagPredicate();
+  const shown = (list: Section[]) => list.filter((s) => !s.flag || flagOn(s.flag));
+  const agentSections = shown(AGENT_SECTIONS);
+  const capabilitySections = shown(CAPABILITY_SECTIONS);
+  const boxSections = onHost ? shown(BOX_SECTIONS) : [];
+
   const sections = [
-    ...AGENT_SECTIONS,
-    ...CAPABILITY_SECTIONS,
-    ...(onHost ? BOX_SECTIONS : []),
-    ...CONSOLE_SECTIONS,
+    ...agentSections,
+    ...capabilitySections,
+    ...boxSections,
+    ...consoleSections,
   ];
   const active = sections.find((s) => s.id === persistedSection) ?? sections[0];
   const toItem = (s: Section) => ({ id: s.id, label: s.label, icon: <s.icon size={15} /> });
   const groups = [
-    { label: "Agent", items: AGENT_SECTIONS.map(toItem) },
-    { label: "Capabilities", items: CAPABILITY_SECTIONS.map(toItem) },
-    ...(onHost ? [{ label: "Box", items: BOX_SECTIONS.map(toItem) }] : []),
-    { label: "This console", items: CONSOLE_SECTIONS.map(toItem) },
+    { label: "Agent", items: agentSections.map(toItem) },
+    { label: "Capabilities", items: capabilitySections.map(toItem) },
+    ...(onHost ? [{ label: "Box", items: boxSections.map(toItem) }] : []),
+    { label: "This console", items: consoleSections.map(toItem) },
   ];
 
   return (
     <div className="settings-shell">
-      <SideNav ariaLabel="Settings sections" groups={groups} active={active.id} onSelect={(id) => setSection(id)} />
+      <SideNav responsive={isMobile} ariaLabel="Settings sections" groups={groups} active={active.id} onSelect={(id) => setSection(id)} />
       <div className="settings-content">
         {active.render()}
       </div>

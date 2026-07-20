@@ -30,7 +30,7 @@ import sqlite3
 import time
 from collections.abc import Callable
 
-from knowledge.store import KnowledgeStore
+from knowledge.store import _BULK_DELETE_REASON, KnowledgeStore, _namespace_clause, _normalize_before
 
 log = logging.getLogger(__name__)
 
@@ -116,6 +116,39 @@ class HybridKnowledgeStore(KnowledgeStore):
         was_open = self._breaker_open() or self._embed_failures > 0
         self._record_embed_success()
         return was_open
+
+    def _probe_once(self) -> bool:
+        """One synchronous embedding-route probe: on failure, open the breaker
+        IMMEDIATELY (not after ``breaker_threshold`` in-turn failures) so no chat
+        turn pays for a dead route. Returns True when the route is healthy."""
+        if self._embed_fn is None:
+            return False
+        try:
+            self._embed_fn("ping")
+            self._record_embed_success()
+            return True
+        except Exception as exc:  # noqa: BLE001 — a probe failure must only open the breaker
+            log.warning(
+                "[knowledge] embedding probe failed — semantic recall paused for %.0fs "
+                "(keyword recall continues): %s",
+                self._breaker_cooldown_s,
+                exc,
+            )
+            self._embed_failures = self._breaker_threshold
+            self._breaker_open_until = time.monotonic() + self._breaker_cooldown_s
+            return False
+
+    def warm_probe(self) -> None:
+        """Fire-and-forget ``_probe_once`` on a daemon thread (#1681). Recall runs
+        BEFORE every model call, so without this the FIRST turns of an embedding
+        outage each ate the full transport timeout before the in-turn breaker could
+        trip — the operator experienced a frozen chat. Probing at construction moves
+        that cost off the user's turn entirely."""
+        if self._embed_fn is None:
+            return
+        import threading
+
+        threading.Thread(target=self._probe_once, daemon=True, name="knowledge-embed-probe").start()
 
     def _embed(self, text: str) -> list[float] | None:
         if self._embed_fn is None or self._breaker_open():
@@ -257,20 +290,98 @@ class HybridKnowledgeStore(KnowledgeStore):
                 db.close()
         return super().delete_by_namespace(namespace)
 
-    def _vector_search(self, query_vec: list[float], k: int, domain: str | None) -> list[int]:
+    def purge_domain(self, domain: str, *, before=None) -> int:
+        """Purge the domain's chunks AND their vectors (#1634) — the
+        :meth:`delete_by_namespace` pattern: no FK cascade on the side table, so
+        the vectors go first (under the SAME cutoff — the base delete's FTS
+        trigger covers ``chunks_fts``, nothing covers ``chunk_vectors``). A
+        purged chunk must vanish from BOTH search modes, not linger as a
+        vector-only hit."""
+        if not domain or not domain.strip():
+            return 0
+        try:
+            cutoff = _normalize_before(before)
+        except ValueError:
+            # Mirror the base refusal BEFORE touching vectors — a bad cutoff must
+            # not strip embeddings off rows that then survive the row delete.
+            log.warning("[knowledge] purge_domain(%r): unparseable before=%r — refusing to purge", domain, before)
+            return 0
+        db = self._get_db()
+        if db is not None:
+            try:
+                sql = "DELETE FROM chunk_vectors WHERE chunk_id IN (SELECT id FROM chunks WHERE domain = ?"
+                params: list = [domain]
+                if cutoff is not None:
+                    sql += " AND created_at < ?"
+                    params.append(cutoff)
+                db.execute(sql + ")", params)
+                db.commit()
+            except sqlite3.DatabaseError as exc:
+                log.warning("[knowledge] purge_domain vectors failed: %s", exc)
+            finally:
+                db.close()
+        return super().purge_domain(domain, before=cutoff)
+
+    def purge_invalidated(self, older_than_seconds: int = 0, *, _cutoff: str | None = None) -> int:
+        """Sweep past-grace bulk-soft-deleted chunks AND their vectors (#1770) — the
+        :meth:`delete_by_namespace` / :meth:`purge_domain` pattern: no FK cascade
+        on the side table, so the vectors go first under the SAME cutoff (shared
+        via ``_cutoff`` so a swept chunk can't linger as a vector-only hit).
+
+        Mirrors the base's ``invalidation_reason`` filter so only bulk delete-by-source
+        vectors are dropped — auto-supersession audit rows (ADR 0069 D9) keep theirs."""
+        cutoff = _cutoff if _cutoff is not None else self._invalidated_cutoff(older_than_seconds)
+        db = self._get_db()
+        if db is not None:
+            try:
+                db.execute(
+                    "DELETE FROM chunk_vectors WHERE chunk_id IN "
+                    "(SELECT id FROM chunks WHERE invalidated_at IS NOT NULL "
+                    "AND invalidated_at <= ? AND invalidation_reason = ?)",
+                    (cutoff, _BULK_DELETE_REASON),
+                )
+                db.commit()
+            except sqlite3.DatabaseError as exc:
+                log.warning("[knowledge] purge_invalidated vectors failed: %s", exc)
+            finally:
+                db.close()
+        return super().purge_invalidated(older_than_seconds, _cutoff=cutoff)
+
+    def _vector_search(
+        self,
+        query_vec: list[float],
+        k: int,
+        domain: str | None,
+        namespace: str | list[str] | None = None,
+        include_invalidated: bool = False,
+        epoch: str | None = None,
+    ) -> list[int]:
         """Return chunk ids ranked by cosine similarity (brute force)."""
         db = self._get_db()
         if db is None:
             return []
+        where: list[str] = []
+        params: list = []
+        if not include_invalidated:
+            where.append("c.invalidated_at IS NULL")
+        if domain:
+            where.append("c.domain = ?")
+            params.append(domain)
+        if epoch:
+            where.append("c.epoch = ?")
+            params.append(epoch)
+        ns_sql, ns_params = _namespace_clause(namespace, col="c.namespace")
+        if ns_sql:
+            where.append(ns_sql)
+            params.extend(ns_params)
+        sql = (
+            "SELECT v.chunk_id, v.vec FROM chunk_vectors v "
+            "JOIN chunks c ON c.id = v.chunk_id WHERE " + " AND ".join(where)
+            if where
+            else "SELECT chunk_id, vec FROM chunk_vectors"
+        )
         try:
-            if domain:
-                rows = db.execute(
-                    "SELECT v.chunk_id, v.vec FROM chunk_vectors v "
-                    "JOIN chunks c ON c.id = v.chunk_id WHERE c.domain = ?",
-                    (domain,),
-                ).fetchall()
-            else:
-                rows = db.execute("SELECT chunk_id, vec FROM chunk_vectors").fetchall()
+            rows = db.execute(sql, params).fetchall()
         except sqlite3.DatabaseError:
             return []
         finally:
@@ -293,21 +404,43 @@ class HybridKnowledgeStore(KnowledgeStore):
 
     # ── hybrid search ────────────────────────────────────────────────────────────
 
-    def search(self, query, k: int = 5, *, domain: str | None = None) -> list[dict]:
+    def search(
+        self,
+        query,
+        k: int = 5,
+        *,
+        domain: str | None = None,
+        namespace: str | list[str] | None = None,
+        include_invalidated: bool = False,
+        epoch: str | None = None,
+    ) -> list[dict]:
         """RRF-fuse the FTS5 ranking with a vector ranking.
 
         Falls back to pure FTS5 when embeddings are unavailable (no embed_fn,
         circuit open, or the query fails to embed) — same shape, never raises.
+        ``namespace`` (ADR 0069 D3a) filters BOTH rankings, so a fused hit can
+        never come from outside the requested scope. Superseded rows
+        (``invalidated_at``, ADR 0069 D9) are likewise excluded from BOTH
+        rankings by default; ``include_invalidated=True`` is the audit escape
+        hatch. ``epoch`` (#1634) likewise filters BOTH rankings — an
+        out-of-era chunk can't surface as a vector-only hit.
         """
         if not query or not query.strip():
             return []
 
-        base = super().search(query, k=self._vector_k, domain=domain)
+        base = super().search(
+            query,
+            k=self._vector_k,
+            domain=domain,
+            namespace=namespace,
+            include_invalidated=include_invalidated,
+            epoch=epoch,
+        )
         query_vec = self._embed(query)
         if query_vec is None:
             return base[:k]
 
-        vec_ids = self._vector_search(query_vec, self._vector_k, domain)
+        vec_ids = self._vector_search(query_vec, self._vector_k, domain, namespace, include_invalidated, epoch)
         if not vec_ids:
             return base[:k]
 

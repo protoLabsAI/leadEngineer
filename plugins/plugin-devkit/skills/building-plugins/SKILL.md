@@ -74,9 +74,31 @@ views:                      # console rail view (ADR 0026/0038) — a sandboxed 
   - { id: board, label: "Board", icon: LayoutDashboard, path: /plugins/my-plugin/board }
 emits: ["my-plugin.updated"]     # event-bus topics you broadcast (ADR 0039; optional, for discovery)
 subscribes: ["other-plugin.*"]   # topics you listen for
-requires_pip: ["httpx>=0.27"]   # deps — declared, NOT auto-installed (ADR 0027)
+requires_pip:                    # deps — declared, NOT auto-installed (ADR 0027)
+  - "httpx>=0.27"                          # hard: gates the frozen desktop install (ADR 0058 D2)
+  - { pkg: "pillow>=10", optional: true }  # optional (#1953): missing → warn, feature degrades
 repository: https://github.com/owner/my-plugin
 ```
+
+**Optional deps pair with lazy-import degradation.** Mark a dep `optional: true`
+only if the plugin genuinely runs without it: import it **inside** the tool body
+(never at module top) and catch `ImportError` to return a readable error naming
+the fix, so the plugin's other tools keep working:
+
+```python
+@tool
+async def resize_image(path: str) -> str:
+    """Resize an image."""
+    try:
+        from PIL import Image
+    except ImportError:
+        return "resize_image needs pillow — run: python -m server plugin install-deps my-plugin"
+    ...
+```
+
+A missing hard dep refuses the frozen (desktop) install outright; a missing
+optional dep installs with a warning, and `install-deps` treats it best-effort
+(a failed optional install warns instead of failing).
 
 ## 4. Write `register(registry)`
 The registry collects code contributions (mounted once at init):
@@ -125,15 +147,61 @@ functions/tools) so your plugin still loads + tests host-free. The surface:
   KNOBS = Knobs().define("min_margin", 30, lo=0).preset("trade-max", {"min_margin": 20})
   registry.register_tools(make_knob_tools(KNOBS, prefix="fleet"))
   ```
-- **A self-driving goal loop (OODA)** — `start_goal_loop(…)`: set a monitor goal verified by
-  your plugin verifier **and** schedule a recurring tick that drives it until the verifier
-  passes — in one call (`stop_goal_loop` to tear down, e.g. from an `on_achieved` hook). Register
-  the verifier + hook in `register()` first; pass `session_id` from your tool's `InjectedState`.
+- **Hand the user a generated file (image/audio/video)** — `registry.save_media(data, mime, meta=None)` (#1929):
+  persists the bytes (or a source file path) into the core media store and returns a
+  `MediaRef {id, url, path, mime}`. Embed `ref.url` in the tool's returned markdown and the
+  console renders it inline — no plugin-owned route, no UI change. The URL carries a per-file
+  HMAC signature, so inline `<img>` rendering works even on a bearer-gated deployment; files
+  land under the instance data dir and survive restart (`media.retention_days` prunes,
+  `media.public` opts the store public). A `media.saved` bus event fires per save. Pairs with
+  `multimodal_tool_result` below: save for the *user*, envelope for the *model*.
   ```python
-  from graph.sdk import start_goal_loop
-  start_goal_loop(session_id=sid, goal="reach 1M credits",
-                  verifier="fleet:credits", verifier_args={"min": 1_000_000},
-                  every="30m", prompt="Run the OODA tick and report.")
+  @tool
+  async def generate_image(prompt: str) -> str:
+      """Generate an image and show it in chat."""
+      png = await _generate(prompt)                      # bytes
+      ref = registry.save_media(png, "image/png", {"prompt": prompt})
+      return f"![{prompt}]({ref.url})"
+  ```
+- **Return an image the model can SEE** — `multimodal_tool_result(caption, images=[…])` (#1930):
+  a tool that just produced an image (a render, a chart, a screenshot) returns this instead of a
+  path string. On a vision model (`model.vision: true`) the image rides the ToolMessage as
+  content blocks the model actually looks at — enabling generate → look → refine loops; on a
+  text-only model it degrades to the caption (plus a description via
+  `knowledge.image_describe_model`, when configured). Each image is `{"path": p}` or
+  `{"b64": data}` + optional `"mime"` (default `image/png`). Limits: `MAX_IMAGES_PER_RESULT`
+  (3) images per result, `MAX_IMAGE_BYTES` (2 MiB) decoded per image — downscale in the tool.
+  ```python
+  from graph.sdk import multimodal_tool_result
+
+  @tool
+  async def render_chart(spec: str) -> str:
+      """Render the chart and show it to the model."""
+      path = _render(spec)
+      return multimodal_tool_result("Rendered chart:", images=[{"path": path}])
+  ```
+- **A self-driving goal loop (OODA)** — `start_goal_loop(…)` (#2060): arm a **watch** on the
+  goal, verified by your plugin verifier, **and** schedule the recurring tick that drives it —
+  in one call. Sugar over `create_watch` + `schedule_recurring` under a shared derived id
+  (goals themselves are drive-only since ADR 0067 — the "wait for the metric" half is a
+  watch). Register the verifier + an `on_met` watch hook in `register()` first; the hook
+  calling `stop_goal_loop` is what retires the cadence when the verifier passes. Pass
+  `session_id` from your tool's `InjectedState`.
+  ```python
+  from graph.sdk import start_goal_loop, stop_goal_loop
+
+  start_goal_loop(goal="reach 1M credits", verifier="fleet:credits",
+                  verifier_args={"min": 1_000_000}, every="30m",
+                  prompt="Run the OODA tick and report.",
+                  plugin_id=registry.plugin_id, loop_id="credits-1m",
+                  session_id=sid)
+
+  # in register(): the self-retiring half
+  PREFIX = "fleet:goal-loop:"
+  async def on_met(watch):
+      if watch.id.startswith(PREFIX):
+          stop_goal_loop(plugin_id="fleet", loop_id=watch.id.removeprefix(PREFIX))
+  registry.register_watch_hook(on_met=on_met)
   ```
 - **Observability** — `DecisionLog` (an audit trail of what the agent changed, and why),
   `telemetry(…)` (the standard status/metrics/hints/decisions envelope), `render_html(env)` (a
@@ -183,6 +251,13 @@ its behaviour. So you no longer have to extract logic into dependency-free modul
 test it; keeping host-only imports lazy is still good practice but no longer a hard
 requirement. In-repo (bundled) plugins import the same testkit directly:
 `from graph.plugins.testkit import load_plugin, install_host_stubs, FakeRegistry`.
+
+`FakeRegistry` mirrors **every** public `PluginRegistry` method (a parity test in core
+enforces it), so run `register()` against it bare — no `hasattr` guards — and assert every
+contribution: `reg.tools`, `reg.chat_commands["issue"]`, `reg.subagents`, … . Where the live
+registry warns-and-skips an invalid registration (a chat command named `goal` — reserved,
+an unslugifiable name, a duplicate token), the fake **raises `ValueError`**, so a typo'd
+registration fails your suite instead of shipping green.
 
 From the shell (no agent): `python -m server plugin new "My Plugin" --view --skill --tests`
 scaffolds the skeleton; `plugin new-bundle "My Stack" --member id=url@ref --builtin delegates`

@@ -1,0 +1,582 @@
+import { useEffect, useState } from "react";
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Alert } from "@protolabsai/ui/data";
+import { Input, Textarea } from "@protolabsai/ui/forms";
+import { PanelHeader, Tabs } from "@protolabsai/ui/navigation";
+import { ConfirmDialog, Dialog, Tooltip, useToast } from "@protolabsai/ui/overlays";
+import { Badge, Button, Empty } from "@protolabsai/ui/primitives";
+import { Flame, History, Pencil, Syringe, Trash2 } from "lucide-react";
+
+import { RefreshButton } from "../app/ui-kit";
+import { openDocument } from "../docviewer";
+import { api } from "../lib/api";
+import { ago, bytes, errMsg } from "../lib/format";
+import { queryKeys } from "../lib/queries";
+import type {
+  MemoryHotChunk,
+  MemoryInjectionDetail,
+  MemoryInjectionRow,
+  MemorySessionDigest,
+} from "../lib/types";
+
+import { injectionSummary } from "./injectionSummary";
+import "./memory.css";
+
+// Memory inspector (ADR 0069 D7) — the audit surface over the memory DELIVERY
+// layer: which session summaries feed the <prior_sessions> digest, which hot
+// chunks ride every turn, and (D6) exactly which memory items entered which
+// turn. A security control first — SpAIware-class memory poisoning gets
+// *detected* here — UX second, so the panels favor raw ids/timestamps over
+// polish. Distinct from Knowledge → Store (the whole KB): this is only what
+// auto-injects.
+
+type MemoryTab = "sessions" | "hot" | "injections";
+
+const TABS: { id: MemoryTab; label: string; icon: React.ReactNode }[] = [
+  { id: "sessions", label: "Sessions", icon: <History size={15} /> },
+  { id: "hot", label: "Hot memory", icon: <Flame size={15} /> },
+  { id: "injections", label: "Injections", icon: <Syringe size={15} /> },
+];
+
+export function MemorySurface() {
+  const [tab, setTab] = useState<MemoryTab>("sessions");
+  // Set by a session row's "injections" jump — pre-filters the Injections panel.
+  const [injectionFilter, setInjectionFilter] = useState("");
+
+  return (
+    <section className="panel stage-panel memory-panel" data-testid="memory-surface">
+      <PanelHeader
+        title="Memory"
+        kicker="what auto-injects into the agent's turns — inspect, audit, prune"
+      />
+      {/* Not `responsive`: this surface lives on the main stage (wide), and the
+          deterministic role="tab" strip keeps the e2e + a11y contract simple. */}
+      <Tabs
+        active={tab}
+        onSelect={(t) => setTab(t as MemoryTab)}
+        items={TABS.map((t) => ({ id: t.id, label: t.label, icon: t.icon }))}
+        ariaLabel="Memory sections"
+      />
+      <div className="stage-body">
+        {tab === "sessions" ? (
+          <SessionsPanel
+            onShowInjections={(sid) => {
+              setInjectionFilter(sid);
+              setTab("injections");
+            }}
+          />
+        ) : tab === "hot" ? (
+          <HotMemoryPanel />
+        ) : (
+          <InjectionsPanel filter={injectionFilter} setFilter={setInjectionFilter} />
+        )}
+      </div>
+    </section>
+  );
+}
+
+// ── Sessions — the summaries behind the <prior_sessions> digest ───────────────
+
+function SessionsPanel({ onShowInjections }: { onShowInjections: (sid: string) => void }) {
+  const qc = useQueryClient();
+  const toast = useToast();
+  const { data, isFetching, error, refetch } = useQuery({
+    queryKey: queryKeys.memorySessions,
+    queryFn: () => api.memorySessions(),
+  });
+  const sessions = data?.sessions ?? [];
+  const [pendingDelete, setPendingDelete] = useState<MemorySessionDigest | null>(null);
+
+  const del = useMutation({
+    mutationFn: (sid: string) => api.deleteMemorySession(sid),
+    onSuccess: (_r, sid) => {
+      toast({ tone: "success", title: "Memory", message: `Session summary ${sid} deleted.` });
+      void qc.invalidateQueries({ queryKey: queryKeys.memorySessions });
+    },
+    onError: (e) => toast({ tone: "error", title: "Memory", message: errMsg(e) }),
+  });
+
+  // Open the FULL summary (the render recall_session returns) in the document
+  // viewer. It's the raw <session> record — show it verbatim in a <pre>, never
+  // as markdown (an ingested summary could otherwise smuggle live HTML).
+  async function openSession(row: MemorySessionDigest) {
+    try {
+      const r = await api.memorySession(row.session_id);
+      openDocument({
+        title: row.session_id,
+        subtitle: `${row.surface} · ${row.timestamp} · ${row.message_count} msgs`,
+        render: () => <pre className="memory-session-pre">{r.session.rendered || "(empty summary)"}</pre>,
+      });
+    } catch (e) {
+      toast({ tone: "error", title: "Memory", message: errMsg(e) });
+    }
+  }
+
+  return (
+    <>
+      <div className="memory-panel-head">
+        <p className="memory-panel-hint">
+          Persisted session summaries. The <code>&lt;prior_sessions&gt;</code> digest the agent
+          sees each turn carries only the newest few (token-capped; background sessions
+          excluded) — badged rows are stored but not currently in it. Click a row for the full
+          summary (what <code>recall_session</code> returns); delete to forget a session.
+        </p>
+        <RefreshButton onClick={() => void refetch()} busy={isFetching} />
+      </div>
+      {error ? <Alert status="error">Couldn't list session summaries — {errMsg(error)}</Alert> : null}
+      {!error && sessions.length === 0 ? (
+        <Empty
+          title="No session summaries"
+          description="finished sessions persist a summary here; the digest stays empty until then."
+        />
+      ) : (
+        <ul className="playbook-list memory-list">
+          {sessions.map((s) => (
+            <li key={s.session_id} className="playbook-card memory-row">
+              <button
+                type="button"
+                className="memory-row-main"
+                title="Open the full summary in the reader"
+                onClick={() => void openSession(s)}
+              >
+                <span className="memory-row-title">
+                  <Badge status="neutral">{s.surface}</Badge>
+                  <code>{s.session_id}</code>
+                  {/* Only an explicit false draws the badge — an older backend omits
+                      the field entirely, and unknown must not read as "excluded". */}
+                  {s.in_digest === false ? (
+                    <span title="Outside the current digest window (the newest summaries under the token cap; background sessions excluded) — stored, but not in the <prior_sessions> digest the agent sees.">
+                      <Badge status="warning">not in digest</Badge>
+                    </span>
+                  ) : null}
+                </span>
+                <span className="memory-row-topic">{s.topic || "(no user message)"}</span>
+                <span className="memory-row-meta">
+                  {s.timestamp !== "unknown" ? ago(s.timestamp) : "unknown"} · {s.message_count} msgs
+                  {typeof s.size_bytes === "number" ? <> · {bytes(s.size_bytes)}</> : null}
+                </span>
+              </button>
+              <span className="knowledge-chunk-actions">
+                <Button
+                  icon
+                  variant="ghost"
+                  type="button"
+                  title="Show what this session's turns injected"
+                  aria-label={`injections for ${s.session_id}`}
+                  onClick={() => onShowInjections(s.session_id)}
+                >
+                  <Syringe size={14} />
+                </Button>
+                <Button
+                  icon
+                  variant="ghost"
+                  type="button"
+                  title="Delete this session summary (drops it from the digest)"
+                  aria-label={`delete session ${s.session_id}`}
+                  onClick={() => setPendingDelete(s)}
+                >
+                  <Trash2 size={14} />
+                </Button>
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+      <ConfirmDialog
+        open={pendingDelete !== null}
+        title="Delete this session summary?"
+        confirmLabel="Delete summary"
+        destructive
+        onConfirm={() => {
+          if (pendingDelete) del.mutate(pendingDelete.session_id);
+          setPendingDelete(null);
+        }}
+        onClose={() => setPendingDelete(null)}
+      >
+        {pendingDelete
+          ? `"${pendingDelete.session_id}" leaves the <prior_sessions> digest and recall_session — the agent will no longer know of this session. Takes effect within about a minute (the digest is cached per turn loop). This can't be undone.`
+          : undefined}
+      </ConfirmDialog>
+    </>
+  );
+}
+
+// ── Hot memory — the domain="hot" chunks injected every turn ─────────────────
+
+function HotMemoryPanel() {
+  const qc = useQueryClient();
+  const toast = useToast();
+  const { data, isFetching, error, refetch } = useQuery({
+    queryKey: queryKeys.memoryHot,
+    queryFn: () => api.memoryHot(),
+  });
+  const enabled = data?.enabled ?? true;
+  const chunks = data?.chunks ?? [];
+  const [pendingDelete, setPendingDelete] = useState<MemoryHotChunk | null>(null);
+  const [editingId, setEditingId] = useState<number | null>(null);
+  const [draft, setDraft] = useState("");
+  const invalidate = () => void qc.invalidateQueries({ queryKey: queryKeys.memoryHot });
+
+  // Both write routes answer 200 with enabled:false when the knowledge store went
+  // off AFTER this list rendered (settings hot-reload / restart; the list has no
+  // focus-refetch so it goes stale silently) — the write was DROPPED, and the
+  // refetch below swaps the panel to the store-off notice.
+  const storeOffToast = (verb: string) =>
+    toast({
+      tone: "error",
+      title: "Memory",
+      message: `The knowledge store is off — nothing was ${verb} (enable middleware.knowledge).`,
+    });
+
+  const del = useMutation({
+    mutationFn: (id: number) => api.deleteMemoryHot(id),
+    onSuccess: (r) => {
+      if (r.enabled === false) storeOffToast("deleted");
+      else toast({ tone: "success", title: "Memory", message: "Hot-memory entry deleted." });
+      invalidate();
+    },
+    onError: (e) => toast({ tone: "error", title: "Memory", message: errMsg(e) }),
+  });
+
+  const save = useMutation({
+    mutationFn: ({ id, content }: { id: number; content: string }) =>
+      api.updateMemoryHot(id, { content }),
+    onSuccess: (r) => {
+      if (r.enabled === false) {
+        // Store-off branch ({enabled:false, id:null, replaced:false}) — must win
+        // over the replaced check: nothing was updated and nothing injects, so
+        // the stale-revision warning below would be false in every clause.
+        storeOffToast("saved");
+      } else if (r.replaced === false) {
+        // The edit is add-new-then-delete-old server-side; replaced:false means the
+        // old revision survived, so BOTH rows sit in the store until one is pruned.
+        toast({
+          tone: "warning",
+          title: "Memory",
+          message:
+            "Updated, but the old revision couldn't be removed; both may inject — delete the stale row.",
+        });
+      } else {
+        toast({ tone: "success", title: "Memory", message: "Hot-memory entry updated." });
+      }
+      setEditingId(null);
+      setDraft("");
+      invalidate();
+    },
+    onError: (e) => toast({ tone: "error", title: "Memory", message: errMsg(e) }),
+  });
+
+  return (
+    <>
+      <div className="memory-panel-head">
+        <p className="memory-panel-hint">
+          Always-on memory — the <em>newest</em> entries (roughly 100, under a small character
+          budget) are injected into every turn; older rows are backlog that no longer injects.
+          Keep it small; anything wrong or planted in the window steers the agent until it's
+          removed.
+        </p>
+        <RefreshButton onClick={() => void refetch()} busy={isFetching} />
+      </div>
+      {error ? <Alert status="error">Couldn't list hot memory — {errMsg(error)}</Alert> : null}
+      {!enabled ? (
+        <Empty>
+          The knowledge store is off (enable <code>middleware.knowledge</code>).
+        </Empty>
+      ) : !error && chunks.length === 0 ? (
+        <Empty
+          title="No hot memory"
+          description="the agent (or you, via the Knowledge surface with domain 'hot') hasn't pinned any always-on memory."
+        />
+      ) : (
+        <ul className="playbook-list memory-list">
+          {chunks.map((c) => (
+            <li key={c.id} className="playbook-card memory-row">
+              {editingId === c.id ? (
+                <div className="memory-edit-form">
+                  <Textarea
+                    rows={3}
+                    value={draft}
+                    onChange={(e) => setDraft(e.target.value)}
+                    aria-label={`hot entry ${c.id} content`}
+                  />
+                  <div className="memory-edit-actions">
+                    <Button
+                      type="button"
+                      variant="primary"
+                      size="sm"
+                      disabled={save.isPending || !draft.trim()}
+                      onClick={() => save.mutate({ id: c.id, content: draft })}
+                    >
+                      Save
+                    </Button>
+                    <Button type="button" variant="ghost" size="sm" onClick={() => setEditingId(null)}>
+                      Cancel
+                    </Button>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <div className="memory-row-main memory-row-static">
+                    <span className="memory-row-title">
+                      {c.heading ? <strong>{c.heading}</strong> : null}
+                      {c.source ? (
+                        <span title="provenance — the session/source that wrote this row">
+                          <Badge status="neutral">{c.source}</Badge>
+                        </span>
+                      ) : null}
+                      {/* Only an explicit false draws the badge — an older backend
+                          (or a custom store) omits the field, and unknown must not
+                          read as "outside the window". */}
+                      {c.injecting === false ? (
+                        <span title="Outside the injection window — only the newest hot entries under the character budget ride each turn; this row is kept but not currently sent to the agent.">
+                          <Badge status="warning">not injecting</Badge>
+                        </span>
+                      ) : null}
+                    </span>
+                    <span className="memory-row-topic">{c.content || c.preview}</span>
+                    <span className="memory-row-meta">{ago(c.created_at)}</span>
+                  </div>
+                  <span className="knowledge-chunk-actions">
+                    <Button
+                      icon
+                      variant="ghost"
+                      type="button"
+                      title="Edit this hot-memory entry"
+                      aria-label={`edit hot entry ${c.id}`}
+                      onClick={() => {
+                        setEditingId(c.id);
+                        setDraft(c.content || "");
+                      }}
+                    >
+                      <Pencil size={14} />
+                    </Button>
+                    <Button
+                      icon
+                      variant="ghost"
+                      type="button"
+                      title="Delete this hot-memory entry outright"
+                      aria-label={`delete hot entry ${c.id}`}
+                      onClick={() => setPendingDelete(c)}
+                    >
+                      <Trash2 size={14} />
+                    </Button>
+                  </span>
+                </>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+      <ConfirmDialog
+        open={pendingDelete !== null}
+        title="Delete this hot-memory entry?"
+        confirmLabel="Delete entry"
+        destructive
+        onConfirm={() => {
+          if (pendingDelete) del.mutate(pendingDelete.id);
+          setPendingDelete(null);
+        }}
+        onClose={() => setPendingDelete(null)}
+      >
+        {/* Effect copy tracks the row's injection-window state — a backlog row
+            (badged "not injecting") isn't being sent to the agent, so claiming
+            the delete "stops injecting" would contradict its own badge. */}
+        {pendingDelete
+          ? `"${(pendingDelete.heading || pendingDelete.content || pendingDelete.preview || "").slice(0, 80)}" is removed from hot memory${
+              pendingDelete.injecting === false
+                ? " — it's outside the injection window, so nothing the agent currently sees changes"
+                : pendingDelete.injecting === true
+                  ? " and stops injecting into the agent's turns"
+                  : ""
+            }. This can't be undone.`
+          : undefined}
+      </ConfirmDialog>
+    </>
+  );
+}
+
+// ── Injections — which memory entered which turn (ADR 0069 D6) ───────────────
+
+function InjectionsPanel({ filter, setFilter }: { filter: string; setFilter: (v: string) => void }) {
+  // Local echo of the filter so typing paints instantly; the lifted filter (and
+  // with it the query key) only changes after the debounce, so a fast typist
+  // doesn't fire a request per keystroke. Mount seeds from the lifted value —
+  // the Sessions panel's "injections" jump pre-fills it before switching tabs.
+  const [input, setInput] = useState(filter);
+  useEffect(() => {
+    const t = window.setTimeout(() => setFilter(input), 250);
+    return () => window.clearTimeout(t);
+  }, [input, setFilter]);
+
+  const { data, isFetching, error, refetch } = useQuery({
+    queryKey: [...queryKeys.memoryInjections, filter] as const,
+    queryFn: () => api.memoryInjections(filter, 100),
+    // Keep the last page while the filtered fetch is in flight — otherwise the
+    // table flashes the "no recorded turns" empty state on every filter change.
+    placeholderData: keepPreviousData,
+  });
+  const rows = data?.injections ?? [];
+
+  // The record whose detail dialog is open (null = closed). The dialog resolves
+  // this record's ids → their actual content on open.
+  const [openRow, setOpenRow] = useState<MemoryInjectionRow | null>(null);
+
+  return (
+    <>
+      <div className="memory-panel-head">
+        <p className="memory-panel-hint">
+          What the agent pulled into memory for each turn — click a row to see exactly what.
+        </p>
+        <RefreshButton onClick={() => void refetch()} busy={isFetching} />
+      </div>
+      <Input
+        type="search"
+        placeholder="Filter by exact chat/session id (blank = all)…"
+        value={input}
+        onChange={(e) => setInput(e.target.value)}
+        aria-label="filter injections by session id"
+      />
+      {error ? <Alert status="error">Couldn't read the memory record — {errMsg(error)}</Alert> : null}
+      {!error && rows.length === 0 ? (
+        <Empty
+          title="Nothing here yet"
+          description={
+            filter ? "no turns recorded for that id." : "each turn the agent takes shows up here."
+          }
+        />
+      ) : (
+        <table className="memory-injections">
+          <thead>
+            <tr>
+              <th>when</th>
+              <th>what it used</th>
+              <th>context</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr
+                key={r.id}
+                className="memory-injections-row"
+                role="button"
+                tabIndex={0}
+                aria-label={`${ago(r.ts)} — used ${injectionSummary(r)}; open details`}
+                onClick={() => setOpenRow(r)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    setOpenRow(r);
+                  }
+                }}
+              >
+                <td>
+                  {/* DS Tooltip (never HTML title=) surfaces the exact timestamp. */}
+                  <Tooltip label={r.ts}>
+                    <span>{ago(r.ts)}</span>
+                  </Tooltip>
+                </td>
+                <td className="memory-injections-what">{injectionSummary(r)}</td>
+                <td className="memory-injections-context">~{r.approx_tokens} tokens</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+      {openRow ? <InjectionDetailDialog row={openRow} onClose={() => setOpenRow(null)} /> : null}
+    </>
+  );
+}
+
+// The click-through detail: resolves ONE injection record's ids into the actual
+// items the turn used, grouped (past conversations · memories · docs). Fetches
+// on open (the table itself needs no resolve — its counts are the id arrays).
+function InjectionDetailDialog({
+  row,
+  onClose,
+}: {
+  row: MemoryInjectionRow;
+  onClose: () => void;
+}) {
+  const { data, isLoading, error } = useQuery({
+    queryKey: queryKeys.memoryInjectionDetail(row.id),
+    queryFn: () => api.memoryInjectionDetail(row.id),
+  });
+
+  return (
+    <Dialog open onClose={onClose} title="What this turn used" width="min(560px, 94vw)">
+      {/* Time + cost render immediately from the row we already have. */}
+      <p className="memory-detail-meta">
+        {ago(row.ts)} · ~{row.approx_tokens} tokens
+      </p>
+      {isLoading ? (
+        <p className="memory-panel-hint">Loading the details…</p>
+      ) : error ? (
+        <Alert status="error">Couldn't load the details — {errMsg(error)}</Alert>
+      ) : data ? (
+        <InjectionDetailBody detail={data} />
+      ) : null}
+    </Dialog>
+  );
+}
+
+function InjectionDetailBody({ detail }: { detail: MemoryInjectionDetail }) {
+  const isEmpty =
+    detail.past_sessions.length === 0 && detail.memories.length === 0 && detail.docs.length === 0;
+  if (isEmpty) {
+    return <p className="memory-panel-hint">This turn didn't pull in any stored memory.</p>;
+  }
+  return (
+    <div className="memory-detail">
+      {detail.past_sessions.length ? (
+        <section className="memory-detail-group">
+          <h4>Past conversations ({detail.past_sessions.length})</h4>
+          <ul>
+            {detail.past_sessions.map((s) => (
+              <li key={s.id}>
+                <span className="memory-detail-line">{s.title || s.id}</span>
+              </li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
+      {detail.memories.length ? (
+        <section className="memory-detail-group">
+          <h4>Memories ({detail.memories.length})</h4>
+          <ul>
+            {detail.memories.map((m) => (
+              <li key={m.id}>
+                {m.unavailable ? (
+                  <span className="memory-detail-gone">no longer stored</span>
+                ) : (
+                  <>
+                    {m.heading ? <strong className="memory-detail-heading">{m.heading}</strong> : null}
+                    {m.snippet ? <span className="memory-detail-snippet">{m.snippet}</span> : null}
+                  </>
+                )}
+              </li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
+      {detail.docs.length ? (
+        <section className="memory-detail-group">
+          <h4>Docs ({detail.docs.length})</h4>
+          <ul>
+            {detail.docs.map((d) => (
+              <li key={d.id}>
+                {d.unavailable ? (
+                  <span className="memory-detail-gone">no longer stored</span>
+                ) : (
+                  <>
+                    {d.source ? <span className="memory-detail-source">{d.source}</span> : null}
+                    {d.snippet ? <span className="memory-detail-snippet">{d.snippet}</span> : null}
+                  </>
+                )}
+              </li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
+    </div>
+  );
+}

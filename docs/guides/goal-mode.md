@@ -29,6 +29,8 @@ It's modelled on protocli's goal system but deliberately more rigorous for a lon
 
 The loop wraps graph invocation in `server/chat.py` (both the A2A streaming path and the non-streaming chat path); the graph itself is unchanged.
 
+**Yield instead of spin (ADR 0079).** If the agent's next step waits on async or delegated work — a build, a peer agent, CI, a review — it doesn't have to burn iterations polling. It hands off to a [watch](/guides/watches) or a [schedule](/guides/scheduler) and ends the turn; the drive **pauses** (the goal stays `active`, iterations untouched) and **resumes automatically** when the trigger fires (`⏸ goal paused — handed off to a watch/schedule`). This is what lets a long, delegated goal span time instead of exhausting its budget waiting. Goals, tasks, watches, and schedules compose into one OODA loop over the agent's durable working-state — see [ADR 0079](/adr/0079-autonomous-operating-model).
+
 ## Setting a goal
 
 Send a control message through any channel (A2A, the React console chat, OpenAI-compat):
@@ -60,7 +62,7 @@ In the React console, typing `/` in the chat composer opens a command
 autocomplete (served from `GET /api/chat/commands`) so `/goal` is discoverable;
 ↑/↓ to pick, Enter/Tab to insert.
 
-Programmatic status/clear is also available: `GET /api/goal/{session_id}` and `DELETE /api/goal/{session_id}`.
+Programmatic status/clear is also available: `GET /api/goals/{session_id}` and `DELETE /api/goals/{session_id}`.
 
 ## Manage from the console
 
@@ -76,7 +78,7 @@ Goals are still *set* in chat with `/goal` (setting can run shell/test verifiers
 
 ## Reacting to a goal
 
-A terminal goal is a **trigger**, not just a checkbox. Every finish publishes one of two events on the [event bus](/guides/plugins#events-the-plugin-bus) (ADR 0039):
+A terminal goal is a **trigger**, not just a checkbox. Every finish publishes one of two events on the [event bus](/guides/plugins#event-bus) (ADR 0039):
 
 | Topic | When | Payload |
 |---|---|---|
@@ -105,7 +107,7 @@ def register(registry):
     registry.register_goal_hook(on_achieved=on_achieved)
 ```
 
-Pass `job_id=` to make the re-arm idempotent, or `delay_seconds=` to defer the turn. This is the *reaction* half of the self-improving loop: `sdk.start_goal_loop` **drives** a goal; a hook + `run_in_session` **reacts** when it lands.
+Pass `job_id=` to make the re-arm idempotent, or `delay_seconds=` to defer the turn. This is the *reaction* half of the self-improving loop: a recurring cadence **drives** the work (`sdk.start_goal_loop` arms one against a watch-verified target — ADR 0067/#2060); a hook + `run_in_session` **reacts** when it lands.
 
 ## Verifier types
 
@@ -117,6 +119,7 @@ Set via `verifier.type` in the JSON spec:
 | `test` | same as `command` | exits `0` (the runner's summary line is surfaced in the reason) |
 | `ci` | `pr` **or** `branch` | `gh pr checks <pr>` is all-green, or the latest run on `branch` concluded `success` |
 | `data` | `path` + (`contains` **or** `expr`) | the file contains the substring, or `expr` (evaluated over parsed JSON as `data`) is truthy |
+| `plugin` | `check` (`<plugin-id>:<name>`) + `args?` | the plugin-registered verifier returns met — see [Plugins ▸ Goal & watch verifiers](/guides/plugins#goal-and-watch-verifiers) for `register_goal_verifier` and the `(spec, ctx)` contract (incl. `ctx.invoker`, the polling goal/watch's identity) |
 | `llm` | — (uses `condition`) | a strict evaluator judges the transcript shows the goal demonstrably done (fuzzy fallback) |
 
 `data` `expr` runs in a restricted namespace — the parsed document is `data`, with only read-only builtins (`len`, `any`, `all`, `sum`, …). `__import__`, `open`, `eval`, etc. are unavailable.
@@ -130,7 +133,7 @@ Examples:
 
 ## The running plan (`update_goal_plan`)
 
-Continuation prompts ask the agent to keep a running plan and record it each turn by calling the **`update_goal_plan`** tool. The controller persists that plan with the goal state (fresh-context goals write it to a durable plan artifact) and feeds it back into the next continuation — so the agent maintains a coherent plan across iterations instead of re-planning from scratch. To stop early when the goal is impossible or out of scope, the agent calls **`abandon_goal`** with a reason (honoured only after the verifier runs, so a goal the world already satisfies still finishes `achieved`). Both tools are bound whenever goal mode is on and are harmless no-ops outside a goal.
+Continuation prompts ask the agent to keep a running plan and record it each turn by calling the **`update_goal_plan`** tool. The controller persists that plan to a durable plan artifact for **every** goal and feeds it back into the next continuation — so the agent maintains a coherent plan across iterations instead of re-planning from scratch. (ADR 0079 unified this: the plan used to be written durably only for `fresh_context` goals, so a default same-session goal maintained a plan that `read_plan()` never saw.) The plan is injected back each turn as part of the agent's `<working_state>` block, and it doubles as the **`orient`** signal in the [fleet trace export](/adr/0079-autonomous-operating-model): a goal that maintains a real plan emits `loop_shape=ooda` training rows; a goal with no plan is labelled `react`. To stop early when the goal is impossible or out of scope, the agent calls **`abandon_goal`** with a reason (honoured only after the verifier runs, so a goal the world already satisfies still finishes `achieved`). Both tools are bound whenever goal mode is on and are harmless no-ops outside a goal.
 
 ## Configuration
 
@@ -139,3 +142,5 @@ See the [`goal` config block](/reference/configuration#goal). Defaults: machiner
 ## Security
 
 `command` / `test` / `ci` verifiers execute on the server host with the agent's privileges. **Setting a goal is an operator action** — only accept goal specs from trusted callers. If you expose `/goal` to untrusted input, restrict it to `data` / `llm` verifiers or gate goal-setting behind auth.
+
+> **`data`-verifier path must sit inside the agent's writable workspace when the goal is agent-completed over untrusted `/goal`.** The agent's `read_file`/`write_file` tools are rooted at its `workspace` project (`/sandbox/workspace/`) and **cannot reach the parent** — `../x` → *"path escapes project 'workspace'"* — and the shell fallback that could write elsewhere is **declined** for an untrusted caller (no operator present to approve it). So a verifier pointed at `/sandbox/report.md` will never flip: the agent writes to `/sandbox/workspace/report.md` and the verifier reads a path it can't produce. Point the `path` at `/sandbox/workspace/…`. (This is by design — the deterministic verifier, not the agent's own "done" self-report, is the sole arbiter, so a mispathed artifact correctly leaves the goal unverified.)

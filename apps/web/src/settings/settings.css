@@ -9,6 +9,16 @@
 }
 /* QuickSetting dialog (ADR 0048) — contextual settings shortcut. Reuses the
    .setting-row chrome; the dialog just stacks the rows with breathing room. */
+
+/* Cap the dialog well short of the viewport (the DS default max-height is ~full height, so a
+   handful of fields make it tower over the surface it popped from). The DS body already scrolls
+   (overflow-y:auto), so overflow just scrolls inside the cap. Two-class selector so it beats the
+   DS `.pl-dialog` max-height regardless of stylesheet load order (both classes ride the same
+   element). */
+.pl-dialog.quick-setting-dialog {
+  max-height: min(72vh, 620px);
+  max-height: min(72dvh, 620px);
+}
 .quick-setting-body {
   display: flex;
   flex-direction: column;
@@ -23,9 +33,18 @@
   white-space: nowrap;
 }
 .quick-setting-body .setting-row {
+  /* The base .setting-row is `display: grid` with a 220–320px control column — right for a text
+     input on the wide settings page, but in the narrow dialog it starves the meta column, so a
+     long field description wraps into a tall one-word-per-line sliver. This override always MEANT
+     to stack the row (per the comment above), but `flex-direction: column` is inert on a grid, so
+     the grid + its wide control column stayed in effect. Switch to a real flex column: label +
+     FULL-WIDTH description, then the control below — shorter overall, and works for every control
+     type (toggle / input / select). */
+  display: flex;
   flex-direction: column;
   align-items: stretch;
   gap: 6px;
+  padding: 16px 4px;
 }
 
 /* ── Settings shell: DS SideNav rail + content ───────────────────────────────
@@ -75,6 +94,34 @@
   .settings-content .setting-input { max-width: none; }
 }
 
+/* Phones: the two-column shell can't fit a 200px rail + readable content in a ~360px
+   overlay, so stack it — the SideNav (rendered `responsive` on mobile, see
+   SettingsSurface) becomes a full-width <select> on top, content fills the width below.
+   The DS collapse is a 15rem container query on the rail's own width; the stacked rail is
+   full-width (> 15rem) so that query never fires — force the <select> by viewport instead. */
+@media (max-width: 767px) {
+  .settings-shell {
+    flex-direction: column;
+    gap: 10px;
+    padding-left: 0;
+  }
+  .settings-shell > .pl-sidenav-wrap {
+    flex: 0 0 auto;
+    width: 100%;
+    overflow: visible;
+    padding-right: 0;
+    padding-bottom: 10px;
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+  }
+  .settings-shell > .pl-sidenav-wrap--responsive > .pl-sidenav {
+    display: none;
+  }
+  .settings-shell > .pl-sidenav-wrap--responsive > .pl-sidenav__select {
+    display: block;
+  }
+}
+
 /* Collapsible field groups (DS Accordion, 0.29). Drop the default muted panel
    tint so field labels render at full contrast, and let the dirty-count badge sit
    inline in the trigger title. */
@@ -90,10 +137,21 @@
    full surface inside a dialog — drop the dialog's own body padding (the panels
    carry their own chrome). The settings overlay uses a FIXED-height, non-scrolling
    body so the shell's two columns scroll independently (rail stays put, content
-   scrolls); the theme quick dialog keeps the simple scroll-the-whole-body behavior. */
-.settings-overlay .pl-dialog__body {
+   scrolls); the theme quick dialog keeps the simple scroll-the-whole-body behavior.
+
+   `>` NOT a descendant combinator (#2019). A descendant selector also matched the
+   .pl-dialog__body of any dialog opened from INSIDE Settings (Add Delegate, plugin
+   install/settings, QuickSetting) — handing each one padding:0 + a forced 80vh +
+   overflow:hidden, i.e. zero padding and no scroll. @protolabsai/ui 0.56 since
+   portals overlays to <body> (`overlayPortal`), so nested dialogs are no longer
+   descendants and can't be captured this way again — but keep the `>`: it states
+   what the rule actually means (this dialog's OWN body). These classes ride the
+   .pl-dialog itself (cx("pl-dialog", className)), which travels with the portal, so
+   the body they target is always a direct child either way. */
+.settings-overlay > .pl-dialog__body {
   padding: 0;
   height: 80vh;
+  height: 80dvh; /* dvh so the overlay fits the visible viewport on mobile */
   overflow: hidden;
   /* Flex column so the shell (.settings-shell { flex: 1 }) fills the 80vh — without
      a flex parent the shell collapses to content height and the panel/rail don't
@@ -101,9 +159,10 @@
   display: flex;
   flex-direction: column;
 }
-.theme-quick-dialog .pl-dialog__body {
+.theme-quick-dialog > .pl-dialog__body {
   padding: 0;
   max-height: 80vh;
+  max-height: 80dvh;
   min-height: 50vh;
   overflow-y: auto;
 }
@@ -112,9 +171,6 @@
   border: 0;
   border-radius: 0;
   background: transparent;
-}
-.settings-group {
-  margin-bottom: 40px;
 }
 /* Per-group action row (e.g. the Discord "Test connection" + help link). */
 .settings-group-actions {
@@ -126,15 +182,6 @@
 .settings-inline-status {
   font-size: 0.8rem;
   color: var(--fg-muted);
-}
-.settings-group-title {
-  margin: 0 0 4px;
-  font-size: 0.72rem;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--brand-violet-light);
-  border-bottom: 1px solid var(--border);
-  padding-bottom: 8px;
 }
 .setting-row {
   display: grid;
@@ -206,4 +253,43 @@
 .settings-scope-badge {
   display: inline-flex;
   align-items: center;
+}
+
+/* Secrets manager status card (ADR 0080) — status + sync/test actions rendered as the
+   Secrets panel footer, below the schema-driven fields in the same stage panel. */
+.secrets-status {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border-top: 1px solid var(--border);
+  padding-top: 14px;
+  margin-top: 6px;
+}
+.secrets-status-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.secrets-status-actions {
+  display: flex;
+  gap: 8px;
+}
+.secrets-status-meta {
+  font-size: 0.8rem;
+  color: var(--fg-secondary);
+}
+.secrets-status-vars {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.secrets-status-vars code {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--fg-secondary);
 }

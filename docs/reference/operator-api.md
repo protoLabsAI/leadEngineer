@@ -33,9 +33,9 @@ is a map — `operator_api/*.py` is the source of truth for exact request/respon
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/api/goals` · `/api/goal/{session_id}` | List goals / get a session's goal |
+| GET | `/api/goals` · `/api/goals/{session_id}` | List goals / get a session's goal |
 | POST | `/api/goals` | Set a goal |
-| DELETE | `/api/goals/{session_id}` · `/api/goal/{session_id}` | Clear a goal |
+| DELETE | `/api/goals/{session_id}` | Clear a goal |
 
 ## Subagents & tools
 
@@ -52,6 +52,7 @@ is a map — `operator_api/*.py` is the source of truth for exact request/respon
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/api/background` | Background subagent jobs |
+| GET | `/api/background/{job_id}` | One job's full row by id (full result text; ADR 0070) |
 | POST | `/api/background/{job_id}/cancel` · `/api/background/clear` | Cancel one / clear finished |
 | DELETE | `/api/background/{job_id}` | Remove a job row |
 | GET · POST | `/api/scheduler/jobs` | List / create scheduled jobs |
@@ -65,9 +66,26 @@ is a map — `operator_api/*.py` is the source of truth for exact request/respon
 | POST | `/api/knowledge/ingest` | [Ingest](/guides/ingestion) a file / URL / text |
 | POST | `/api/knowledge/attach` | Attach a chat upload (tiered inline-vs-index) |
 | POST · PUT · DELETE | `/api/knowledge/chunks[/{id}]` | Add / edit / delete a chunk |
+| POST | `/api/knowledge/delete-by-source` · `/api/knowledge/restore-by-source` | Bulk soft-delete / restore every chunk from one ingest (reversible, grace-swept) |
 | GET | `/api/playbooks` · `/api/playbooks/{id}` | List / fetch skills ("playbooks") |
 | POST · PUT · DELETE | `/api/playbooks[/{id}]` | Create / edit / delete a skill |
 | POST | `/api/playbooks/{id}/promote` | Promote a private skill into the commons |
+
+## Memory inspector
+
+The audit surface for the memory delivery layer
+([ADR 0069](../adr/0069-memory-delivery-layer.md) D7): the persisted session
+summaries behind the `<prior_sessions>` digest, the hot-memory chunks (of which
+the newest ride each turn's injection window), and the per-turn injection
+record.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/memory/sessions` | List session summaries (digest fields: id, timestamp, surface, topic, message count, size, plus `in_digest`: whether the session is in the current `<prior_sessions>` injection window) |
+| GET · DELETE | `/api/memory/sessions/{session_id}` | Full rendered summary (what `recall_session` returns) / delete one |
+| GET | `/api/memory/hot` | List hot-memory chunks (`domain="hot"`); each row carries `injecting`: whether the chunk is in the current per-turn injection window (omitted on backends without the id-attributed reader) |
+| PUT · DELETE | `/api/memory/hot/{chunk_id}` | Edit (revision stays `hot`) / delete a hot chunk |
+| GET | `/api/memory/injections` | Per-model-call injection records ([ADR 0069](../adr/0069-memory-delivery-layer.md) D6), newest first: which digest sessions / hot chunk ids / RAG chunk ids entered each turn, at what approximate token cost. `?session_id=` filters to one session; `?limit=` clamps to 1–500 (default 50) |
 
 ## Activity, inbox & events
 
@@ -91,6 +109,7 @@ is a map — `operator_api/*.py` is the source of truth for exact request/respon
 | POST | `/api/config/models` · `/api/config/test-model` | List gateway models / test the connection |
 | GET | `/api/settings/schema` | Settings UI schema |
 | POST | `/api/settings` · `/api/settings/reset` | Apply / reset settings |
+| GET | `/api/operations` | The ops-layer catalog — every operation (name, read/write, summary); mirrors `protoagent operations` (ADR 0075 D2) |
 
 ## Fleet & agents
 
@@ -113,6 +132,7 @@ is a map — `operator_api/*.py` is the source of truth for exact request/respon
 | DELETE | `/api/plugins/{id}` | Uninstall |
 | POST | `/api/mcp/servers` · `/api/mcp/servers/import` | Add / import an MCP server |
 | DELETE | `/api/mcp/servers/{name}` | Remove an MCP server |
+| GET | `/api/mcp/catalog` · `/api/mcp/exposed` | Curated server catalog / operator-MCP tools this instance exposes (effective allowlist + profile) |
 
 ## Telemetry & theme
 

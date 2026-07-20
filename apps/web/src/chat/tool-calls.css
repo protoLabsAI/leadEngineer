@@ -169,6 +169,29 @@
   flex: none;
 }
 
+/* "Manage" deep-link to Tools settings (#1803) — icon-only, in the same header actions slot.
+   Quiet (muted, borderless) so it never competes with the tool's status; accent-toned on
+   hover to read as an intentional jump-to-settings affordance. */
+.tool-manage-btn {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px;
+  width: auto;
+  border-radius: 6px;
+  color: var(--fg-muted);
+  border: 1px solid transparent;
+  opacity: 0.7;
+}
+.tool-manage-btn:hover {
+  color: var(--accent, #7c8cff);
+  background: color-mix(in srgb, var(--accent, #7c8cff) 12%, transparent);
+  border-color: color-mix(in srgb, var(--accent, #7c8cff) 28%, transparent);
+  opacity: 1;
+}
+.tool-manage-btn svg {
+  flex: none;
+}
+
 /* Defensive: an ACP coding agent can report a long/unbroken tool NAME (e.g. a verbose
    MCP tool title). Let the header shrink + the name wrap so it can never force the card
    wider than the chat panel — the args/source live in the expandable body, not here. */
@@ -292,10 +315,81 @@
   color: var(--error);
   font-size: 0.8rem;
   line-height: 1.45;
+  /* Cap like .tool-text — a long error body (a failed command echoing its whole
+     input) must scroll inside the card, not fill the pane (#1691). */
+  max-height: 220px;
+  overflow-y: auto;
+}
+.tool-error span {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 .tool-error svg {
   flex: none;
   margin-top: 1px;
+}
+
+/* Multimodal tool result (#1947) — the envelope's text renders as .tool-text above a small
+   image-count note; the note stands in for what would otherwise be a raw sentinel plus
+   megabytes of base64. */
+.tool-multimodal {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.tool-multimodal-note {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  align-self: flex-start;
+  padding: 1px 6px;
+  border-radius: 5px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  color: var(--fg-muted);
+}
+.tool-multimodal-note svg {
+  flex: none;
+  opacity: 0.7;
+}
+
+/* `wait` (#1914) — the agent yielded deliberately and scheduled its own resume. The block
+   replaces the generic success string; "· ~5 minutes" also rides the collapsed header
+   (.tool-wait-eta), since cards are collapsed by default. */
+.tool-wait {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 0.8rem;
+}
+.tool-wait-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--fg);
+}
+.tool-wait-head svg {
+  flex: none;
+  color: var(--brand-violet-light);
+}
+.tool-wait-then {
+  color: var(--fg-muted);
+}
+.tool-wait-plan {
+  color: var(--fg-secondary);
+  font-style: italic;
+  overflow-wrap: anywhere;
+}
+.tool-wait-hint {
+  font-size: 0.76rem;
+  color: var(--fg-muted);
+}
+/* "· ~5 minutes" in the card header — same quiet treatment as the nested-tools count. */
+.tool-wait-eta {
+  color: var(--pl-color-fg-subtle);
+  font-variant-numeric: tabular-nums;
 }
 
 /* calculator: expr = result */

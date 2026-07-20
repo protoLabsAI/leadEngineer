@@ -25,9 +25,14 @@ from server import _event_bus, agent_name
 
 log = logging.getLogger("protoagent.server")
 
-# Holds the fire-and-forget background-wake tasks (ADR 0050 Phase 2) so they aren't
-# GC'd mid-flight; the done callback discards each on completion.
+# Holds the fire-and-forget background-wake/-resume/-index tasks (ADR 0050 Phase 2,
+# ADR 0070) so they aren't GC'd mid-flight; the done callback discards each on completion.
 _BG_WAKE_TASKS: set = set()
+
+# ADR 0070 D2 — results at or under this size just drain inline; anything bigger is
+# also indexed into the knowledge store so the full report stays searchable after
+# the drain notification truncates it.
+_BG_INDEX_MIN_CHARS = 800
 
 
 def _background_wake_enabled() -> bool:
@@ -35,6 +40,30 @@ def _background_wake_enabled() -> bool:
     Phase 2). On by default; ``BACKGROUND_WAKE=0`` opts out (parity with
     ``BACKGROUND_DISABLED``)."""
     return os.environ.get("BACKGROUND_WAKE", "1").strip().lower() not in ("0", "false", "no")
+
+
+def _background_auto_resume_enabled() -> bool:
+    """Whether a finished background job push-resumes its origin session (ADR 0070 D1).
+    Config ``background.auto_resume``; default on. ``false`` restores pull-only delivery
+    (the drain on the origin session's next manual turn)."""
+    cfg = STATE.graph_config
+    return bool(getattr(cfg, "background_auto_resume", True)) if cfg is not None else True
+
+
+def _should_auto_resume(job) -> bool:
+    """The ADR 0070 D1 guards: push-resume a completed/failed job into its origin
+    session unless the feature is off, the job was canceled (the operator already
+    intervened), there is no origin chat session or it is itself a background
+    context (no resume chains), or the spawning thread was incognito (no memory
+    trail — the report still drains normally)."""
+    if job.status == "canceled":
+        return False
+    origin = job.origin_session or ""
+    if not origin or origin.startswith("background:"):
+        return False
+    if getattr(job, "origin_incognito", False):
+        return False
+    return _background_auto_resume_enabled()
 
 
 def _background_wake_text(job) -> str:
@@ -87,6 +116,102 @@ def _spawn_background_wake(job) -> None:
             await _background_wake(job)
         except Exception:  # noqa: BLE001 — best-effort; never breaks the terminal hook
             log.exception("[background] wake fire failed for %s", getattr(job, "id", "?"))
+
+    t = loop.create_task(_go())
+    _BG_WAKE_TASKS.add(t)
+    t.add_done_callback(_BG_WAKE_TASKS.discard)
+
+
+def _spawn_background_resume(mgr, job) -> None:
+    """Schedule the push-resume nudge (ADR 0070 D1) fire-and-forget on the running
+    loop, batch-aware (#1766). Routes through ``mgr.resume_for_terminal(job)``:
+
+    - a SINGLETON (no batch / batch of one) push-resumes exactly as before;
+    - the LAST member of a fan-out fires ONE coalesced batch nudge (siblings' reports
+      ride the same drained turn);
+    - a non-last member returns ``None`` — HELD, nothing delivered — and we do nothing
+      (no wake, no failure); the last member will deliver for the whole batch.
+
+    On a delivered-vs-not bool (singleton or fired batch), a non-delivery falls back to
+    the ADR 0050 Phase 2 Activity wake (when enabled) so the completion still reaches the
+    agent somewhere. Either way ``notified`` is untouched — the report(s) always drain
+    into the origin session, exactly once. No-op off-loop."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+
+    async def _go() -> None:
+        try:
+            delivered = await mgr.resume_for_terminal(job)
+        except Exception:  # noqa: BLE001 — resume_for_terminal is never-raises by contract; belt and braces
+            log.exception("[background] push-resume failed for %s", getattr(job, "id", "?"))
+            delivered = False
+        if delivered is None:
+            return  # held for still-outstanding batch siblings — the last member delivers
+        if not delivered and _background_wake_enabled():
+            try:
+                await _background_wake(job)
+            except Exception:  # noqa: BLE001 — best-effort fallback
+                log.exception("[background] wake fallback failed for %s", getattr(job, "id", "?"))
+
+    t = loop.create_task(_go())
+    _BG_WAKE_TASKS.add(t)
+    t.add_done_callback(_BG_WAKE_TASKS.discard)
+
+
+def _should_index_report(job) -> bool:
+    """The ADR 0070 D2 guards: index a *completed* job's report when it is substantial
+    (> ``_BG_INDEX_MIN_CHARS`` — smaller results just drain inline), the knowledge
+    store is up, and the spawning thread wasn't incognito (no memory trail)."""
+    if job is None or job.status != "completed":
+        return False
+    if getattr(job, "origin_incognito", False):
+        return False
+    # A CHAINED job — spawned from another background worker's turn — is never
+    # indexed: its origin is a disposable worker identity (D3 — worker sessions are
+    # never memory), its content flows into the parent worker's own report (which is
+    # indexed, or not, under the REAL origin session's rules), and the worker turn
+    # runs non-incognito so an incognito root's no-memory-trail contract (ADR 0069
+    # D3b) would otherwise leak transitively through the chain.
+    if (job.origin_session or "").startswith("background:"):
+        return False
+    if len(job.result or "") <= _BG_INDEX_MIN_CHARS:
+        return False
+    return STATE.knowledge_store is not None
+
+
+def _spawn_report_index(job) -> None:
+    """Index a finished job's FULL report into the knowledge store (ADR 0070 D2),
+    fire-and-forget. Keyed to the ORIGIN session (``source=origin_session``) with
+    ``source_type="background_report"`` (trust tier 2 — agent-derived, ADR 0069 D8),
+    so ``memory_recall`` surfaces it with provenance + trust citations after the
+    drain notification truncates the in-context copy. ``add_document`` chunks
+    document-sized reports with the shared ingestion chunker (knowledge/chunking.py).
+    Best-effort; never raises into the terminal hook. No-op off-loop."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+
+    async def _go() -> None:
+        try:
+            from knowledge import add_document
+
+            # add_document does blocking gateway work per chunk (embed + optional
+            # contextual enrichment) — keep it off the event loop.
+            chunk_ids = await asyncio.to_thread(
+                add_document,
+                STATE.knowledge_store,
+                job.result,
+                domain="conversation",
+                heading=f"Background report: {job.description} ({job.id})",
+                source=job.origin_session or f"background:{job.id}",
+                source_type="background_report",
+            )
+            log.info("[background] indexed report for %s → %d chunk(s)", job.id, len(chunk_ids or []))
+        except Exception:  # noqa: BLE001 — indexing is best-effort; jobs.db stays the record
+            log.exception("[background] report indexing failed for %s", getattr(job, "id", "?"))
 
     t = loop.create_task(_go())
     _BG_WAKE_TASKS.add(t)
@@ -174,11 +299,12 @@ def structured_skill_schema(skill_id: str) -> dict | None:
 
 
 def _package_version() -> str:
-    """Single-source the agent-card version from the package metadata.
+    """Single-source the agent-card version.
 
     Delegates to ``paths.package_version()`` (one source of truth — the
     pyproject ``[project].version`` the release pipeline bumps) so the card,
-    the runtime status, and the fleet version handshake can never disagree.
+    the plugin ``min_protoagent_version`` gate (``graph/plugins/loader.py``),
+    the runtime status, and the fleet version handshake can never disagree (#1644).
     Kept as a name here for its existing importers (``server.__init__`` re-exports it).
     """
     from infra.paths import package_version
@@ -349,6 +475,16 @@ def _record_a2a_telemetry(outcome) -> None:
     except Exception:  # noqa: BLE001 — the Prometheus metric must never break a turn
         pass
 
+    # Which persona (SOUL.md) was live for this turn (#1691), so telemetry can be correlated
+    # with a soul-history version. Deliberately NOT a Prometheus label — a content hash is
+    # high-cardinality and would explode the metric series. Best-effort: never break a turn.
+    try:
+        from graph.config_io import soul_revision
+
+        soul_rev = soul_revision()
+    except Exception:  # noqa: BLE001
+        soul_rev = ""
+
     # Realtime cost/usage on the bus (ADR 0051 Slice 3) — a per-turn HUD can show live
     # spend without polling the telemetry store. Independent of the SQL store.
     try:
@@ -364,6 +500,7 @@ def _record_a2a_telemetry(outcome) -> None:
                 "output_tokens": int(_u.get("output_tokens", 0) or 0),
                 "cost_usd": round(float(getattr(outcome, "cost_usd", 0.0) or 0.0), 6),
                 "duration_ms": int(getattr(outcome, "duration_ms", 0) or 0),
+                "soul_rev": soul_rev,
             },
         )
     except Exception:  # noqa: BLE001 — best-effort
@@ -404,10 +541,26 @@ def _record_a2a_telemetry(outcome) -> None:
                 "tool_calls": int(outcome.tool_calls),
                 "created_at": created.isoformat(),
                 "ended_at": ended.isoformat(),
+                "soul_rev": soul_rev,
             }
         )
     except Exception:  # noqa: BLE001 — telemetry is best-effort
         log.exception("[telemetry] failed to record turn %s", outcome.task_id)
+
+    # Fleet trace export → lab (the flywheel Observe, #1897). Off unless
+    # PROTOAGENT_FLEET_TRACE_EXPORT is set; best-effort, never touches the turn.
+    try:
+        from observability import trace_export
+
+        if trace_export.is_enabled():
+            trace_export.export_turn(
+                outcome,
+                checkpointer=STATE.checkpointer,
+                graph_config=STATE.graph_config,
+                bound_tools=getattr(STATE.graph, "bound_tools", None),
+            )
+    except Exception:  # noqa: BLE001 — export is best-effort
+        log.exception("[trace_export] failed to export turn %s", outcome.task_id)
 
 
 def _a2a_progress(context_id: str, task_id: str, frame: dict) -> None:
@@ -492,10 +645,20 @@ def _handle_background_terminal(outcome) -> None:
             "result": result_preview,
         },
     )
-    # Autonomous idle-wake (ADR 0050 Phase 2): fire an Activity turn so the agent reacts
-    # to the result on its own, instead of only learning on the spawning session's next
-    # turn. Gated + storm-guarded; needs the full job row for the stimulus.
-    if job is not None and _background_wake_enabled():
+    # Index the full report into the knowledge store (ADR 0070 D2) BEFORE any resume
+    # turn runs, so the drained notification's "searchable via memory_recall" pointer
+    # is already true when the agent reads it.
+    if _should_index_report(job):
+        _spawn_report_index(job)
+    # Delivery (ADR 0070 D1): push-resume the ORIGIN session — the nudge turn's drain
+    # injects the <task-notification> and the agent briefs the operator right where
+    # the work was requested. That one turn IS the reaction, so the ADR 0050 Phase 2
+    # Activity wake only fires when the resume doesn't apply (feature off, canceled,
+    # incognito, no/background origin) or couldn't be delivered (fallback inside
+    # _spawn_background_resume) — never both for one completion.
+    if job is not None and _should_auto_resume(job):
+        _spawn_background_resume(mgr, job)
+    elif job is not None and _background_wake_enabled():
         _spawn_background_wake(job)
 
 
@@ -504,9 +667,10 @@ def _surface_resumed_chat_turn(outcome) -> None:
     that landed in a CHAT session — not the Activity thread — on the event bus so an
     open chat tab shows the resumed turn LIVE (bd-k02). The browser only renders
     turns it streamed, so a server-fired resume is otherwise invisible until the
-    next interaction. Mirrors the ADR 0050 background path. Only scheduler-origin
-    turns qualify; an operator/A2A chat turn the browser already streamed does not."""
-    if getattr(outcome, "origin", "") != "scheduler":
+    next interaction. Mirrors the ADR 0050 background path. Only server-fired
+    origins qualify — scheduler resumes and ADR 0070 push-resume briefings; an
+    operator/A2A chat turn the browser already streamed does not."""
+    if getattr(outcome, "origin", "") not in ("scheduler", "background-resume"):
         return
     text = extract_output(outcome.text) or outcome.text
     if not text.strip():

@@ -4,10 +4,13 @@ All models route through the LiteLLM gateway (OpenAI-compatible),
 so we use ChatOpenAI for everything.
 """
 
+import asyncio
 import logging
 import os
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 
+import httpcore
+import httpx
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
 from graph.config import LangGraphConfig
@@ -16,6 +19,59 @@ log = logging.getLogger(__name__)
 
 # Same allowlisted UA the chat client uses (Cloudflare WAF blocks the SDK default).
 _GATEWAY_UA = "protoAgent/0.1 (+https://github.com/protoLabsAI/protoAgent)"
+
+# A provider stream can drop mid-read — an `httpcore.ReadError` / `httpx.TransportError`
+# (or a read timeout) surfaces while iterating the SSE body. `ChatOpenAI(max_retries=…)`
+# retries the request *start*, never a mid-body read, so a rate-limited or flaky gateway
+# that terminates the response kills the whole turn (#1728). These are the read/transport
+# failures we treat as retryable when the stream produced NOTHING yet.
+RETRYABLE_STREAM_ERRORS: tuple[type[BaseException], ...] = (
+    httpx.TransportError,  # httpx.ReadError / ConnectError / ReadTimeout / …
+    httpcore.NetworkError,  # httpcore.ReadError / WriteError / ConnectError (raw, unwrapped)
+    httpcore.TimeoutException,  # httpcore.ReadTimeout / ConnectTimeout
+)
+_STREAM_RETRY_BACKOFF_S = 0.5
+
+
+async def _stream_with_reconnect(
+    make_stream: Callable[[], AsyncIterator],
+    *,
+    max_retries: int,
+    backoff: float = _STREAM_RETRY_BACKOFF_S,
+    sleep: Callable = asyncio.sleep,
+) -> AsyncIterator:
+    """Yield from a model stream, restarting it on a transport/read error that occurs
+    **before any item is emitted**.
+
+    Retrying is only safe with zero items emitted: each chunk fires its
+    ``on_llm_new_token`` callback as it's yielded, so once one has streamed a fresh
+    stream would duplicate it — there we re-raise. This reconnects the model call only;
+    it never replays tools or restarts the turn. A provider closing the stream at the
+    top (the rate-limit case in #1728) emits nothing, so it reconnects cleanly.
+    """
+    attempts = max(max_retries, 0) + 1
+    delay = backoff
+    for attempt in range(attempts):
+        emitted = 0
+        try:
+            async for item in make_stream():
+                emitted += 1
+                yield item
+            return
+        except RETRYABLE_STREAM_ERRORS as exc:
+            if emitted or attempt == attempts - 1:
+                raise
+            log.warning(
+                "model stream dropped before any content (%s: %s) — reconnecting, "
+                "attempt %d/%d in %.1fs (provider closed stream; possible rate limit)",
+                type(exc).__name__,
+                exc,
+                attempt + 1,
+                attempts - 1,
+                delay,
+            )
+            await sleep(delay)
+            delay *= 2
 
 
 class _ReasoningChatOpenAI(ChatOpenAI):
@@ -36,6 +92,19 @@ class _ReasoningChatOpenAI(ChatOpenAI):
             if reasoning:
                 gen.message.additional_kwargs["reasoning_content"] = reasoning
         return gen
+
+    async def _astream(self, *args, **kwargs):
+        """Reconnect a provider stream that drops before emitting any content (#1728).
+
+        Transparent pass-through on the happy path; on a mid-read transport error with
+        zero chunks yielded it reconnects (within the model's ``max_retries`` budget)
+        instead of letting the error kill the turn — the failure mode a rate-limited
+        gateway produces. Once a chunk has streamed, the error propagates unchanged."""
+        async for chunk in _stream_with_reconnect(
+            lambda: super(_ReasoningChatOpenAI, self)._astream(*args, **kwargs),
+            max_retries=self.max_retries or 0,
+        ):
+            yield chunk
 
 
 def _build_llm_kwargs(config: LangGraphConfig) -> dict:
@@ -64,7 +133,7 @@ def _build_llm_kwargs(config: LangGraphConfig) -> dict:
         # `astream_events(v2)` populates `output.usage_metadata` on
         # `on_chat_model_end`. Without this, streaming chunks arrive as
         # AIMessageChunks with usage_metadata=None and we can't emit
-        # the cost-v1 DataPart on the terminal artifact.
+        # the cost-v1 extension metadata on the terminal artifact.
         "stream_usage": True,
         # Cloudflare's managed WAF blocks the OpenAI SDK's default
         # `OpenAI/Python <ver>` User-Agent (observed 403 "Your request
@@ -74,7 +143,7 @@ def _build_llm_kwargs(config: LangGraphConfig) -> dict:
         # UA. If you self-host behind a different edge, this is safe to
         # keep.
         "default_headers": {
-            "User-Agent": "protoAgent/0.1 (+https://github.com/protoLabsAI/protoAgent)",
+            "User-Agent": _GATEWAY_UA,
         },
     }
 
@@ -169,6 +238,15 @@ def create_llm(
     return _ReasoningChatOpenAI(**kwargs)
 
 
+# Embedding calls run INSIDE the turn (recall precedes every model call), so they get
+# a short dedicated timeout — never the chat request_timeout, and never the OpenAI
+# SDK defaults (600s + 2 retries), which let one hung gateway route freeze every chat
+# turn for minutes while the knowledge breaker couldn't trip (#1681: a Cloudflare-524
+# embedding outage read as "chat is broken"). No client retries: the gateway owns
+# retries/fallbacks; app-side retries only multiply the hang.
+_EMBED_TIMEOUT_S = 8.0
+
+
 def _build_embeddings(config: LangGraphConfig) -> "OpenAIEmbeddings | None":
     """The shared OpenAIEmbeddings client for ``knowledge.embed_model`` against
     the gateway (ADR 0021), or None when no embed model is configured."""
@@ -181,6 +259,8 @@ def _build_embeddings(config: LangGraphConfig) -> "OpenAIEmbeddings | None":
         api_key=api_key,
         model=model,
         default_headers={"User-Agent": _GATEWAY_UA},
+        request_timeout=_EMBED_TIMEOUT_S,
+        max_retries=0,
         # Send the raw string, not client-side-tokenized int arrays. Langchain's
         # default tokenizes with tiktoken and posts `input` as arrays of token
         # ids, which a LiteLLM/vLLM-style gateway rejects with 422 ("input should
@@ -210,6 +290,57 @@ def create_embed_batch_fn(
     return emb.embed_documents if emb is not None else None
 
 
+# ── direct gateway endpoint calls (the shared HTTP client, #1931) ─────────────
+#
+# Core AND plugins sometimes need a non-chat, OpenAI-compatible gateway endpoint
+# the LangChain clients don't cover — /audio/transcriptions here, /images/* for
+# an image plugin. Every such call must reproduce three load-bearing details, so
+# they live in ONE factory instead of being re-derived per caller:
+#
+#   1. the configured ``api_base`` + ``api_key`` (bearer auth);
+#   2. the allowlisted User-Agent — the gateway's Cloudflare WAF 403s default
+#      SDK UAs (see the ``default_headers`` note in ``_build_llm_kwargs``);
+#   3. the egress-trust property (ADR 0008): the ``api_base`` host is
+#      auto-allowlisted by ``security/egress.py`` and the OpenShell network
+#      policy, while a provider *backend* host is deny-by-default (a private IP
+#      is denied outright) — so callers go through the gateway, never around it.
+
+# Default timeout for a direct gateway call — generous enough for a slow
+# generation endpoint, bounded so a hung gateway can't wedge the caller.
+_GATEWAY_CLIENT_TIMEOUT_S = 120.0
+
+
+def _gateway_client_kwargs(config: LangGraphConfig, *, timeout: float) -> dict:
+    """The shared httpx client kwargs (base_url + bearer + allowlisted UA + timeout)."""
+    api_key = config.api_key or os.environ.get("OPENAI_API_KEY", "")
+    headers = {"User-Agent": _GATEWAY_UA}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return {"base_url": (config.api_base or "").rstrip("/"), "headers": headers, "timeout": timeout}
+
+
+def gateway_client(
+    config: LangGraphConfig, *, timeout: float = _GATEWAY_CLIENT_TIMEOUT_S, **httpx_kwargs
+) -> httpx.AsyncClient:
+    """An ``httpx.AsyncClient`` pre-configured for the model gateway (#1931).
+
+    Request relative paths (``await client.post("/images/generations", json=…)``) —
+    they resolve under the configured ``api_base`` with bearer auth and the
+    allowlisted User-Agent already set, zero hand-set headers. Use it per call
+    (``async with``); ``**httpx_kwargs`` forwards to the client constructor
+    (e.g. a ``transport`` in tests). Plugins reach this via
+    ``graph.sdk.gateway_client()`` (live config resolved for them)."""
+    return httpx.AsyncClient(**_gateway_client_kwargs(config, timeout=timeout), **httpx_kwargs)
+
+
+def gateway_sync_client(
+    config: LangGraphConfig, *, timeout: float = _GATEWAY_CLIENT_TIMEOUT_S, **httpx_kwargs
+) -> httpx.Client:
+    """The sync twin of :func:`gateway_client` — for worker-thread callers like
+    the ingestion pipeline (``create_transcribe_fn``)."""
+    return httpx.Client(**_gateway_client_kwargs(config, timeout=timeout), **httpx_kwargs)
+
+
 # Transcription timeout — STT of a long clip is slow (cold model load + minutes
 # of audio); generous but bounded so a hung gateway can't wedge an ingest thread.
 _TRANSCRIBE_TIMEOUT_S = 600.0
@@ -223,26 +354,19 @@ def create_transcribe_fn(
     Posts to the gateway's OpenAI-compatible ``/audio/transcriptions`` endpoint
     (ADR 0021) using ``knowledge.transcribe_model`` (e.g. ``whisper-1``) — so
     audio/video ingestion reuses the same gateway + key as chat/embeddings, no
-    local ASR model. Raw httpx (not the OpenAI SDK) to send the allowlisted
-    User-Agent the gateway's WAF requires. Returns ``None`` when no transcribe
-    model is configured; transport/parse errors propagate to the ingestion
-    engine, which maps them to a clean extraction failure."""
+    local ASR model. Goes through the shared :func:`gateway_sync_client` (not the
+    OpenAI SDK) to send the allowlisted User-Agent the gateway's WAF requires.
+    Returns ``None`` when no transcribe model is configured; transport/parse
+    errors propagate to the ingestion engine, which maps them to a clean
+    extraction failure."""
     model = (getattr(config, "transcribe_model", "") or "").strip()
     if not model:
         return None
-    api_base = (config.api_base or "").rstrip("/")
-    api_key = config.api_key or os.environ.get("OPENAI_API_KEY", "")
 
     def _transcribe(data: bytes, filename: str) -> str:
-        import httpx
-
-        headers = {"User-Agent": _GATEWAY_UA}
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-        with httpx.Client(timeout=_TRANSCRIBE_TIMEOUT_S) as client:
+        with gateway_sync_client(config, timeout=_TRANSCRIBE_TIMEOUT_S) as client:
             resp = client.post(
-                f"{api_base}/audio/transcriptions",
-                headers=headers,
+                "/audio/transcriptions",
                 data={"model": model},
                 files={"file": (filename or "audio.mp3", data)},
             )

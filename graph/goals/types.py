@@ -41,20 +41,39 @@ class GoalState:
     ``verifier`` is a free-form spec dict whose ``type`` selects an entry in
     ``graph/goals/verifiers.VERIFIERS`` and whose other keys are that verifier's
     parameters (e.g. ``{"type": "command", "command": "pytest -q"}``).
-    ``checklist`` holds the running plan the agent records with the
-    ``update_goal_plan`` tool, carried forward across iterations.
+
+    The running plan (the "orient" world-model the agent records with the
+    ``update_goal_plan`` tool) is NOT a field here — it lives in the durable
+    ``GoalStore`` plan artifact (``read_plan``/``write_plan``) for EVERY goal, so
+    the continuation loop-back and the trace ``orient``/``loop_shape`` signal see
+    it uniformly (ADR 0079).
     """
 
     session_id: str
     condition: str
     verifier: dict = field(default_factory=lambda: {"type": "llm"})
+    # --- completion contract (ADR 0073) -----------------------------------
+    # A structured layer OVER the verifier (the contract's *verification* stays
+    # ``verifier`` — the real, deterministic check). These fields shape the
+    # continuation prompt each drive turn; they never decide DONE (the verifier
+    # does). All default-empty, so a goal set without a contract is unchanged.
+    #   outcome     — the single required end-state, as a human summary
+    #                 (falls back to ``condition`` when empty; see ``resolved_outcome``).
+    #   constraints — invariants the agent must NOT violate/regress.
+    #   boundaries  — the files/dirs/systems in scope (stay inside these).
+    #   stop_when   — a condition under which the agent should PAUSE the drive
+    #                 loop and ask the operator (v1 = prompt-injected; the agent
+    #                 self-parks via the abandon/ask path — no auto-detection).
+    outcome: str = ""
+    constraints: list[str] = field(default_factory=list)
+    boundaries: list[str] = field(default_factory=list)
+    stop_when: str = ""
     status: str = "active"
     # Fresh-context mode (Ralph loop): each continuation turn starts a NEW
     # LangGraph thread so the model sees a clean slate — no accumulated
     # transcript from prior iterations. Durable state (plan artifact) lives
     # on disk. Opt-in only; short goals benefit from transcript continuity.
     fresh_context: bool = False
-    checklist: str = ""
     # Set by the agent's ``abandon_goal`` tool mid-turn; ``evaluate`` finishes the goal
     # ``unachievable`` after the verifier runs (retired the ``<goal_unachievable/>`` tag).
     abandon_reason: str = ""
@@ -72,6 +91,17 @@ class GoalState:
     def active(self) -> bool:
         return self.status == "active"
 
+    @property
+    def resolved_outcome(self) -> str:
+        """The contract's required end-state — ``outcome`` when set, else the
+        ``condition`` (so a contract-less goal still has one)."""
+        return (self.outcome or "").strip() or self.condition
+
+    @property
+    def has_contract(self) -> bool:
+        """True when the goal carries any contract field beyond the bare condition/verifier."""
+        return bool(self.outcome or self.constraints or self.boundaries or self.stop_when)
+
     def to_dict(self) -> dict:
         return asdict(self)
 
@@ -86,6 +116,8 @@ class GoalState:
         vt = self.verifier.get("type", "llm")
         progress = f"iteration {self.iteration}/{self.max_iterations}"
         tag = ", fresh-context" if self.fresh_context else ""
+        if self.has_contract:
+            tag += ", contract"
         base = f"goal [{self.status}] via {vt}: {self.condition!r} ({progress}{tag})"
         if self.last_reason:
             base += f" — {self.last_reason}"

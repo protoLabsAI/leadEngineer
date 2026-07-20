@@ -25,14 +25,14 @@ def _tool_msg(name: str, content: str = "ok", status: str | None = None) -> Tool
 
 
 def test_just_waited_true_after_successful_wait():
-    msgs = [HumanMessage("go"), AIMessage("…"), _tool_msg("wait", "Yielding for 40s …")]
+    msgs = [HumanMessage("go"), AIMessage("…"), _tool_msg("wait", "Wait scheduled: 40 seconds …")]
     assert _just_waited(msgs) is True
 
 
 def test_just_waited_false_on_fresh_turn():
     # A new stimulus is the trailing message — wait may be deep in history but
     # didn't just run.
-    msgs = [_tool_msg("wait", "Yielding …"), AIMessage("done"), HumanMessage("new task")]
+    msgs = [_tool_msg("wait", "Wait scheduled: …"), AIMessage("done"), HumanMessage("new task")]
     assert _just_waited(msgs) is False
 
 
@@ -43,7 +43,7 @@ def test_just_waited_false_for_other_tools():
 
 def test_just_waited_true_with_parallel_tools():
     # wait alongside another tool in the same step still yields.
-    msgs = [AIMessage("…"), _tool_msg("st_ship", "ok"), _tool_msg("wait", "Yielding …")]
+    msgs = [AIMessage("…"), _tool_msg("st_ship", "ok"), _tool_msg("wait", "Wait scheduled: …")]
     assert _just_waited(msgs) is True
 
 
@@ -56,7 +56,7 @@ def test_just_waited_false_when_wait_errored():
 
 def test_middleware_jumps_to_end_only_after_wait():
     mw = WaitYieldMiddleware()
-    waited = {"messages": [AIMessage("…"), _tool_msg("wait", "Yielding …")]}
+    waited = {"messages": [AIMessage("…"), _tool_msg("wait", "Wait scheduled: …")]}
     assert mw.before_model(waited, None) == {"jump_to": "end"}
 
     fresh = {"messages": [HumanMessage("hello")]}
@@ -76,11 +76,21 @@ class _FakeScheduler:
     def __init__(self):
         self.added: list[tuple[str, str]] = []
         self.last_context_id: str | None = "__unset__"
+        self.jobs: dict[str, str] = {}  # job_id → schedule (models the pending set)
+        self.cancelled: list[str] = []
 
     def add_job(self, prompt, schedule, *, job_id=None, timezone=None, context_id=None):
+        if job_id and job_id in self.jobs:
+            raise ValueError(f"job id {job_id!r} already exists")  # faithful to the real backend
         self.added.append((prompt, schedule))
         self.last_context_id = context_id
+        if job_id:
+            self.jobs[job_id] = schedule
         return _FakeJob(schedule)
+
+    def cancel_job(self, job_id):
+        self.cancelled.append(job_id)
+        return self.jobs.pop(job_id, None) is not None
 
     def list_jobs(self):
         return []
@@ -101,7 +111,7 @@ async def test_wait_schedules_a_one_shot_in_the_future():
     fire = datetime.fromisoformat(schedule)  # parses ISO-8601 (one-shot)
     delta = (fire - datetime.now(UTC)).total_seconds()
     assert 30 < delta <= 41  # ~40s out
-    assert "Dock and sell ore." in out and "re-invoked" in out
+    assert "Dock and sell ore." in out and "resume" in out.lower()
 
 
 @pytest.mark.asyncio
@@ -210,3 +220,118 @@ async def test_wait_in_a_real_graph_stamps_the_turn_session(monkeypatch):
         config={"configurable": {"thread_id": "t1"}},
     )
     assert sched.last_context_id == "sess-XYZ"
+
+
+@pytest.mark.asyncio
+async def test_wait_supersedes_a_pending_wait_for_the_same_thread():
+    """One pending wait per thread (#1702): a second wait for the same session cancels
+    the first, so stacked wakes can't pile up (the 'old resume messages catching up' bug)."""
+    sched = _FakeScheduler()
+    state = {"session_id": "chat-abc"}
+    await _wait_tool(sched).ainvoke({"seconds": 30, "then": "check ship", "state": state})
+    await _wait_tool(sched).ainvoke({"seconds": 200, "then": "check ship again", "state": state})
+    # both waits target the stable per-session id; the second actually superseded the
+    # first (proven by exactly ONE pending job despite two add_jobs — without the
+    # cancel, the second add_job would ValueError on the duplicate id).
+    assert sched.cancelled == ["wait:chat-abc", "wait:chat-abc"]
+    assert list(sched.jobs) == ["wait:chat-abc"]
+    assert len(sched.added) == 2  # both scheduled cleanly (no duplicate-id error)
+
+
+@pytest.mark.asyncio
+async def test_wait_for_different_threads_do_not_supersede_each_other():
+    sched = _FakeScheduler()
+    await _wait_tool(sched).ainvoke({"seconds": 10, "then": "a", "state": {"session_id": "chat-1"}})
+    await _wait_tool(sched).ainvoke({"seconds": 10, "then": "b", "state": {"session_id": "chat-2"}})
+    assert set(sched.jobs) == {"wait:chat-1", "wait:chat-2"}  # both pending, independent
+
+
+@pytest.mark.asyncio
+async def test_wait_logs_the_scheduling(caplog):
+    import logging
+
+    sched = _FakeScheduler()
+    with caplog.at_level(logging.INFO, logger="protoagent.tools"):
+        await _wait_tool(sched).ainvoke({"seconds": 45, "then": "dock and sell", "state": {"session_id": "chat-x"}})
+    line = next((r.getMessage() for r in caplog.records if "[wait]" in r.getMessage()), "")
+    assert "thread=chat-x" in line and "45s" in line and "dock and sell" in line
+
+
+# ── the `wait` tool × the REAL LocalScheduler (#1702 edge cases) ──────────────
+# The supersede tests above run against _FakeScheduler; these pin the two edge
+# cases only the real SQLite-backed scheduler can prove — so the fake's claimed
+# faithfulness (duplicate-id ValueError, cancel-on-miss False) can't silently
+# drift from the backend the tool actually runs on.
+
+
+def _real_scheduler(tmp_path, agent: str = "wait-test"):
+    from scheduler.local import LocalScheduler
+
+    # Constructed but never start()ed — no loop, no owner-lock contention.
+    return LocalScheduler(
+        agent_name=agent,
+        invoke_url="http://127.0.0.1:7870",
+        api_key="k",
+        bearer_token="b",
+        db_dir=tmp_path,
+    )
+
+
+@pytest.mark.asyncio
+async def test_wait_supersede_works_against_a_persisted_wait_across_restart(tmp_path, caplog):
+    """#1702 edge (c): the pending set persists in SQLite, so a wait scheduled
+    before a server restart must still be superseded by the next wait for the
+    same thread — the stable ``wait:<session>`` id has to dedup across process
+    lifetimes, not just within one scheduler instance."""
+    import logging
+
+    s1 = _real_scheduler(tmp_path)
+    await _wait_tool(s1).ainvoke({"seconds": 300, "then": "check ship (pre-restart)", "state": {"session_id": "chat-abc"}})
+    del s1  # "restart": a fresh scheduler instance over the same persisted db
+
+    s2 = _real_scheduler(tmp_path)
+    assert [j.id for j in s2.list_jobs()] == ["wait:chat-abc"]  # survived the restart
+    with caplog.at_level(logging.INFO, logger="protoagent.tools"):
+        await _wait_tool(s2).ainvoke({"seconds": 60, "then": "check ship (post-restart)", "state": {"session_id": "chat-abc"}})
+
+    jobs = s2.list_jobs()
+    assert [j.id for j in jobs] == ["wait:chat-abc"]  # exactly one pending — the later one
+    assert jobs[0].prompt == "check ship (post-restart)"
+    assert jobs[0].context_id == "chat-abc"
+    # Select the post-restart scheduling line by its snippet — depending on suite
+    # order the pre-restart line can land in caplog too (capture spans the test,
+    # not just the at_level block).
+    line = next((r.getMessage() for r in caplog.records if "post-restart" in r.getMessage()), "")
+    assert "[wait]" in line and "superseded a pending wait" in line
+
+
+@pytest.mark.asyncio
+async def test_wait_after_the_pending_wait_fired_is_not_a_supersede(tmp_path, caplog):
+    """#1702 edge (a): a wait that already FIRED is deleted by the fire loop
+    (one-shots: delete on success), so the next wait must schedule cleanly and
+    must NOT claim it superseded anything."""
+    import logging
+    from datetime import timedelta
+
+    s = _real_scheduler(tmp_path)
+    # A due wait, then the exact backend path the fire loop runs on success.
+    past = (datetime.now(UTC) - timedelta(seconds=5)).isoformat()
+    s.add_job("stale resume", past, job_id="wait:chat-abc", context_id="chat-abc")
+    s._reschedule_or_delete(s.list_jobs()[0], fired_at=datetime.now(UTC))
+    assert s.list_jobs() == []  # fired one-shot is gone
+
+    with caplog.at_level(logging.INFO, logger="protoagent.tools"):
+        await _wait_tool(s).ainvoke({"seconds": 60, "then": "next step", "state": {"session_id": "chat-abc"}})
+
+    assert [j.prompt for j in s.list_jobs()] == ["next step"]
+    line = next((r.getMessage() for r in caplog.records if "next step" in r.getMessage()), "")
+    assert "[wait]" in line and "superseded" not in line  # scheduled, but no retroactive supersede
+
+
+@pytest.mark.asyncio
+async def test_wait_real_backend_keeps_different_threads_independent(tmp_path):
+    """#1702 edge (b) against the real backend: per-context job ids never collide."""
+    s = _real_scheduler(tmp_path)
+    await _wait_tool(s).ainvoke({"seconds": 30, "then": "a", "state": {"session_id": "chat-1"}})
+    await _wait_tool(s).ainvoke({"seconds": 30, "then": "b", "state": {"session_id": "chat-2"}})
+    assert {j.id for j in s.list_jobs()} == {"wait:chat-1", "wait:chat-2"}  # both pending

@@ -78,42 +78,20 @@ def _boot_stores_only(config):
     STATE.skills_index = ai._build_skills_index(config, extra_skill_dirs=plugins.skill_dirs)
 
 
-def operator_tools(config):
-    """The allowlisted tools (core + plugin) to expose — empty allowlist ⇒ none."""
-    from tools.lg_tools import get_all_tools
+# The allowlist/profile resolution now lives in ``runtime.operator_mcp_tools`` (a neutral
+# infra module both this sidecar and ``operator_api.mcp_routes`` can import without breaking
+# the import-layering contract — ADR 0075 D2). Re-exported here so existing
+# ``from server.operator_mcp import operator_tools`` callers keep working; only the FastMCP
+# wrapping + stores boot stay in this module.
+from runtime.operator_mcp_tools import operator_tools, resolve_allow, resolve_exposed_names
 
-    allow = set(getattr(config, "operator_mcp_tools", []) or [])
-    if not allow:
-        return []
-    tools = list(
-        get_all_tools(
-            STATE.knowledge_store,
-            scheduler=STATE.scheduler,
-            inbox_store=STATE.inbox_store,
-            tasks_store=STATE.tasks_store,
-            goal_enabled=bool(getattr(config, "goal_enabled", False)),
-        )
-    )
-    tools += list(getattr(STATE, "plugin_tools", None) or [])
-    # "*" = expose everything (minus a small danger set you must opt into by name) — so you
-    # don't have to enumerate every tool. List specific names instead for tight control.
-    star = "*" in allow
-    seen: set[str] = set()
-    out = []
-    for t in tools:
-        name = getattr(t, "name", None)
-        if not name or name in seen:
-            continue
-        if (name in allow) or (star and name not in _STAR_EXCLUDE):
-            seen.add(name)
-            out.append(t)
-    return out
-
-
-# Tools "*" skips — a coding-agent brain already has its own code execution / file tools,
-# so exposing protoAgent's execute_code over the bus is redundant. Not a security gate
-# (you can still allowlist it by name); just avoids handing it a tool it already has.
-_STAR_EXCLUDE = {"execute_code"}
+__all__ = [
+    "resolve_allow",
+    "operator_tools",
+    "resolve_exposed_names",
+    "build_server",
+    "main",
+]
 
 
 def build_server(config, *, name: str = "protoAgent-operator"):

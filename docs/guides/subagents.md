@@ -167,9 +167,24 @@ like any other; the `deep-research` recipe just wires them into a DAG.
 A delegation can run **detached** so it never blocks the turn: `task(run_in_background=true)`
 (or `task_batch`) fires the subagent, returns a `bg-…` job id immediately, and the result is
 drained back into the conversation when it finishes — with a live card on the console's
-background-jobs surface and an autonomous idle-wake
-([ADR 0050](/adr/0050-background-subagents-reactive-notifications)). Durable (survives restart),
-concurrency-capped (`BACKGROUND_MAX_CONCURRENCY`), and cancellable.
+background-jobs surface ([ADR 0050](/adr/0050-background-subagents-reactive-notifications)).
+Durable (survives restart), concurrency-capped (`BACKGROUND_MAX_CONCURRENCY`), and cancellable.
+
+**Completion is a push, not mail waiting for pickup**
+([ADR 0070](/adr/0070-background-results-push-resume)). When a job finishes, the server
+**resumes the origin session** with a nudge turn: the pending `<task-notification>` drains into
+that turn and the agent briefs the operator right where the work was requested (config
+`background.auto_resume`, on by default; `false` restores pull-only delivery on the session's
+next manual turn — the ADR 0050 Activity idle-wake then covers autonomous reaction instead).
+A **substantial report** (> ~800 chars) is also **indexed into the knowledge store** at
+completion, keyed to the origin session (`source_type: background_report`, trust tier 2 —
+agent-derived), so only a 3 000-char excerpt rides in-context while the full text stays
+searchable via `memory_recall` and openable from the console report card
+(`GET /api/background/{job_id}`). Worker transcripts are **disposable**: `background:*`
+sessions are excluded from session-summary persistence, the `<prior_sessions>` digest, and
+retirement harvest — the jobs DB is the system of record. Jobs spawned from an **incognito**
+thread inherit the no-memory-trail contract: no auto-resume, no indexing; the report still
+drains normally.
 
 **Reuse it from your own code — `BackgroundManager.spawn_work(...)`.** Not every long job is an
 LLM turn. A *deterministic* pipeline — media transcription, a bulk import, a crawl — shouldn't
@@ -195,6 +210,13 @@ The `knowledge_ingest` tool is the first consumer — it detaches any slow URL/m
 way so a 20-minute transcription never freezes the chat. Reach for `spawn_work` whenever a tool
 or plugin has a long **deterministic** operation that shouldn't block the turn (vs.
 `run_in_background`, which is for detaching an *LLM subagent* turn).
+
+**From a plugin, use the consumption SDK instead of `STATE`.** `graph.sdk.spawn_background(prompt,
+*, subagent_type, origin_session, label=None)` spawns a detached *subagent* job through the same
+pipeline — the report card, KB indexing, and the push-resume nudge all land for free — and
+`graph.sdk.background_status(task_id)` reads the job row (`{status, description, report?}`) so a
+plugin dashboard can show progress between launch and the nudge. See
+[Plugins ▸ Tapping core deeper](/guides/plugins#consumption-sdk).
 
 ## What you get for free
 

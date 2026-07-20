@@ -5,15 +5,16 @@ The default tool set (from `tools/lg_tools.py::get_all_tools`):
 - Four keyless general-purpose tools — `current_time`, `calculator`, `web_search`, `fetch_url` — that work without any state.
 - Two **HITL tools** — `ask_human` (a free-text question) and `request_user_input` (a multi-step Back/Next form **wizard** with text/number/choice fields, incl. AskUserQuestion-style option cards) — pause the turn (A2A `input-required`) for the operator and resume with their answer. Lead-agent only (hard-denied to subagents); on autonomous turns they don't block — the runtime auto-answers so the turn can't deadlock.
 - The **render tool** `show_component(component, props, title?)` — render structured data inline in chat as a `table`, `keyvalue`, or `timeline` widget instead of a markdown blob ([ADR 0051](/adr/0051-a2a-realtime-streaming-and-component-rendering)). Data-only and safe (no code execution); the console renders it via an **extensible component registry** plugins can add to. For free-form generated HTML/React, use an artifact instead.
-- Four **memory tools** — `memory_ingest`, `memory_recall`, `memory_list`, `memory_stats` — bound to the bundled `KnowledgeStore` (sqlite + FTS5, see [Configuration](/reference/configuration#knowledge)). Omitted when no store.
+- Five **memory tools** — `memory_ingest`, `memory_recall`, `recall_session`, `memory_list`, `memory_stats` — bound to the bundled `KnowledgeStore` (sqlite + FTS5, see [Configuration](/reference/configuration#knowledge)). Omitted when no store.
 - Three **scheduler tools** — `schedule_task`, `list_schedules`, `cancel_schedule` — bound to the bundled scheduler backend (local sqlite, see [Schedule future work](/guides/scheduler)). Omitted when no scheduler.
 - Four **tasks tools** — `task_create`, `task_list`, `task_update`, `task_close` — the agent's in-process planning board, bridged to the console Tasks panel. Bound when a tasks store is present (default in `server/agent_init.py`).
 - One **inbox tool** — `check_inbox` — bound to the durable inbound inbox (ADR 0003) when configured; pulls stimuli pushed to `POST /api/inbox`.
 - **Goal + watch tools** — `set_goal` / `update_goal_plan` / `abandon_goal` drive a standing, plugin-verified goal; `create_watch` / `list_watches` / `clear_watch` supervise many external conditions at once ([ADR 0028](/adr/0028-plugin-goal-verifiers) / [ADR 0067](/adr/0067-standalone-watch-primitive); both plugin-verified, always on). See [Goal mode](/guides/goal-mode) + [Watches](/guides/watches).
 - Three **curation tools** — `recent_activity`, `list_skills`, `save_skill` — let the agent review what it's recently done and manage its own skill library; they also back the scheduled `/dream` (memory consolidation) and `/distill` (workflow→skill) passes ([ADR 0054](/adr/0054-dream-distill-curation-subagents)).
 - The **`search_tools`** meta-tool — added only when deferred-tool disclosure is on ([ADR 0005](/adr/0005-tool-pollution-and-progressive-disclosure)); the agent calls it to load tools that aren't in the per-call base set.
+- One **persona tool** — `edit_soul` — lets the lead agent rewrite a section of its own `SOUL.md` ([ADR 0081](/adr/0081-self-authored-persona-edit-soul)). **Off by default, guarded**: bound only when an operator sets `soul.self_edit_enabled: true`, and never on a subagent. See [`edit_soul`](#edit_soul) below.
 
-`get_all_tools(knowledge_store=None, scheduler=None, inbox_store=None, tasks_store=None, goal_enabled=False)` is the registry; the conditional groups above are included only when their backend is passed (all are constructed by default in `server/agent_init.py`; opt out via `middleware.knowledge: false` / `middleware.scheduler: false`). The render + curation tools are unconditional; the goal + watch tools ride `goal_enabled`. To **drop** a core tool without editing this function, list it in `tools.disabled`.
+`get_all_tools(knowledge_store=None, scheduler=None, inbox_store=None, tasks_store=None, goal_enabled=False, soul_edit_enabled=False, reload_callback=None)` is the registry; the conditional groups above are included only when their backend is passed (all are constructed by default in `server/agent_init.py`; opt out via `middleware.knowledge: false` / `middleware.scheduler: false`). The render + curation tools are unconditional; the goal + watch tools ride `goal_enabled`, and `edit_soul` rides `soul_edit_enabled`. To **drop** a core tool without editing this function, list it in `tools.disabled`.
 
 ## Plugin-provided tools (not in `get_all_tools`)
 
@@ -148,6 +149,15 @@ Top-k keyword search over the store via FTS5 (LIKE fallback). Returns one match 
 
 Returns `"No matches."` when nothing scores above the keyword threshold.
 
+## `recall_session`
+
+```python
+@tool
+async def recall_session(session_id: str) -> str
+```
+
+Expands one entry from the auto-injected `<prior_sessions>` digest into the full persisted session summary — messages and final output, reasoning-stripped, capped at ~6 000 chars ([ADR 0069](/adr/0069-memory-delivery-layer)). The digest itself carries only one attributed line per prior session (id · timestamp · surface · topic · message count), so this tool is the on-demand path to a prior session's content. Errors cleanly on an unknown or malformed id.
+
 ## `memory_list`
 
 ```python
@@ -214,6 +224,43 @@ Cancel a scheduled job by id. Returns `"Canceled <id>."` or `"Error: no such job
 
 Cross-agent cancellation is blocked — `gina-personal` cannot cancel `gina-work`'s jobs even when sharing a sqlite path.
 
+## `wait`
+
+```python
+@tool
+async def wait(seconds: int, then: str) -> str
+```
+
+Yield the turn and resume LATER instead of busy-polling a status tool to wait
+something out ([ADR 0053](/adr/0053-wait-yield-and-resume)). Calling `wait` **ends
+the current turn** (via `WaitYieldMiddleware`) and schedules a one-shot resume
+`seconds` from now; when it fires the agent is re-invoked with `then` as its
+instruction, in the **same conversation thread** (history intact) — so it acts
+exactly once, when the thing is actually ready. This is the right way to run
+long-horizon "do X, wait, do Y" work without burning the recursion budget on a
+poll loop.
+
+`then` is required and **self-contained** — it's the agent's only context on
+resume, so it must name what to do and which entities are involved ("Dock
+NOVAHAUL-5 at X1-UC87-K93, sell the ore, accept the next contract"), not a
+back-reference. `seconds` is clamped to ≥ 1; pass the ETA a status tool gave you
+(e.g. `st_navigate` returns `arriving in Ns` and the exact `wait(N, …)` call) and
+wait the **full** duration in one call — under-waiting just wakes early to wait
+again.
+
+**One pending wait per thread** ([#1702](https://github.com/protoLabsAI/protoAgent/issues/1702)):
+a new `wait` **supersedes** any still-pending wait for the same session (a stable
+`wait:<session>` job id → cancel-then-add), so repeated waits can't stack up into
+a pile of wake-ups that all fire into the thread. A user `schedule_task` uses its
+own id and is untouched. Every scheduling is logged —
+`[wait] thread=… in Ns (superseded a pending wait) → resume: …` — so a stacking
+loop is visible in logs.
+
+**Lead-agent only** (gated on the scheduler; subagents run bounded by `max_turns`
+and don't get it). The yield is durable across restart (a persisted scheduler
+job). For an absolute time or a recurring cadence use `schedule_task` instead —
+`wait` is for "yield for a bit, then pick this back up".
+
 ## `ask_human`
 
 ```python
@@ -275,6 +322,39 @@ only when an `InboxStore` is configured. `priority_floor` selects the tiers:
 `now`-priority items have already fired an Activity turn; `next`/`later` wait for
 this call so the agent decides when to surface them. Returns the items one per
 line, or `"Inbox empty."`.
+
+## `edit_soul`
+
+```python
+@tool
+async def edit_soul(section: str, content: str, mode: str = "replace") -> str
+```
+
+**Guarded, off by default** ([ADR 0081](/adr/0081-self-authored-persona-edit-soul)). Bound to
+the **lead agent only** when an operator opts in with `soul.self_edit_enabled: true`; bounded
+subagents never receive it. Lets the agent durably refine its own persona by rewriting one
+markdown **section** of its `SOUL.md` — `section` is matched case-insensitively (a missing
+section is created), `mode` is `replace` (swap the body) or `append`.
+
+**Scope is persona only** — identity, voice, values, temperament — never operating doctrine
+(SOUL stays pure persona, [ADR 0079](/adr/0079-autonomous-operating-model)). Guardrails: a
+single call edits one section (can't blow away the file), a 64 KB cap keeps the persona prompt
+prefix bounded, and empty/no-op/invalid-mode edits are refused with an error string.
+
+Every edit goes through `write_soul`, so the outgoing persona is **snapshotted to soul-history
+([#1691](https://github.com/protoLabsAI/protoagent/issues/1691))** and is restorable from
+Settings ▸ Identity. The change takes effect on the agent's **next turn**: the server injects its
+graph-reload as a callback so the compiled graph rebinds (atomically — the current turn is
+unaffected) without `tools/` importing `server/`. In builds with no callback wired
+(subagent/eval/script), the save still lands and applies on the next natural reload.
+
+**Never silent.** Every accepted edit publishes a `persona.self_edited` event (section, mode,
+new revision) on the event bus, so the operator sees an identity change in the console even when
+it happens on an autonomous (scheduled/activity) turn — and it leaves a trail if a prompt-injection
+ever drove one. This is the transparency guardrail from ADR 0081's due-diligence against prior art
+(Hermes keeps SOUL.md operator-only; OpenClaw invites unguarded self-edit and treats the soul as a
+prompt-injection surface; Letta added a read-only persona guard after unconstrained self-edits
+degraded identity).
 
 ## Adding your own
 

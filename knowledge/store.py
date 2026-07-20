@@ -36,7 +36,7 @@ import re
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -87,6 +87,12 @@ class Chunk:
     created_at: str
     updated_at: str
     namespace: str | None = None
+    invalidated_at: str | None = None
+    epoch: str | None = None
+    # Why the row was invalidated: NULL = auto-supersession audit history (ADR 0069
+    # D9, kept forever); ``_BULK_DELETE_REASON`` = a reversible bulk delete-by-source
+    # (#1770) that the grace sweep may eventually reap.
+    invalidation_reason: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -98,8 +104,10 @@ class Chunk:
             "source_type": self.source_type,
             "finding_type": self.finding_type,
             "namespace": self.namespace,
+            "epoch": self.epoch,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "invalidated_at": self.invalidated_at,
         }
 
 
@@ -138,6 +146,55 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _normalize_before(before: str | datetime | None) -> str | None:
+    """Normalize a purge cutoff to the stored ``created_at`` format (UTC ISO-8601)
+    so string comparison in SQL is well-defined. ``None`` passes through (no
+    cutoff). Raises ``ValueError`` on an unparseable value — the caller refuses
+    to purge rather than deleting the wrong rows."""
+    if before is None:
+        return None
+    if isinstance(before, datetime):
+        dt = before
+    else:
+        dt = datetime.fromisoformat(str(before).strip())  # ValueError on junk
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)  # naive input = UTC (the stored convention)
+    return dt.astimezone(UTC).isoformat()
+
+
+# Preview length in the hot-write event payload — enough for a console toast /
+# Activity line to be meaningful, small enough to never bloat the bus.
+_HOT_EVENT_PREVIEW_CHARS = 160
+
+
+def _publish_hot_write(chunk_id: int, source: str | None, source_type: str | None, content: str) -> None:
+    """Emit ``memory.hot_written`` on the plugin event bus (ADR 0069 D8).
+
+    ``domain="hot"`` chunks are injected in front of the model EVERY turn, so a
+    write to that domain must be visible, not silent — this is how the console
+    notification path (and any ADR 0039 subscriber) learns one landed, whoever
+    wrote it (agent tool, operator route, plugin SDK). Best-effort via the
+    late-bound ``HOST.publish`` seam (same pattern as ``tasks/store.py``): a
+    missing bus (unit tests, standalone use) or a bus hiccup must never break
+    a store write. The lazy import keeps ``knowledge`` free of a hard ``graph``
+    dependency."""
+    try:
+        from graph.plugins.host import HOST
+
+        if HOST.publish:
+            HOST.publish(
+                "memory.hot_written",
+                {
+                    "chunk_id": chunk_id,
+                    "source": source or "",
+                    "source_type": source_type or "",
+                    "preview": (content or "")[:_HOT_EVENT_PREVIEW_CHARS],
+                },
+            )
+    except Exception:  # noqa: BLE001 — visibility must never break a write
+        log.debug("[knowledge] hot-write event publish failed", exc_info=True)
+
+
 # LIKE escaping — sqlite treats ``%`` and ``_`` as wildcards in LIKE
 # patterns. Without escaping, a search for ``"100%"`` matches every row
 # starting with ``"100"`` instead of literal "100%". We escape them
@@ -153,6 +210,30 @@ def _escape_like(text: str) -> str:
         .replace("%", _LIKE_ESCAPE + "%")
         .replace("_", _LIKE_ESCAPE + "_")
     )
+
+
+def _namespace_clause(namespace: str | list[str] | None, col: str = "namespace") -> tuple[str, list[str]]:
+    """SQL predicate + params for a namespace filter (ADR 0069 D3a).
+
+    Accepts one value or a list. The empty string ``""`` in the filter matches
+    rows with NO namespace (NULL or ''), so scoped auto-inject can still include
+    un-namespaced chunks — most rows written before namespaces were filtered.
+    ``None`` / empty list → no predicate (unfiltered, today's behavior).
+    """
+    if namespace is None:
+        return "", []
+    values = [namespace] if isinstance(namespace, str) else [str(v) for v in namespace]
+    if not values:
+        return "", []
+    named = [v for v in values if v != ""]
+    arms: list[str] = []
+    params: list[str] = []
+    if named:
+        arms.append(f"{col} IN ({','.join('?' for _ in named)})")
+        params.extend(named)
+    if len(named) != len(values):  # "" requested → match un-namespaced rows
+        arms.append(f"({col} IS NULL OR {col} = '')")
+    return "(" + " OR ".join(arms) + ")", params
 
 
 def _fts_quote(token: str) -> str:
@@ -176,6 +257,14 @@ def _has_fts5(db: sqlite3.Connection) -> bool:
         return False
 
 
+# Discriminator stamped on ``invalidation_reason`` by :meth:`KnowledgeStore.invalidate_by_source`
+# (the #1770 bulk soft-delete). It's what lets :meth:`KnowledgeStore.purge_invalidated`
+# reap ONLY bulk-deleted ingests once they age past the grace window, while leaving
+# auto-supersession audit rows (ADR 0069 D9, which stamp ``invalidated_at`` with a NULL
+# reason and are kept forever) untouched. Both paths set ``invalidated_at``, so without
+# this marker they'd be indistinguishable and the sweep would wipe supersession history.
+_BULK_DELETE_REASON = "source_delete"
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS chunks (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -186,12 +275,16 @@ CREATE TABLE IF NOT EXISTS chunks (
     source_type   TEXT,
     finding_type  TEXT,
     namespace     TEXT,
+    epoch         TEXT,
     created_at    TEXT NOT NULL,
-    updated_at    TEXT NOT NULL
+    updated_at    TEXT NOT NULL,
+    invalidated_at TEXT,
+    invalidation_reason TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_chunks_domain     ON chunks(domain);
 CREATE INDEX IF NOT EXISTS idx_chunks_created_at ON chunks(created_at);
+CREATE INDEX IF NOT EXISTS idx_chunks_source     ON chunks(source);
 
 CREATE TABLE IF NOT EXISTS _kb_meta (
     key   TEXT PRIMARY KEY,
@@ -295,6 +388,40 @@ class KnowledgeStore:
                 db.execute("CREATE INDEX IF NOT EXISTS idx_chunks_namespace ON chunks(namespace)")
             except sqlite3.DatabaseError as exc:
                 log.debug("[knowledge] namespace migration skipped: %s", exc)
+            # Migration: add the invalidated_at column (ADR 0069 D9 — supersede,
+            # don't delete). Same additive+nullable pattern as namespace; NULL =
+            # the row is valid, an ISO timestamp = superseded by a newer row.
+            try:
+                cols = {r[1] for r in db.execute("PRAGMA table_info(chunks)")}
+                if "invalidated_at" not in cols:
+                    db.execute("ALTER TABLE chunks ADD COLUMN invalidated_at TEXT")
+                db.execute("CREATE INDEX IF NOT EXISTS idx_chunks_invalidated_at ON chunks(invalidated_at)")
+            except sqlite3.DatabaseError as exc:
+                log.debug("[knowledge] invalidated_at migration skipped: %s", exc)
+            # Migration: add the invalidation_reason column (#1770 — bulk soft delete).
+            # Same additive+nullable pattern. NULL means "invalidated but kept for audit"
+            # (auto-supersession, ADR 0069 D9); ``_BULK_DELETE_REASON`` marks a bulk
+            # delete-by-source so the grace sweep reaps only those. Rows soft-deleted on a
+            # pre-migration build carry a NULL reason and are therefore preserved by the
+            # sweep — the safe (never-lose-audit-history) default.
+            try:
+                cols = {r[1] for r in db.execute("PRAGMA table_info(chunks)")}
+                if "invalidation_reason" not in cols:
+                    db.execute("ALTER TABLE chunks ADD COLUMN invalidation_reason TEXT")
+            except sqlite3.DatabaseError as exc:
+                log.debug("[knowledge] invalidation_reason migration skipped: %s", exc)
+            # Migration: add the epoch column (#1634 — knowledge lifecycle). Same
+            # additive+nullable pattern; an epoch tag ("2026-06-29") scopes a chunk
+            # to one era of a resettable world, so a wipe is a new tag rather than
+            # a delete — old lessons stay for post-mortems but stop matching an
+            # epoch-filtered search.
+            try:
+                cols = {r[1] for r in db.execute("PRAGMA table_info(chunks)")}
+                if "epoch" not in cols:
+                    db.execute("ALTER TABLE chunks ADD COLUMN epoch TEXT")
+                db.execute("CREATE INDEX IF NOT EXISTS idx_chunks_epoch ON chunks(epoch)")
+            except sqlite3.DatabaseError as exc:
+                log.debug("[knowledge] epoch migration skipped: %s", exc)
             self._fts_available = _has_fts5(db)
             if self._fts_available:
                 db.executescript(_FTS_SCHEMA)
@@ -367,6 +494,7 @@ class KnowledgeStore:
         source_type: str | None = None,
         finding_type: str | None = None,
         namespace: str | None = None,
+        epoch: str | None = None,
     ) -> int | None:
         """Insert a chunk. Returns the new row id, or None on failure.
 
@@ -375,6 +503,10 @@ class KnowledgeStore:
         store. We strip ``<scratch_pad>``/``<think>`` defensively — covering all
         writers (memory tools, ingest, harvest, future ones), not just the ones
         that remember to clean their input.
+
+        ``epoch`` (#1634) tags the chunk with the era it was learned in (an
+        opaque string, e.g. a reset date) so ``search(epoch=...)`` can scope
+        retrieval to the current era of a resettable world.
         """
         if not content or not content.strip():
             return None
@@ -389,11 +521,17 @@ class KnowledgeStore:
             cur = db.execute(
                 "INSERT INTO chunks "
                 "(content, domain, heading, source, source_type, finding_type, "
-                "namespace, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (content, domain, heading, source, source_type, finding_type, namespace, now, now),
+                "namespace, epoch, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (content, domain, heading, source, source_type, finding_type, namespace, epoch, now, now),
             )
             db.commit()
-            return int(cur.lastrowid)
+            chunk_id = int(cur.lastrowid)
+            # Hot-memory write visibility (ADR 0069 D8): every write funnels
+            # through here, so this one hook covers every writer of the
+            # always-on domain — agent tool, operator routes, plugin SDK.
+            if domain == "hot":
+                _publish_hot_write(chunk_id, source, source_type, content)
+            return chunk_id
         except sqlite3.DatabaseError:
             log.exception("[knowledge] add_chunk failed")
             return None
@@ -431,6 +569,7 @@ class KnowledgeStore:
         source_type: str | None = None,
         finding_type: str | None = None,
         namespace: str | None = None,
+        epoch: str | None = None,
         max_chars: int | None = None,
         overlap_chars: int | None = None,
         min_chars: int | None = None,
@@ -473,6 +612,7 @@ class KnowledgeStore:
                 source_type=source_type,
                 finding_type=finding_type,
                 namespace=namespace,
+                epoch=epoch,
             )
             if cid is not None:
                 ids.append(cid)
@@ -548,6 +688,9 @@ class KnowledgeStore:
         k: int = 5,
         *,
         domain: str | None = None,
+        namespace: str | list[str] | None = None,
+        include_invalidated: bool = False,
+        epoch: str | None = None,
     ) -> list[dict[str, Any]]:
         """Top-k chunks matching ``query``. Shape matches what the
         ``KnowledgeMiddleware`` consumes: each result has ``table``,
@@ -555,6 +698,17 @@ class KnowledgeStore:
 
         Uses FTS5 when available, else a tokenized LIKE fallback. Returns
         an empty list on no matches or DB failure (never raises).
+        ``namespace`` (ADR 0069 D3a) optionally restricts hits to the given
+        namespace value(s) — see :func:`_namespace_clause` for the ``""``
+        (un-namespaced rows) convention. ``None`` = unfiltered.
+
+        Superseded rows (``invalidated_at`` set — ADR 0069 D9) are excluded
+        by default; ``include_invalidated=True`` is the escape hatch for
+        audit tooling that needs the full history.
+
+        ``epoch`` (#1634) restricts hits to chunks tagged with exactly that
+        epoch (see :meth:`add_chunk`) — chunks from other eras, and untagged
+        chunks, don't match. ``None`` = unfiltered (today's behavior).
         """
         if not query or not query.strip():
             return []
@@ -563,9 +717,9 @@ class KnowledgeStore:
             return []
         try:
             rows = (
-                self._search_fts(db, query, k, domain)
+                self._search_fts(db, query, k, domain, namespace, include_invalidated, epoch)
                 if self._fts_available
-                else self._search_like(db, query, k, domain)
+                else self._search_like(db, query, k, domain, namespace, include_invalidated, epoch)
             )
         except sqlite3.DatabaseError as exc:
             log.warning("[knowledge] search failed: %s", exc)
@@ -591,6 +745,9 @@ class KnowledgeStore:
         query: str,
         k: int,
         domain: str | None,
+        namespace: str | list[str] | None = None,
+        include_invalidated: bool = False,
+        epoch: str | None = None,
     ) -> list[sqlite3.Row]:
         # Sanitize to FTS5-safe tokens; OR them so a multi-word query
         # matches any of the keywords (closer to LIKE behaviour).
@@ -602,20 +759,27 @@ class KnowledgeStore:
         if not tokens:
             return []
         match = " OR ".join(_fts_quote(t) for t in tokens)
+        where = ["chunks_fts MATCH ?"]
+        params: list[Any] = [match]
+        if not include_invalidated:
+            where.append("c.invalidated_at IS NULL")
         if domain:
-            return db.execute(
-                "SELECT c.* FROM chunks_fts f "
-                "JOIN chunks c ON c.id = f.rowid "
-                "WHERE chunks_fts MATCH ? AND c.domain = ? "
-                "ORDER BY rank LIMIT ?",
-                (match, domain, k),
-            ).fetchall()
+            where.append("c.domain = ?")
+            params.append(domain)
+        if epoch:
+            where.append("c.epoch = ?")
+            params.append(epoch)
+        ns_sql, ns_params = _namespace_clause(namespace, col="c.namespace")
+        if ns_sql:
+            where.append(ns_sql)
+            params.extend(ns_params)
+        params.append(k)
         return db.execute(
             "SELECT c.* FROM chunks_fts f "
             "JOIN chunks c ON c.id = f.rowid "
-            "WHERE chunks_fts MATCH ? "
+            f"WHERE {' AND '.join(where)} "
             "ORDER BY rank LIMIT ?",
-            (match, k),
+            params,
         ).fetchall()
 
     def _search_like(
@@ -624,6 +788,9 @@ class KnowledgeStore:
         query: str,
         k: int,
         domain: str | None,
+        namespace: str | list[str] | None = None,
+        include_invalidated: bool = False,
+        epoch: str | None = None,
     ) -> list[sqlite3.Row]:
         tokens = [t for t in re.findall(r"[\w']+", query) if t]
         if not tokens:
@@ -640,9 +807,18 @@ class KnowledgeStore:
             needle = f"%{_escape_like(t)}%"
             params.extend([needle, _LIKE_ESCAPE, needle, _LIKE_ESCAPE])
         sql = f"SELECT *, ({like_clauses}) AS score FROM chunks WHERE score > 0"
+        if not include_invalidated:
+            sql += " AND invalidated_at IS NULL"
         if domain:
             sql += " AND domain = ?"
             params.append(domain)
+        if epoch:
+            sql += " AND epoch = ?"
+            params.append(epoch)
+        ns_sql, ns_params = _namespace_clause(namespace)
+        if ns_sql:
+            sql += f" AND {ns_sql}"
+            params.extend(ns_params)
         sql += " ORDER BY score DESC, id DESC LIMIT ?"
         params.append(k)
         return db.execute(sql, params).fetchall()
@@ -653,15 +829,22 @@ class KnowledgeStore:
         limit: int = 50,
         *,
         namespace: str | None = None,
+        include_invalidated: bool = False,
     ) -> list[Chunk]:
         """Most-recent-first chunk listing. Used by ``memory_list`` and the
         fact consolidator. ``namespace`` (ADR 0021) optionally scopes to one
-        per-project/owner bucket."""
+        per-project/owner bucket.
+
+        Superseded rows (ADR 0069 D9) are excluded by default — so hot-memory
+        injection, ``memory_list``, and the fact consolidator only see valid
+        rows. ``include_invalidated=True`` is the audit escape hatch."""
         db = self._get_db()
         if db is None:
             return []
         clauses: list[str] = []
         params: list[Any] = []
+        if not include_invalidated:
+            clauses.append("invalidated_at IS NULL")
         if domain:
             clauses.append("domain = ?")
             params.append(domain)
@@ -680,8 +863,11 @@ class KnowledgeStore:
         return [Chunk(**dict(r)) for r in rows]
 
     def delete_by_id(self, chunk_id: int) -> bool:
-        """Delete one chunk by id. Used by the fact consolidator to replace a
-        superseded fact (ADR 0021). Returns True if a row was removed."""
+        """HARD-delete one chunk by id. This is the operator-intent path
+        (``forget_memory``, the inspector's DELETE routes) — an explicit
+        delete removes the row outright, history-keeping notwithstanding.
+        Automatic supersession uses :meth:`invalidate_chunk` instead
+        (ADR 0069 D9). Returns True if a row was removed."""
         db = self._get_db()
         if db is None:
             return False
@@ -695,6 +881,50 @@ class KnowledgeStore:
         finally:
             db.close()
 
+    def invalidate_chunk(self, chunk_id: int) -> bool:
+        """Mark one chunk superseded (ADR 0069 D9): set ``invalidated_at`` to
+        now, keeping the row for audit/history. Invalidated rows drop out of
+        ``search``/``list_chunks``/hot memory by default but stay reachable via
+        the ``include_invalidated`` escape hatch. Idempotent-safe: returns True
+        only when a VALID row was invalidated (already-invalidated or unknown
+        ids return False)."""
+        db = self._get_db()
+        if db is None:
+            return False
+        try:
+            now = _now_iso()
+            cur = db.execute(
+                "UPDATE chunks SET invalidated_at = ?, updated_at = ? WHERE id = ? AND invalidated_at IS NULL",
+                (now, now, int(chunk_id)),
+            )
+            db.commit()
+            return cur.rowcount > 0
+        except sqlite3.DatabaseError:
+            log.exception("[knowledge] invalidate_chunk failed")
+            return False
+        finally:
+            db.close()
+
+    def get_hot_memory_entries(self, max_chars: int = 6000) -> list[tuple[int, str]]:
+        """The ``(chunk_id, formatted piece)`` pairs behind :meth:`get_hot_memory`.
+
+        Id-attributed so the per-turn injection record (ADR 0069 D6) can name
+        exactly which hot chunks entered a model call. Same selection/budget
+        semantics as ``get_hot_memory`` (one source of truth — it joins this).
+        Superseded chunks never inject: ``list_chunks`` excludes
+        ``invalidated_at`` rows by default (ADR 0069 D9).
+        """
+        chunks = self.list_chunks(domain="hot", limit=100)  # newest-first, valid-only
+        entries: list[tuple[int, str]] = []
+        total = 0
+        for c in chunks:  # newest-first → oldest trimmed when over budget
+            piece = (f"[{c.heading}] " if c.heading else "") + c.content
+            if total + len(piece) > max_chars:
+                break
+            entries.append((c.id, piece))
+            total += len(piece)
+        return entries
+
     def get_hot_memory(self, max_chars: int = 6000) -> str:
         """Concatenate every ``domain="hot"`` chunk for always-on injection.
 
@@ -703,16 +933,7 @@ class KnowledgeStore:
         this each turn so a newly-added hot fact is seen immediately. Returns
         "" when there are none; trims oldest-first if over ``max_chars``.
         """
-        chunks = self.list_chunks(domain="hot", limit=100)  # newest-first
-        formatted: list[str] = []
-        total = 0
-        for c in chunks:  # newest-first → oldest trimmed when over budget
-            piece = (f"[{c.heading}] " if c.heading else "") + c.content
-            if total + len(piece) > max_chars:
-                break
-            formatted.append(piece)
-            total += len(piece)
-        return "\n".join(formatted)
+        return "\n".join(piece for _, piece in self.get_hot_memory_entries(max_chars))
 
     def stats(self) -> dict[str, int]:
         """Return per-domain chunk counts plus a ``total`` key."""
@@ -855,6 +1076,156 @@ class KnowledgeStore:
             return int(cur.rowcount)
         except sqlite3.DatabaseError as exc:
             log.warning("[knowledge] delete_by_namespace failed: %s", exc)
+            return 0
+        finally:
+            db.close()
+
+    def purge_domain(self, domain: str, *, before: str | datetime | None = None) -> int:
+        """HARD-delete every chunk in ``domain`` — optionally only those created
+        strictly before ``before`` (an ISO-8601 timestamp or a datetime; naive =
+        UTC). The knowledge-lifecycle primitive (#1634): a long-running plugin
+        retires a whole bucket of now-wrong lessons (or just the old ones) in one
+        call. Returns the count removed.
+
+        Explicit-intent path like :meth:`delete_by_id` — rows are removed
+        outright (the FTS delete trigger keeps ``chunks_fts`` in sync); for
+        keep-for-audit retirement, tag writes with ``epoch`` instead. An empty
+        ``domain`` or an unparseable ``before`` refuses to purge (returns 0)
+        rather than risk deleting the wrong rows."""
+        if not domain or not domain.strip():
+            return 0
+        try:
+            cutoff = _normalize_before(before)
+        except ValueError:
+            log.warning("[knowledge] purge_domain(%r): unparseable before=%r — refusing to purge", domain, before)
+            return 0
+        db = self._get_db()
+        if db is None:
+            return 0
+        try:
+            sql = "DELETE FROM chunks WHERE domain = ?"
+            params: list[Any] = [domain]
+            if cutoff is not None:
+                sql += " AND created_at < ?"
+                params.append(cutoff)
+            cur = db.execute(sql, params)
+            db.commit()
+            return int(cur.rowcount)
+        except sqlite3.DatabaseError as exc:
+            log.warning("[knowledge] purge_domain failed: %s", exc)
+            return 0
+        finally:
+            db.close()
+
+    # ── bulk delete-by-source lifecycle (#1770) ─────────────────────────────
+    # Deleting a whole ingest one chunk at a time is impractical, so the console
+    # groups chunks by source and bulk-deletes them. It's a SOFT delete: the rows
+    # are invalidated (drop out of search/list/hot-memory at once, ADR 0069 D9) but
+    # survive a grace window so an Undo — restore_by_source — can bring them back.
+    # purge_invalidated is the sweep that eventually makes the removal permanent.
+
+    def invalidate_by_source(self, source: str) -> int:
+        """SOFT-delete every VALID chunk sharing ``source`` — stamp
+        ``invalidated_at`` so the whole ingest leaves recall at once while the rows
+        survive for a grace window. Backs the console's bulk "delete all chunks
+        from this source" (#1770); reversible via :meth:`restore_by_source`, made
+        permanent by :meth:`purge_invalidated`. Empty/whitespace ``source`` is a
+        no-op (0) — never an ``invalidated_at = everything`` sweep. Returns the
+        count newly invalidated (already-invalidated rows aren't recounted).
+
+        Stamps ``invalidation_reason = _BULK_DELETE_REASON`` alongside
+        ``invalidated_at`` so :meth:`purge_invalidated` can tell a reapable bulk
+        soft-delete apart from an auto-supersession audit row (ADR 0069 D9), which
+        leaves the reason NULL and is kept forever."""
+        if not source or not source.strip():
+            return 0
+        db = self._get_db()
+        if db is None:
+            return 0
+        try:
+            now = _now_iso()
+            cur = db.execute(
+                "UPDATE chunks SET invalidated_at = ?, invalidation_reason = ?, updated_at = ? "
+                "WHERE source = ? AND invalidated_at IS NULL",
+                (now, _BULK_DELETE_REASON, now, source),
+            )
+            db.commit()
+            return int(cur.rowcount)
+        except sqlite3.DatabaseError as exc:
+            log.warning("[knowledge] invalidate_by_source failed: %s", exc)
+            return 0
+        finally:
+            db.close()
+
+    def restore_by_source(self, source: str) -> int:
+        """Clear ``invalidated_at`` on every BULK-SOFT-DELETED chunk sharing
+        ``source`` — the inverse of :meth:`invalidate_by_source`, backing the
+        console's Undo toast (#1770). Only rows still present (not yet swept by
+        :meth:`purge_invalidated`) can be restored. Empty ``source`` is a no-op.
+        Returns the count restored.
+
+        Scoped to ``invalidation_reason = _BULK_DELETE_REASON`` so an Undo can only
+        resurrect what THIS feature soft-deleted — never an auto-supersession audit
+        row (ADR 0069 D9) that happens to share the ``source`` string. Clears the
+        reason marker on the way back out."""
+        if not source or not source.strip():
+            return 0
+        db = self._get_db()
+        if db is None:
+            return 0
+        try:
+            cur = db.execute(
+                "UPDATE chunks SET invalidated_at = NULL, invalidation_reason = NULL, updated_at = ? "
+                "WHERE source = ? AND invalidation_reason = ?",
+                (_now_iso(), source, _BULK_DELETE_REASON),
+            )
+            db.commit()
+            return int(cur.rowcount)
+        except sqlite3.DatabaseError as exc:
+            log.warning("[knowledge] restore_by_source failed: %s", exc)
+            return 0
+        finally:
+            db.close()
+
+    def _invalidated_cutoff(self, older_than_seconds: int) -> str:
+        """The ``invalidated_at`` boundary for :meth:`purge_invalidated`: rows
+        stamped at or before this UTC-ISO instant are past the grace window. Shared
+        with the hybrid override so both delete under ONE cutoff (no orphan-vector
+        window from a second ``now()``)."""
+        return (datetime.now(UTC) - timedelta(seconds=max(0, int(older_than_seconds)))).isoformat()
+
+    def purge_invalidated(self, older_than_seconds: int = 0, *, _cutoff: str | None = None) -> int:
+        """HARD-delete BULK-SOFT-DELETED chunks whose ``invalidated_at`` is at or
+        older than ``older_than_seconds`` ago — the grace sweep that makes a bulk
+        delete-by-source (#1770) eventually permanent.
+
+        Reaps ONLY rows stamped ``invalidation_reason = _BULK_DELETE_REASON`` by
+        :meth:`invalidate_by_source`. Auto-supersession rows (ADR 0069 D9, which set
+        ``invalidated_at`` with a NULL reason) are deliberately excluded and kept
+        forever as audit history — the ``include_invalidated`` escape hatch stays
+        populated. Without this reason filter the sweep would silently wipe that
+        supersession history on the first bulk delete.
+
+        ``older_than_seconds<=0`` purges every bulk-soft-deleted row now. Returns the
+        count removed.
+
+        The FTS delete trigger keeps ``chunks_fts`` in sync; a hybrid store
+        overrides this to drop the side-table vectors first (no FK cascade).
+        ``_cutoff`` is an internal seam for that override to share one boundary."""
+        db = self._get_db()
+        if db is None:
+            return 0
+        try:
+            cutoff = _cutoff if _cutoff is not None else self._invalidated_cutoff(older_than_seconds)
+            cur = db.execute(
+                "DELETE FROM chunks "
+                "WHERE invalidated_at IS NOT NULL AND invalidated_at <= ? AND invalidation_reason = ?",
+                (cutoff, _BULK_DELETE_REASON),
+            )
+            db.commit()
+            return int(cur.rowcount)
+        except sqlite3.DatabaseError as exc:
+            log.warning("[knowledge] purge_invalidated failed: %s", exc)
             return 0
         finally:
             db.close()

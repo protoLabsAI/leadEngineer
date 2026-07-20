@@ -56,8 +56,29 @@ jobs:
         with:
           python-version: '3.12'
 
+      - uses: astral-sh/setup-uv@v6
+        with:
+          # MUST match checks.yml's pin — that job's `uv lock --check` validates what this
+          # job writes, so a version skew between them would open a release PR that its own
+          # CI rejects. uv's lock output is version-dependent; see the note in checks.yml.
+          version: "0.11.29"
+
       - name: Bump version
         run: python scripts/version.py ${{ inputs.bump || 'patch' }}
+
+      - name: Re-lock
+        # The version bump above rewrites pyproject.toml's `version`, which uv.lock
+        # records for the project itself — so without this the lock ships one version
+        # behind on every single release and `uv lock --check` fails the moment the
+        # bump PR lands. That drift is what #1998 had to clean up.
+        #
+        # NOT `--offline` (tried it, broke the v0.103.2 cut): `uv lock` re-resolves the
+        # full graph either way, so --offline just denies it the index and it fails on a
+        # runner's cold cache ("No solution found ... only a2a-sdk<1.1 is available").
+        # Plain `uv lock` doesn't drift deps anyway — it prefers the versions already
+        # pinned in uv.lock and changes only what must change (that's `--upgrade`'s job),
+        # so a release PR's lock diff is just the project's own version line.
+        run: uv lock
 
       - name: Read new version
         id: version
@@ -93,7 +114,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           git checkout -b "${BRANCH}"
-          git add pyproject.toml CHANGELOG.md sites/marketing/data/changelog.json
+          git add pyproject.toml uv.lock CHANGELOG.md sites/marketing/data/changelog.json
           git commit -m "chore: release v${VERSION}"
           git push origin "${BRANCH}"
 

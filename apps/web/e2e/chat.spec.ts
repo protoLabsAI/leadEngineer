@@ -1,5 +1,7 @@
 import { expect, test } from "@playwright/test";
 
+import { seedCurrentChat } from "./chat-helpers";
+
 // Drives the chat surface against the mock A2A stream and asserts the
 // tool-call card contract: stable collapsed-by-default rows, pretty-printed
 // JSON on expand, clean markdown answers, and no horizontal overflow.
@@ -80,7 +82,7 @@ test("expanded state is sticky and the assistant answer renders as markdown", as
 test("a completed turn shows a context meter + token/cost footer (#1372)", async ({ page }) => {
   await send(page, "what is the capital of France?");
 
-  // The terminal cost-v1 + context-v1 DataParts → a quiet footer under the answer:
+  // The terminal cost-v1 metadata + context-v1 DataPart → a quiet footer under the answer:
   // context-window fill (with a compaction bar) / output ↓ / $cost.
   const usage = page.locator(".pl-message--assistant .chat-usage").first();
   await expect(usage).toBeVisible();
@@ -142,6 +144,7 @@ test("right-click a chat tab → New chat / Rename / Close, and New chat adds a 
   // ADR 0036 — the chat tab context menu. Default has one session tab.
   const tabs = page.locator(".pl-tabbar__tab");
   await expect(tabs).toHaveCount(1);
+  await seedCurrentChat(page); // a pristine blank is reused, so "New chat" would be a no-op
 
   await tabs.first().click({ button: "right" });
   const menu = page.locator(".pl-menu");
