@@ -87,6 +87,34 @@ def _bundle_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
+def _ensure_ca_bundle_env() -> None:
+    """Point native TLS clients at the bundled CA certificates when frozen.
+
+    In a PyInstaller onefile build (the desktop sidecar) the OS trust-store
+    discovery a native TLS client relies on doesn't resolve — so ``ddgs`` (the
+    ``web_search`` backend, which verifies over OpenSSL via ``primp``) fails with
+    ``CERTIFICATE_VERIFY_FAILED``, even though ``httpx`` calls work (httpx loads
+    ``certifi.where()`` directly). Export ``SSL_CERT_FILE`` / ``REQUESTS_CA_BUNDLE`` /
+    ``CURL_CA_BUNDLE`` to the bundled ``certifi`` bundle so OpenSSL-backed clients
+    verify against it.
+
+    Frozen-only, ``setdefault`` so an operator's explicit override always wins, and a
+    no-op in a source checkout (system discovery already works there). Must run before
+    the first outbound TLS request."""
+    if not getattr(sys, "frozen", False):
+        return
+    try:
+        import certifi
+
+        ca = certifi.where()
+    except Exception:  # noqa: BLE001 — a missing/broken certifi must never block boot
+        return
+    if not ca or not os.path.exists(ca):
+        return
+    for var in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"):
+        os.environ.setdefault(var, ca)
+
+
 def _resolve_operator_project_root() -> str:
     """The operator console's default project root (+ its always-allowed dir).
 
@@ -137,14 +165,19 @@ def _install_parent_death_watchdog() -> None:
 
     import threading
 
+    from infra.paths import pid_alive
+
     def _watch() -> None:
+        # pid_alive, NOT os.kill(ppid, 0): on Windows signal 0 is CTRL_C_EVENT, which
+        # fails with OSError against a GUI launcher — the old probe read the healthy
+        # desktop shell as "gone" and self-killed the sidecar ~2s after every Windows
+        # boot (#1678). (It also misread POSIX PermissionError — exists — as dead.)
         while True:
             time.sleep(2)
             try:
-                os.kill(ppid, 0)  # signal 0 = liveness probe; raises if gone
-            except OSError:
-                log.info("[watchdog] launcher pid %d gone — exiting sidecar", ppid)
-                os._exit(0)
+                if not pid_alive(ppid):
+                    log.info("[watchdog] launcher pid %d gone — exiting sidecar", ppid)
+                    os._exit(0)
             except Exception:  # noqa: BLE001 — never let the watchdog crash the server
                 return
 
@@ -237,6 +270,8 @@ from server.agent_init import (  # noqa: E402,F401 — re-export of the extracte
     _build_telemetry_store,
     _checkpoint_prune_loop,
     _init_langgraph_agent,
+    _plugin_autoupdate_loop,
+    _secrets_refresh_loop,
     _watch_loop,
     _mount_plugin_routers,
     _plugin_agent_invoke,
@@ -260,47 +295,23 @@ from server.agent_init import (  # noqa: E402,F401 — re-export of the extracte
 
 
 def _main():
+    # Frozen sidecar TLS: point native clients (primp → ddgs → web_search) at the
+    # bundled certifi CA bundle before any outbound request, else DuckDuckGo search
+    # fails CERTIFICATE_VERIFY_FAILED in the desktop app. No-op in a source checkout.
+    _ensure_ca_bundle_env()
 
-    # Plugin management subcommand (ADR 0027): `python -m server plugin install
-    # <git-url>` (+ list/uninstall/sync). Handled before the server argparse —
-    # it fetches code to disk and exits, never starting the server.
-    if len(sys.argv) > 1 and sys.argv[1] == "plugin":
-        from graph.plugins.cli import run_plugin_cli
+    # Management + lifecycle subcommands (ADR 0075 D1) — `plugin` / `workspace` /
+    # `skills` / `fleet` / `config` (act on disk/DBs and exit) plus `up`/`down`/
+    # `status`. Routed through the SINGLE shared dispatcher so `python -m server
+    # <sub>` and the `protoagent` command can never drift; `dispatch` returns an exit
+    # code when it handled the args, or None to fall through to the server boot below
+    # (a bare invocation / server flags). The `protoagent` front door adds `--help`
+    # discoverability, `serve`, and `setup` on top of this same dispatcher.
+    from server.cli import dispatch
 
-        raise SystemExit(run_plugin_cli(sys.argv[2:]))
-
-    # Workspace management subcommand (ADR 0041): `python -m server workspace
-    # new/ls/run/rm` — named, isolated agents on one host. `new`/`ls`/`rm` act on
-    # disk and exit; `run` execs the normal server with the workspace's config dir +
-    # instance + port wired in (so the dispatch below runs unchanged for it).
-    if len(sys.argv) > 1 and sys.argv[1] == "workspace":
-        from graph.workspaces.cli import run_workspace_cli
-
-        raise SystemExit(run_workspace_cli(sys.argv[2:]))
-
-    # Skills subcommand (ADR 0041 slice 3): `python -m server skills ls|promote <name>`
-    # — inspect/curate the layered (commons ∪ private) skill library. Acts on the DBs
-    # and exits.
-    if len(sys.argv) > 1 and sys.argv[1] == "skills":
-        from graph.skills.cli import run_skills_cli
-
-        raise SystemExit(run_skills_cli(sys.argv[2:]))
-
-    # Fleet subcommand (ADR 0042 slice 1): `python -m server fleet up|down|ls` —
-    # run workspace agents as persistent background processes (start/stop/status).
-    if len(sys.argv) > 1 and sys.argv[1] == "fleet":
-        from graph.fleet.cli import run_fleet_cli
-
-        raise SystemExit(run_fleet_cli(sys.argv[2:]))
-
-    # Config subcommand: `python -m server config explain` — a read-only diagnostic
-    # that prints this instance's identity, both roots, every resolved path, and the
-    # per-field cascade provenance (the "where did my config/key go?" answer). Acts
-    # on disk + the env, then exits; never starts the server.
-    if len(sys.argv) > 1 and sys.argv[1] == "config":
-        from graph.config_explain import run_config_cli
-
-        raise SystemExit(run_config_cli(sys.argv[2:]))
+    _sub_code = dispatch(sys.argv[1:])
+    if _sub_code is not None:
+        raise SystemExit(_sub_code)
 
     # Frozen-binary entrypoint for a plugin's managed MCP server (ADR 0019): the
     # bundled desktop app has no `python` on PATH, so a plugin's managed-server
@@ -367,6 +378,10 @@ def _main():
     if ui == "full":  # the Gradio tier was removed; 'full' is now an alias for console.
         log.warning("--ui full / PROTOAGENT_UI=full is deprecated (the Gradio UI was removed) — using console.")
         ui = "console"
+    # Mirror the FINAL resolved tier into the env: graph/config.py's tier-aware
+    # defaults (e.g. filesystem.allow_run, #1849) read PROTOAGENT_UI directly, and
+    # need this value whether it came from --ui, PROTOAGENT_UI, or --headless.
+    os.environ["PROTOAGENT_UI"] = ui
 
     # `--setup` one-shot: complete setup headlessly and exit.
     if args.setup:
@@ -374,11 +389,13 @@ def _main():
         from graph.config_io import (
             config_yaml_path,
             ensure_live_config,
+            ensure_live_soul,
             mark_setup_complete,
             validate_for_headless,
         )
 
         ensure_live_config()
+        ensure_live_soul()
         cfg = LangGraphConfig.from_yaml(config_yaml_path())
         ok, reason = validate_for_headless(cfg)
         if not ok:
@@ -398,12 +415,15 @@ def _main():
 
     tracing.init()
     metrics.init()
+    # trace_export.init() runs later (after config loads) so it can honor the
+    # telemetry.fleet_trace_export toggle, not just the env var.
 
     _init_langgraph_agent(headless_setup=headless_setup)
 
     import uvicorn
     from fastapi import FastAPI, Request
     from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.middleware.gzip import GZipMiddleware
     from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
     from fastapi.staticfiles import StaticFiles
     from pydantic import BaseModel as PydanticBaseModel
@@ -420,6 +440,16 @@ def _main():
         allow_headers=["*"],
         allow_credentials=True,
     )
+    # gzip every text/JSON response — the console's own JS bundle is ~1 MB and was
+    # shipping uncompressed (gzips ~79%); assets are cached immutable but STILL
+    # recompressed per request, so keep compresslevel at the web-standard 6 (level 9
+    # buys ~1% for materially more CPU). SSE is the one thing that must NOT be buffered:
+    # Starlette's GZipMiddleware excludes `text/event-stream` by default
+    # (DEFAULT_EXCLUDED_CONTENT_TYPES) and skips already-`content-encoding`'d bodies, so
+    # the chat stream, the event bus, A2A message/stream (sse-starlette), and the fleet
+    # proxy's forwarded SSE all pass through untouched. minimum_size skips tiny JSON
+    # where gzip framing would cost more than it saves. See issue #2005.
+    fastapi_app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=6)
 
     # --- React operator-console API ----------------------------------------
     # Console handler bodies live in operator_api/console_handlers.py (ADR 0023
@@ -526,6 +556,25 @@ def _main():
 
             STATE.watch_task = asyncio.create_task(_watch_loop())
 
+        # Opt-in plugin auto-update (#1720) — only sweeps plugins the operator lists
+        # in ``plugins.update_policy``; the loop self-guards each pass (empty policy
+        # or interval 0 ⇒ idle). Start it unconditionally so a later config reload
+        # that turns it on takes effect without a restart — the idle loop just sleeps.
+        if STATE.graph_config is not None:
+            import asyncio
+
+            STATE.plugin_autoupdate_task = asyncio.create_task(_plugin_autoupdate_loop())
+
+        # External secrets-manager refresh (ADR 0080) — re-pull env vars on the
+        # configured interval so rotation lands without a restart. Started
+        # unconditionally for the same reason as the auto-update loop above: the
+        # loop self-guards (disabled / refresh 0 ⇒ idle), so enabling it via a
+        # config reload takes effect without a restart.
+        if STATE.graph_config is not None:
+            import asyncio
+
+            STATE.secrets_refresh_task = asyncio.create_task(_secrets_refresh_loop())
+
         # (The inbound Discord gateway now starts as the discord plugin's surface,
         # below — ADR 0018/0019.)
 
@@ -538,11 +587,22 @@ def _main():
                 if asyncio.iscoroutine(res):
                     res = await res
                 STATE.plugin_surface_handles.append(
-                    {"name": s["name"], "stop": s.get("stop"), "reload": s.get("reload"), "handle": res}
+                    {
+                        "plugin_id": s.get("plugin_id"),
+                        "name": s["name"],
+                        "stop": s.get("stop"),
+                        "reload": s.get("reload"),
+                        "handle": res,
+                    }
                 )
                 log.info("[plugins] started surface: %s", s["name"])
             except Exception:
                 log.exception("[plugins] surface %s failed to start", s.get("name"))
+        # The startup surface-start loop has run — a config reload may now RECONCILE
+        # (hot-start newly-enabled surfaces, stop removed ones) instead of leaving them
+        # until a full restart. Before this point a reload must not hot-start, or a
+        # surface would start twice (here AND in reconcile). ADR 0018.
+        STATE.plugin_surfaces_started = True
 
         # Fleet discovery (ADR 0042 §I) — advertise this agent on mDNS so siblings on the LAN can
         # find it. Best-effort; never breaks boot. Off the loop (to_thread): sync Zeroconf
@@ -585,8 +645,32 @@ def _main():
             from graph.fleet import supervisor as _sup
 
             await asyncio.to_thread(_sup.reconcile_on_boot)
+            # Autostart roster (ADR 0072 slice): bring declared members back up after a
+            # container recreate / host restart killed their detached processes. Off the
+            # loop (spawns + per-member boot-watch), best-effort — never blocks hub boot.
+            await asyncio.to_thread(_sup.start_autostart_members)
         except Exception:
             log.exception("[fleet] boot version reconcile failed")
+
+        # System lifecycle: app.loaded (ADR 0074). Boot is done — graph compiled, scheduler
+        # + surfaces + fleet autostart up — so broadcast it on the bus, fire plugin
+        # lifecycle hooks, and run any configured `lifecycle_hooks` reactions (opt-in; empty
+        # config ⇒ just the broadcast). Fire-and-forget on the loop so a webhook/prompt
+        # reaction never stalls the last step of boot; the dispatcher isolates every failure.
+        try:
+            import time as _time
+
+            from graph import lifecycle as _lifecycle
+
+            payload = {
+                "ts": _time.time(),
+                "agent": agent_name(),
+                "port": getattr(STATE, "active_port", None),
+                "previous_state": "boot",
+            }
+            asyncio.create_task(_lifecycle.fire("app_loaded", payload))
+        except Exception:
+            log.exception("[lifecycle] app.loaded emit failed")
 
     @fastapi_app.on_event("shutdown")
     async def _scheduler_shutdown() -> None:
@@ -643,6 +727,8 @@ def _main():
             STATE.checkpoint_prune_task.cancel()
         if STATE.watch_task is not None:
             STATE.watch_task.cancel()
+        if STATE.plugin_autoupdate_task is not None:
+            STATE.plugin_autoupdate_task.cancel()
         # Close the long-lived A2A push-notification client (created below in
         # _main) so its connection pool doesn't leak on shutdown/reload — matters
         # in the desktop-sidecar restart loop. Best-effort; NameError if boot
@@ -651,6 +737,14 @@ def _main():
             await _a2a_push_client.aclose()
         except Exception:
             log.exception("[a2a] push client close failed")
+        # Flush buffered Langfuse observations LAST (after every surface above
+        # has stopped emitting) so in-flight spans survive process exit instead
+        # of dying in the SDK's batch buffer. Off the loop — flush() blocks on
+        # the exporter. Best-effort, like everything else in this hook.
+        try:
+            await asyncio.to_thread(tracing.flush)
+        except Exception:  # noqa: BLE001 — shutdown teardown is best-effort
+            log.exception("[tracing] flush on shutdown failed")
 
     # Chat / goal / health / OpenAI-compat HTTP surface. Extracted to
     # operator_api/chat_routes.py (ADR 0023 phase 3); ``ui`` is passed in
@@ -660,6 +754,12 @@ def _main():
     # Knowledge store + Playbooks (ADR 0020). Extracted to
     # operator_api/knowledge_routes.py (ADR 0023 phase 3).
     register_knowledge_routes(fastapi_app)
+
+    # Memory inspector (ADR 0069 D7) — /api/memory/*: the session summaries
+    # behind the <prior_sessions> digest + always-injected hot memory.
+    from operator_api.memory_routes import register_memory_routes
+
+    register_memory_routes(fastapi_app)
     register_plugin_routes(fastapi_app)
 
     # Operator server controls — POST /api/restart (graceful self-restart). Gated by
@@ -668,11 +768,38 @@ def _main():
 
     register_runtime_control_routes(fastapi_app)
 
+    # Managed Node runtime (ADR 0085) — /api/runtime/node status + one-click install,
+    # so the console can provision node/npx for the npx-based ACP agents + MCP servers
+    # on a machine that has no Node of its own.
+    from operator_api.node_routes import register_node_routes
+
+    register_node_routes(fastapi_app)
+
+    # Device pairing (ADR 0087) — /api/pairing/* + /api/devices. Lets the operator add a
+    # phone by QR instead of hand-typing a bearer, and revoke it individually afterwards.
+    # NOTE: /api/pairing/claim is on the auth allowlist by necessity (it mints the
+    # credential); see a2a_impl/auth.py `_PUBLIC_EXACT` and ADR 0087 D4.
+    from operator_api.pairing_routes import register_pairing_routes
+
+    register_pairing_routes(fastapi_app)
+
     # Fleet control plane (ADR 0042) — /api/fleet (list/create/start/stop) +
     # /api/archetypes. The CLI + the desktop GUI panels both drive these.
     from operator_api.fleet_routes import register_fleet_routes
 
     register_fleet_routes(fastapi_app)
+
+    # Developer flags (ADR 0068) — /api/flags serves the resolved flag states the
+    # console Developer panel renders + toggles.
+    from operator_api.flags_routes import register_flags_routes
+
+    register_flags_routes(fastapi_app)
+
+    # External secrets manager (ADR 0080) — /api/secrets status / sync-now /
+    # connection-test for the Settings panel.
+    from operator_api.secrets_routes import register_secrets_routes
+
+    register_secrets_routes(fastapi_app)
 
     # Per-agent theme (ADR 0042) — each agent saves its own look; the console repaints
     # to the focused agent's theme (proxied via /agents/<slug>/api/theme, slug routing).
@@ -686,10 +813,21 @@ def _main():
     # operator_api/telemetry_routes.py (ADR 0023 phase 3).
     register_telemetry_routes(fastapi_app)
 
+    # Memory-injection record (ADR 0069 D6) — which memory items entered which
+    # turn. Read-only forensics surface over observability/injection_log.py.
+    from operator_api.injection_routes import register_injection_routes
+
+    register_injection_routes(fastapi_app)
+
     # Live config / SOUL editing, model probe/test, setup wizard, and
     # schema-driven settings. Extracted to operator_api/config_routes.py
     # (ADR 0023 phase 3).
     register_config_routes(fastapi_app)
+
+    # GET /api/operations — the ops-layer catalog (ADR 0075 D2), derived from ops.registry().
+    from operator_api.operations_routes import register_operations_routes
+
+    register_operations_routes(fastapi_app)
 
     # OpenAI-compatible /v1/chat/completions + /v1/models are registered above
     # by register_chat_routes (operator_api/chat_routes.py, ADR 0023 phase 3).
@@ -706,6 +844,7 @@ def _main():
 
     from a2a_impl import auth
     from a2a_impl.executor import ProtoAgentExecutor, set_progress_hook, set_terminal_hook
+    from a2a_impl.registry import harden_active_task_registry
     from a2a_impl.stores import (
         build_a2a_stores,
         build_push_sender,
@@ -713,6 +852,13 @@ def _main():
     )
 
     STATE.telemetry_store = _build_telemetry_store(STATE.graph_config)
+
+    # Fleet trace export → lab (the flywheel Observe, #1897). Init here (not in the
+    # early observability block) so it can honor the telemetry.fleet_trace_export
+    # config toggle — the env var still overrides in both directions.
+    from observability import trace_export
+
+    trace_export.init(config_enabled=getattr(STATE.graph_config, "fleet_trace_export_enabled", False))
 
     # ADR 0003 / 0006: record telemetry + surface Activity output on terminal.
     set_terminal_hook(_a2a_terminal)
@@ -739,6 +885,21 @@ def _main():
         federation_token=((STATE.graph_config.federation_token if STATE.graph_config else "") or None),
     )
 
+    # Member-public deferral for the fleet proxy (#1890): a member's plugin view
+    # pages are public chrome on the MEMBER, but through the hub they live at
+    # /agents/<slug>/… — a prefix the hub's own public list can't know (the member
+    # may run plugins the hub doesn't). Every instance serves its live auth-exempt
+    # list on a public /.well-known endpoint (the listed paths are anonymously
+    # reachable by definition, so the list discloses nothing new), and the hub's
+    # auth gate defers slug-prefixed plugin-namespace paths to that list.
+    from graph.fleet import member_public as _member_public
+
+    auth.set_member_public_resolver(_member_public.is_member_public)
+
+    @fastapi_app.get(_member_public.WELL_KNOWN_PATH, include_in_schema=False)
+    async def _plugin_public_paths():
+        return {"public_paths": auth.public_prefixes()}
+
     # Short-lived SSE token endpoint (Part 3 of auth inversion): the React
     # console fetches a 30s HMAC token here (bearer-gated under /api/) and
     # passes it to ``EventSource("/api/events?token=...")``. Server-to-server
@@ -746,6 +907,13 @@ def _main():
     @fastapi_app.get("/api/sse-token", include_in_schema=False)
     async def _sse_token():
         return {"token": auth.generate_sse_token()}
+
+    # Core media output channel (#1929): ONE route serves every artifact a plugin
+    # tool saved via registry.save_media() — signed-URL / opt-in-public access is
+    # enforced by the auth middleware installed above (see infra/media.py).
+    from server.media import register_media_routes
+
+    register_media_routes(fastapi_app)
 
     a2a_card = _build_agent_card_proto()
     # Deploy-time guard (opt-in): refuse to start if the card would advertise a
@@ -815,15 +983,26 @@ def _main():
         push_config_store=push_config_store,
         push_sender=build_push_sender(push_config_store, _a2a_push_client),
     )
+    # a2a-sdk 1.1.0 GC's a turn's still-pending `producer:<task_id>` task at teardown
+    # (upstream a2a-python#1123; #1713) — 'Task was destroyed but it is pending!' at
+    # every turn completion under load. Swap in a registry whose cleanup owns the
+    # producer/consumer tasks for their lifetime: strong-ref'd and awaited (grace to
+    # flush) or cancelled+awaited before the last reference drops. Remove once the
+    # SDK ships the fix and the pin moves past 1.1.0 (see a2a_impl/registry.py).
+    harden_active_task_registry(a2a_request_handler)
     add_a2a_routes_to_fastapi(
         fastapi_app,
         # ``agent_card_routes`` (server.a2a) serves the same well-known card as
         # a2a-sdk's ``create_agent_card_routes`` plus a proto-free protocolVersion
         # hint, so a delegating peer can pre-check version compatibility (ADR 0051).
         agent_card_routes=agent_card_routes(a2a_card),
-        jsonrpc_routes=create_jsonrpc_routes(a2a_request_handler, rpc_url="/a2a"),
+        # enable_v0_3_compat: a2a-sdk 1.1.0 renamed the JSON-RPC methods; without the
+        # compat adapter every classic client (`message/send` — the fleet's delegate
+        # spine, our own docs' curl examples) gets -32601 Method not found (#1854).
+        # Both vocabularies serve on the same endpoint until the fleet migrates.
+        jsonrpc_routes=create_jsonrpc_routes(a2a_request_handler, rpc_url="/a2a", enable_v0_3_compat=True),
     )
-    log.info("[a2a] a2a-sdk routes mounted (JSON-RPC at /a2a, card at /.well-known/agent-card.json)")
+    log.info("[a2a] a2a-sdk routes mounted (JSON-RPC at /a2a + v0.3 compat, card at /.well-known/agent-card.json)")
 
     # --- Prometheus metrics -------------------------------------------------
     if metrics.is_enabled():
@@ -923,6 +1102,13 @@ def _main():
         ) or "127.0.0.1"
 
     log.info("Starting %s (ui=%s) on http://%s:%d", agent_name(), ui, args.host, args.port)
+
+    # Tell the pairing routes what we actually bound to (ADR 0087 D6). Enumerating the
+    # host's interfaces isn't enough: a loopback-bound server still HAS a LAN address, and
+    # offering it as a pairing target produces a QR that silently can't work.
+    from operator_api.pairing_routes import set_bind_host
+
+    set_bind_host(args.host)
 
     # Boot gate: a non-loopback bind with no A2A auth token exposes the full
     # operator API (plugin install+enable = code execution, config/SOUL

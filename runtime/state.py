@@ -24,12 +24,17 @@ class AppState:
     checkpoint_prune_task: Any = None
     monitor_goals_task: Any = None  # ADR 0030 monitor-goal cadence loop
     watch_task: Any = None  # ADR 0067 watch cadence loop
+    plugin_autoupdate_task: Any = None  # #1720 opt-in plugin auto-update loop
+    secrets_refresh_task: Any = None  # ADR 0080 external secrets-manager refresh loop
     # Stores / registries bound into the active graph.
     knowledge_store: Any = None
     skills_index: Any = None
     workflow_registry: Any = None  # set by the workflows plugin (None = plugin disabled)
     workflow_run: Any = None  # async (name, inputs, on_step) -> result; set by the workflows plugin
     telemetry_store: Any = None
+    # Plugin metric timeseries (#1632) — behind sdk.record_metric / metric_history /
+    # metric_last. Wired once at boot (path isn't reloadable config); survives reloads.
+    metrics_store: Any = None
     # Async engine behind the durable A2A task store — held so the periodic
     # prune loop can re-run the 24h TTL sweep (it used to run only at boot, so
     # an always-on agent accumulated task rows forever between restarts).
@@ -63,6 +68,11 @@ class AppState:
     restart_requested: bool = False
     plugin_surfaces: list = field(default_factory=list)
     plugin_surface_handles: list = field(default_factory=list)
+    # True once the startup hook has run its surface-start loop. A config reload uses
+    # this to tell "surfaces not started yet" (the pending startup will start the
+    # updated list — don't hot-start, or they'd double-start) from "startup done"
+    # (reconcile: hot-start newly-enabled, stop removed) — ADR 0018 surface hot-reload.
+    plugin_surfaces_started: bool = False
     plugin_meta: list = field(default_factory=list)
     # Background subsystems + handles.
     scheduler: Any = None
@@ -73,6 +83,9 @@ class AppState:
     main_loop: Any = None
     # The port this process actually bound to (populated by _main).
     active_port: int = 7870
+    # Epoch of the last chat-turn start, for the ADR 0074 ``agent.active`` idle debounce.
+    # None ⇒ no turn yet this process (the first turn emits with previous_state="boot").
+    last_activity_ts: float | None = None
 
 
 STATE = AppState()

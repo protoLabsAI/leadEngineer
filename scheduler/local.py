@@ -596,6 +596,20 @@ class LocalScheduler:
         finally:
             db.close()
 
+    def _publish_turn(self, topic: str, *, session_id: str, origin: str, trigger: str, ok: bool | None = None) -> None:
+        """Emit a turn-lifecycle event (#1767) around the self-POST so an open console
+        can render its typing indicator during an otherwise-invisible server-initiated
+        turn. Best-effort — a publish failure never disturbs the fire."""
+        if self._publish is None:
+            return
+        data: dict[str, Any] = {"session_id": session_id, "origin": origin, "trigger": trigger}
+        if ok is not None:
+            data["ok"] = ok
+        try:
+            self._publish(topic, data)
+        except Exception:  # noqa: BLE001 — the event is best-effort
+            log.exception("[scheduler] %s publish failed for %s", topic, trigger)
+
     async def _fire(self, job: Job) -> bool:
         """Deliver a job by POSTing to the agent's own A2A endpoint.
 
@@ -634,6 +648,35 @@ class LocalScheduler:
             except Exception:  # noqa: BLE001 — the event is best-effort
                 log.exception("[scheduler] fired-event publish failed for %s", job.id)
 
+        # Turn-lifecycle events (#1767): a scheduled/watch fire holds the connection open
+        # for the WHOLE turn (the A2A handler runs it synchronously), so without these the
+        # console shows nothing — no typing indicator, no stream — during the agent's
+        # longest turns. Emit `turn.started` before the POST and `turn.finished` after so
+        # the console renders its typing indicator, labelled by trigger. The session id is
+        # the fire's context (a `wait`/`run_in_session` resume lands in a chat session; a
+        # plain cron lands in the Activity thread); a watch-reaction one-shot carries a
+        # `watch-<id>` job id (graph/watches → sdk.run_in_session), so tag its origin as
+        # such — otherwise it's an ordinary `scheduler` fire.
+        session_id = job.context_id or ACTIVITY_CONTEXT
+        origin = job.id if job.id.startswith("watch-") else "scheduler"
+        self._publish_turn("turn.started", session_id=session_id, origin=origin, trigger=job.id)
+
+        # Wake-framing (ADR 0079): a scheduled/watch fire delivered a bare prompt, so the agent
+        # had no idea WHY it was awake (a cron sweep? a watch trip? a wait resume?). Prepend a
+        # one-line "why you're awake" header and point it at <working_state> so it orients before
+        # acting, and set a distinct `watch` origin so a watch reaction is no longer masquerading
+        # as an ordinary scheduler fire (server._AUTONOMOUS_ORIGINS recognizes both).
+        is_watch = job.id.startswith("watch-")
+        is_wait = job.id.startswith("wait:")
+        fire_origin = "watch" if is_watch else "scheduler"
+        if is_watch:
+            wake_header = "[Autonomous wake — a watch you set has tripped. Orient from <working_state>, then:]"
+        elif is_wait:
+            wake_header = "[Autonomous wake — a wait you scheduled has elapsed. Continue:]"
+        else:
+            wake_header = "[Autonomous wake — scheduled run. Orient from <working_state>, then:]"
+        wake_prompt = f"{wake_header}\n\n{job.prompt}"
+
         message_id = str(uuid.uuid4())
         body = {
             "jsonrpc": "2.0",
@@ -642,24 +685,26 @@ class LocalScheduler:
             "params": {
                 "message": {
                     "role": "ROLE_USER",
-                    "parts": [{"text": job.prompt}],
+                    "parts": [{"text": wake_prompt}],
                     "messageId": message_id,
                     # Fire into the job's own context when set (ADR 0053 — the
                     # `wait` tool stamps the originating chat session so a resume
                     # continues that conversation's thread), else the durable
                     # Activity thread (ADR 0003) so a normal scheduled fire lands
                     # somewhere visible/continuable instead of a throwaway context.
-                    "contextId": job.context_id or ACTIVITY_CONTEXT,
+                    "contextId": session_id,
                     # Scheduler bookkeeping for this fire (origin + job id) —
-                    # informational; the handler doesn't require these keys.
+                    # informational; the handler doesn't require these keys. `origin`
+                    # is `watch` for a watch reaction, else `scheduler` (ADR 0079).
                     "metadata": {
                         "scheduler_job_id": job.id,
                         "scheduler_kind": "local",
-                        "origin": "scheduler",
+                        "origin": fire_origin,
                     },
                 },
             },
         }
+        ok = False
         try:
             async with httpx.AsyncClient(timeout=self._fire_timeout_s) as client:
                 r = await client.post(f"{self._invoke_url}/a2a", headers=headers, json=body)
@@ -672,6 +717,7 @@ class LocalScheduler:
                 )
                 return False
             log.info("[scheduler] fired job %s", job.id)
+            ok = True
             return True
         except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
             # The agent's own HTTP server isn't accepting connections yet — common
@@ -687,6 +733,10 @@ class LocalScheduler:
         except Exception:  # noqa: BLE001
             log.exception("[scheduler] fire exception for job %s", job.id)
             return False
+        finally:
+            # Always clear the indicator, whatever the outcome — a failed fire that left
+            # `turn.started` hanging would spin the console forever.
+            self._publish_turn("turn.finished", session_id=session_id, origin=origin, trigger=job.id, ok=ok)
 
     def _generate_id(self) -> str:
         # Agent-name prefix keeps cross-agent IDs distinct in shared

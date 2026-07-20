@@ -64,6 +64,22 @@ _PUBLIC_PREFIXES = (
     "/_ds/",
 )
 
+# Public paths matched EXACTLY, not by prefix. Kept separate from _PUBLIC_PREFIXES because
+# prefix-matching a credential-minting route would also exempt any sibling that happens to
+# share the string (``/api/pairing/claim-something``) — fine for static asset trees, not for
+# this.
+_PUBLIC_EXACT = frozenset(
+    {
+        # Device pairing claim (ADR 0087 D4) — UNAUTHENTICATED BY NECESSITY: obtaining auth
+        # is its entire purpose, so it cannot require it. The only credential-minting path
+        # on the allowlist, guarded in `security.devices` instead: ~190-bit codes, a 120s
+        # TTL, single-use consumption, an immediate reject when nothing is pending, and a
+        # failed-attempt counter that drops all pending codes rather than allowing
+        # indefinite probing. The operator-only pairing/device routes beside it stay authed.
+        "/api/pairing/claim",
+    }
+)
+
 # /metrics is CONDITIONALLY public — see ``_metrics_public``. It carries
 # operational data (model/tool inventory, cost, traffic) so it is exposed without
 # auth only in open mode (no token configured). Once a bearer / X-API-Key gates
@@ -112,6 +128,34 @@ def set_public_prefixes(prefixes) -> None:
         logger.info("[a2a] %d plugin-declared auth-exempt path(s): %s", len(cleaned), ", ".join(cleaned))
 
 
+def public_prefixes() -> list[str]:
+    """The live plugin-declared auth-exempt prefixes (post-validation) — exactly what
+    ``_is_public`` enforces. Served on the public-paths well-known endpoint so a fleet
+    hub can defer its public decision to this member (#1890)."""
+    return list(_PLUGIN_PUBLIC)
+
+
+# Fleet-proxied member view pages (#1890). A member's plugin view page is public
+# *chrome* on the member itself (see ``set_public_prefixes``) — but the console
+# iframes it through the hub as ``/agents/<slug>/plugins/<id>/…``, a plain
+# navigation that cannot carry the operator bearer, and the hub's own public list
+# is built from the HUB's manifests (the member may run plugins the hub doesn't).
+# The member is the authority on what it serves anonymously, so the hub defers:
+# for a slug-prefixed path inside a plugin namespace, an injected async resolver
+# ``(slug, rest) -> bool`` answers "would the member serve this anonymously?"
+# (graph/fleet/member_public.py — fetched from the member's public-paths endpoint,
+# TTL-cached, fail-closed). Injected from the server bootstrap so this module
+# stays host-free.
+_MEMBER_PUBLIC: list = [None]
+
+_AGENTS_RE = re.compile(r"^/agents/([^/]+)(/.+)$")
+
+
+def set_member_public_resolver(fn) -> None:
+    """Install the async ``(slug, rest) -> bool`` member-public resolver (None = off)."""
+    _MEMBER_PUBLIC[0] = fn
+
+
 def _metrics_public() -> bool:
     """Whether ``/metrics`` is reachable without auth.
 
@@ -127,6 +171,8 @@ def _metrics_public() -> bool:
 
 def _is_public(path: str) -> bool:
     """Return True when ``path`` is on the public allowlist (no auth needed)."""
+    if path in _PUBLIC_EXACT:
+        return True
     if any(path.startswith(p) for p in _PUBLIC_PREFIXES):
         return True
     if any(path.startswith(p) for p in _PLUGIN_PUBLIC):
@@ -146,6 +192,35 @@ def _requires_operator(path: str) -> bool:
     reach the ceiling (handled earlier in dispatch). The substring form also catches the
     fleet-proxy variants (``/active/<slug>/api/…``, ``/agents/<slug>/api/…``)."""
     return "/api/" in path or path == "/api" or path.endswith("/api")
+
+
+def _device_token_ok(token: str) -> bool:
+    """True when ``token`` belongs to a paired, non-revoked device (ADR 0087).
+
+    Imported lazily and failed-closed: the device registry is an optional, additive tier, and
+    a broken/absent registry must never take down auth for the shared bearer — which is
+    already handled above by the time we get here.
+    """
+    try:
+        from security.devices import verify_token
+
+        return verify_token(token) is not None
+    except Exception:  # noqa: BLE001 — registry problems must not become auth outages
+        logger.exception("[auth] device-token check failed; denying this credential")
+        return False
+
+
+def bearer_configured() -> bool:
+    """True when a bearer token is active on THIS server.
+
+    The single source of truth for "does this instance require a token", exposed because a
+    client cannot infer it: a browser holding a token in localStorage says nothing about what
+    the server accepts, and the two diverge the moment a token is rotated or removed. The
+    pairing flow reads this before it will write a non-loopback bind — writing one without a
+    token configured makes the server refuse to start (`evaluate_open_bind`), which bricks
+    the app until someone hand-edits YAML.
+    """
+    return _BEARER[0] is not None
 
 
 def set_bearer_token(token: str | None) -> None:
@@ -263,9 +338,57 @@ class A2AAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
 
+        # CORS preflight is never authenticated — by SPEC. A browser sends `OPTIONS` with no
+        # `Authorization` header (the actual credentialed request follows only if this
+        # succeeds), so demanding a bearer here 401s EVERY cross-origin call before it starts:
+        # any token-gated instance whose console is a different origin — the desktop webview
+        # (tauri://localhost) is the common one — can't talk to its own server. This
+        # middleware is added AFTER CORSMiddleware and so wraps outside it (Starlette runs
+        # later-added middleware first), meaning without this branch the preflight never
+        # reaches CORS to be answered. Preflight carries no credentials and triggers no side
+        # effects; the real request still passes through the checks below.
+        if request.method == "OPTIONS":
+            return await call_next(request)
+
         # Public allowlist — pass without auth.
         if _is_public(path):
             return await call_next(request)
+
+        # Fleet-proxied member-public paths (#1890): ``/agents/<slug>/<rest>`` where
+        # ``<rest>`` sits inside a plugin namespace defers to the MEMBER's own public
+        # list — its view pages are public chrome THERE, and the iframe navigation
+        # cannot carry a bearer. Consulted only when a credential actually gates this
+        # hub (open mode passes below anyway) and only for the plugin namespace —
+        # never ``/agents/<slug>/api/…``. ``request.state.member_public`` tells the
+        # fleet proxy NOT to lend a stored remote bearer to this request.
+        resolver = _MEMBER_PUBLIC[0]
+        if resolver is not None and (_BEARER[0] is not None or _API_KEY[0]):
+            m = _AGENTS_RE.match(path)
+            if m and _PLUGIN_NS_RE.match(m.group(2)):
+                try:
+                    member_public = await resolver(m.group(1), m.group(2))
+                except Exception:  # noqa: BLE001 — resolver trouble = fail closed to normal auth
+                    logger.exception("[a2a] member-public resolver failed for %s", path)
+                    member_public = False
+                if member_public:
+                    request.state.member_public = True
+                    return await call_next(request)
+
+        # Core media store (#1929): ``/media/<file>`` serves tool-generated artifacts
+        # that the console chat renders as inline ``<img>`` tags — a plain browser
+        # fetch that cannot carry an Authorization header. Each saved URL carries a
+        # per-file HMAC signature minted at save time (``infra/media.py``); a request
+        # passes iff the signature verifies (or the store is explicitly opted public
+        # via ``media.public``). Anything else falls through to the normal bearer /
+        # X-API-Key checks below — default-deny holds.
+        if path.startswith("/media/"):
+            try:
+                from infra.media import request_allowed as _media_allowed
+
+                if _media_allowed(path, request.query_params.get("sig", "")):
+                    return await call_next(request)
+            except Exception:  # noqa: BLE001 — a check failure fails CLOSED to normal auth
+                logger.exception("[a2a] media access check failed for %s", path)
 
         # SSE endpoint: accept either a valid query-string token OR a bearer header.
         # The query token is for browser EventSource clients that cannot send headers.
@@ -302,6 +425,12 @@ class A2AAuthMiddleware(BaseHTTPMiddleware):
                 tier = "operator"
             elif is_federation:
                 tier = "federation"
+            elif _device_token_ok(token):
+                # A paired device (ADR 0087 D1) is the OPERATOR — it runs the full console
+                # and needs the same surface the desktop does. The point of per-device
+                # tokens is identity + revocation, not a reduced tier. Checked last so the
+                # shared-bearer path stays a single compare and never touches disk.
+                tier = "operator"
             else:
                 return _unauthorized("Unauthorized: invalid bearer token")
 

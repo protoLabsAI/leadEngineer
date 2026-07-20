@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import secrets
 import time
 
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -27,13 +28,66 @@ from runtime.state import STATE
 log = logging.getLogger("protoagent.server")
 from server import agent_name
 from server.agent_init import _retire_thread
-from server.chat import chat
+from server.chat import chat, compact_session, rewind_session
 
 
 class ChatRequest(BaseModel):
+    # Omitted/blank session_id → a unique per-call id is minted (ADR 0069 D4).
+    # The old literal "api-default" pooled every anonymous caller into ONE
+    # checkpointer thread and ONE session-memory file.
     message: str
-    session_id: str = "api-default"
+    session_id: str = ""
     model: str | None = None  # per-tab model override; None → configured default
+    # Incognito thread (ADR 0069 D3b): no session-memory persistence and no
+    # memory injection for this turn. Additive, default False — existing
+    # callers are unaffected.
+    incognito: bool = False
+    # This message answers a pending HITL form/question/approval (#1560): resume
+    # the parked interrupt instead of running a fresh turn. Set by the console's
+    # desktop /api/chat fallback — the streaming path carries the same flag as
+    # A2A message metadata (`hitl_resume`). Additive, default False.
+    hitl_resume: bool = False
+
+
+_B36 = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+
+def _mint_session_id() -> str:
+    """Unique per-call session id — ``api-<epoch-ms>-<6 base36>``, mirroring the
+    console's ``chat-<ts>-<rand>`` shape (apps/web chat-store ``id()``)."""
+    rand = "".join(secrets.choice(_B36) for _ in range(6))
+    return f"api-{int(time.time() * 1000)}-{rand}"
+
+
+def _split_openai_content(content) -> tuple[str, list[tuple[str, str]]]:
+    """OpenAI ``message.content`` → ``(text, [(media_type, url)])`` (#1943).
+
+    OpenAI multimodal messages carry ``content`` as a list of typed parts
+    (``{"type": "text"}`` / ``{"type": "image_url"}``); assuming a plain string
+    made ``/v1`` reject any image-attaching client with a ``.strip()`` crash.
+    Text parts join with newlines; image parts keep the URL as-is (``data:`` or
+    remote — both are what the turn layer forwards to a vision model). The
+    media_type is parsed off a ``data:`` URI and empty otherwise, matching the
+    ``[(media_type, uri)]`` shape of ``a2a_impl``'s ``_extract_image_parts``.
+    """
+    if isinstance(content, str):
+        return content, []
+    texts: list[str] = []
+    images: list[tuple[str, str]] = []
+    for part in content if isinstance(content, list) else []:
+        if not isinstance(part, dict):
+            continue
+        kind = part.get("type")
+        if kind == "text":
+            texts.append(str(part.get("text", "")))
+        elif kind == "image_url":
+            url = (part.get("image_url") or {}).get("url", "")
+            if isinstance(url, str) and url:
+                mt = ""
+                if url.startswith("data:"):
+                    mt = url[5:].split(";", 1)[0].split(",", 1)[0]
+                images.append((mt, url))
+    return "\n".join(texts), images
 
 
 def register_chat_routes(app, ui: str) -> None:
@@ -46,9 +100,14 @@ def register_chat_routes(app, ui: str) -> None:
     # --- Chat API -----------------------------------------------------------
     @app.post("/api/chat")
     async def _api_chat(req: ChatRequest):
-        result = await chat(req.message, req.session_id, model=req.model)
+        # Echo the (possibly minted) session_id so callers can continue the
+        # session — additive key, existing consumers unaffected.
+        session_id = req.session_id.strip() or _mint_session_id()
+        result = await chat(
+            req.message, session_id, model=req.model, incognito=req.incognito, hitl_resume=req.hitl_resume
+        )
         parts = [m["content"] for m in result if m.get("role") == "assistant" and m.get("content")]
-        return {"response": "\n\n".join(parts), "messages": result}
+        return {"response": "\n\n".join(parts), "messages": result, "session_id": session_id}
 
     @app.delete("/api/chat/sessions/{session_id}")
     async def _api_delete_session(session_id: str, harvest: bool = False):
@@ -61,8 +120,10 @@ def register_chat_routes(app, ui: str) -> None:
         operator may be deleting it precisely to get rid of it. The TTL prune
         sweep keeps its own config-driven default (``checkpoint_harvest_enabled``).
 
-        Both ``a2a:{session_id}`` and ``chat:{session_id}`` threads are retired
-        with cascade so goal-mode ``:goal-iter-N`` sub-threads are not orphaned."""
+        Both ``a2a:{session_id}`` and the legacy ``chat:{session_id}`` threads are
+        retired (non-streaming turns keyed ``chat:`` before ADR 0069 unified the
+        prefix) with cascade so goal-mode ``:goal-iter-N`` sub-threads are not
+        orphaned."""
         chunk_id = await _retire_thread(f"a2a:{session_id}", harvest=harvest, cascade=True)
         await _retire_thread(f"chat:{session_id}", harvest=False, cascade=True)  # only harvest once
         # Ephemeral chat attachments are session-scoped (ADR 0021) — drop them so a
@@ -74,6 +135,53 @@ def register_chat_routes(app, ui: str) -> None:
             except Exception as exc:  # noqa: BLE001 — cleanup is best-effort
                 log.warning("[chat] attachment cleanup failed for %s: %s", session_id, exc)
         return {"deleted": True, "harvested": chunk_id is not None}
+
+    @app.post("/api/chat/sessions/{session_id}/compact")
+    async def _api_compact_session(session_id: str):
+        """Compact a chat session's live context (#1527): archive the raw history
+        into searchable memory, summarize it, and rewrite the LangGraph checkpoint
+        to ``[summary, recent tail]`` so the agent keeps context at lower token
+        cost. Runs SERVER-SIDE — the checkpoint is the agent's real context, so a
+        client-only compaction would do nothing.
+
+        Never-lossy: if there's no store or the archive write yields nothing, the
+        checkpoint is left untouched and ``refused`` is true (the console then
+        keeps the full thread rather than dropping anything).
+
+        Pre-release: behind the ``chat.compact`` developer flag (ADR 0068)."""
+        from fastapi import HTTPException
+
+        from runtime.flags import flag_enabled
+
+        if not flag_enabled("chat.compact"):
+            raise HTTPException(
+                status_code=403,
+                detail="/compact is pre-release — enable the chat.compact developer flag (ADR 0068)",
+            )
+        return await compact_session(session_id)
+
+    @app.post("/api/chat/sessions/{session_id}/rewind")
+    async def _api_rewind_session(session_id: str, body: dict | None = None):
+        """Rewind a chat session to a target message (#1535): discard everything
+        AFTER it and rewrite the LangGraph checkpoint IN PLACE. Runs SERVER-SIDE —
+        the checkpoint is the agent's real context, so a client-only truncate would
+        leave the agent's memory intact.
+
+        The body carries the target: ``message_id`` and/or ``content`` (the console
+        sends the visible bubble's text, since its client-side message ids never
+        appear in the checkpoint), or an explicit ``index``. Intentionally
+        DESTRUCTIVE (no archive) but never corrupting — the kept prefix is trimmed
+        to a safe tool-call boundary so no orphaned tool_call is left behind."""
+        body = body or {}
+        idx = body.get("index")
+        occ = body.get("occurrence")
+        return await rewind_session(
+            session_id,
+            message_id=body.get("message_id"),
+            index=int(idx) if idx is not None else None,
+            content=body.get("content"),
+            occurrence=int(occ) if occ is not None else None,
+        )
 
     @app.post("/api/chat/sessions/{session_id}/steer")
     async def _api_steer(session_id: str, body: dict | None = None):
@@ -140,22 +248,10 @@ def register_chat_routes(app, ui: str) -> None:
         cancelled = delegations.cancel(session_id, delegation_id)
         return {"cancelled": cancelled, "running": delegations.running(session_id)}
 
-    # --- Goal mode API ------------------------------------------------------
-    # Programmatic status/clear for a session's goal (setting is done via the
-    # `/goal ...` control message through chat/A2A). Returns 404-style payloads
-    # as plain JSON to keep the surface dependency-free.
-    @app.get("/api/goal/{session_id}")
-    async def _api_goal_status(session_id: str):
-        if STATE.goal_controller is None:
-            return {"enabled": False, "goal": None}
-        state = STATE.goal_controller.store.get(session_id)
-        return {"enabled": True, "goal": state.to_dict() if state else None}
-
-    @app.delete("/api/goal/{session_id}")
-    async def _api_goal_clear(session_id: str):
-        if STATE.goal_controller is None:
-            return {"enabled": False, "cleared": False}
-        return {"enabled": True, "cleared": STATE.goal_controller.store.clear(session_id)}
+    # Goal-mode read/clear moved to the canonical plural `/api/goals*` in
+    # operator_api/routes.py (D4 dedupe, ADR 0075): `GET /api/goals` (list),
+    # `GET /api/goals/{session_id}` (one), `DELETE /api/goals/{session_id}` (clear).
+    # The singular `/api/goal/{session_id}` duplicates were retired here.
 
     # --- Health / readiness (ADR 0010) -------------------------------------
     # Reflects whether the graph actually compiled — the only readiness signal
@@ -187,7 +283,7 @@ def register_chat_routes(app, ui: str) -> None:
         user_msgs = [m for m in messages if m.get("role") == "user"]
         if not user_msgs:
             return {"error": "No user message provided"}, 400
-        prompt = user_msgs[-1].get("content", "")
+        prompt, images = _split_openai_content(user_msgs[-1].get("content", ""))
         session_id = f"openai-compat-{int(time.time())}"
         stream = req.get("stream", False)
 
@@ -198,13 +294,34 @@ def register_chat_routes(app, ui: str) -> None:
         req_model = (req.get("model") or "").strip()
         model = req_model if req_model and req_model != agent_name() else None
 
-        result = await chat(prompt, session_id, model=model)
+        # Incognito (ADR 0069): opt-in per request via an `incognito` field (OpenAI
+        # clients pass it through `extra_body`). Off by default — unchanged behavior —
+        # so a programmatic caller (e.g. an eval/benchmark harness) can run a turn with
+        # no memory injection, persistence, or harvest, for reproducible, uncontaminated
+        # runs. A2A and /api/chat already expose this; /v1 was the gap.
+        incognito = bool(req.get("incognito", False))
+
+        result = await chat(prompt, session_id, model=model, incognito=incognito, images=images or None)
         parts = [m["content"] for m in result if m.get("role") == "assistant" and m.get("content")]
         content = "\n\n".join(parts)
         created = int(time.time())
         completion_id = f"{agent_name()}-{session_id}"
 
+        # Real token usage, summed from the assistant turn(s) (server.chat._sum_usage
+        # already folds every model call — lead + goal continuations + subagents — into the
+        # OpenAI `{prompt,completion,total}_tokens` shape). Absent (a short-circuit / older
+        # reply) ⇒ zeros, same as before (ADR 0075 D4).
+        usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        for _m in result:
+            _u = _m.get("usage")
+            if isinstance(_u, dict):
+                for _k in usage:
+                    usage[_k] += int(_u.get(_k, 0) or 0)
+
         if stream:
+            # OpenAI streams usage only when the client opts in, in a final chunk with
+            # empty `choices` (stream_options.include_usage).
+            include_usage = bool((req.get("stream_options") or {}).get("include_usage"))
 
             async def _stream():
                 chunk = {
@@ -225,6 +342,16 @@ def register_chat_routes(app, ui: str) -> None:
                     "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
                 }
                 yield f"data: {json.dumps(done_chunk)}\n\n"
+                if include_usage:
+                    usage_chunk = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": agent_name(),
+                        "choices": [],
+                        "usage": usage,
+                    }
+                    yield f"data: {json.dumps(usage_chunk)}\n\n"
                 yield "data: [DONE]\n\n"
 
             return StreamingResponse(_stream(), media_type="text/event-stream")
@@ -241,7 +368,7 @@ def register_chat_routes(app, ui: str) -> None:
                     "finish_reason": "stop",
                 }
             ],
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "usage": usage,
         }
 
     @app.get("/v1/models")

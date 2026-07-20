@@ -292,7 +292,22 @@ class AgentClient:
                         task_id = payload_obj.get("taskId", "") or task_id
                         art = payload_obj.get("artifact")
                         if art:
-                            artifacts.append(art)
+                            # Honor the A2A `append` flag (spec §TaskArtifactUpdateEvent):
+                            # append=True extends the same-id artifact; append absent/False
+                            # REPLACES it. The executor's terminal frame re-sends the full
+                            # canonical answer as a replace (#1709) — blind accumulation
+                            # would double the text.
+                            aid = art.get("artifactId", "")
+                            idx = next(
+                                (i for i, a in enumerate(artifacts) if a.get("artifactId", "") == aid),
+                                None,
+                            )
+                            if idx is None:
+                                artifacts.append(art)
+                            elif payload_obj.get("append"):
+                                artifacts[idx].setdefault("parts", []).extend(art.get("parts") or [])
+                            else:
+                                artifacts[idx] = art
                     elif kind == "statusUpdate":
                         task_id = payload_obj.get("taskId", "") or task_id
                         status = payload_obj.get("status") or {}
@@ -313,19 +328,19 @@ class AgentClient:
     # ── goal mode ─────────────────────────────────────────────────────────────
 
     async def get_goal(self, session_id: str) -> dict:
-        """GET ``/api/goal/{session_id}`` → ``{enabled, goal}`` (goal is the
+        """GET ``/api/goals/{session_id}`` → ``{enabled, goal}`` (goal is the
         full persisted state dict, or None when no goal is set)."""
         async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(f"{self.base_url}/api/goal/{session_id}", headers=self.headers)
+            r = await client.get(f"{self.base_url}/api/goals/{session_id}", headers=self.headers)
             r.raise_for_status()
             return r.json()
 
     async def clear_goal(self, session_id: str) -> dict:
-        """DELETE ``/api/goal/{session_id}`` → ``{enabled, cleared}``."""
+        """DELETE ``/api/goals/{session_id}`` → ``{enabled, cleared}``."""
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.request(
                 "DELETE",
-                f"{self.base_url}/api/goal/{session_id}",
+                f"{self.base_url}/api/goals/{session_id}",
                 headers=self.headers,
             )
             r.raise_for_status()
@@ -366,25 +381,34 @@ def _is_terminal(state: str) -> bool:
 def _extract(result: dict) -> tuple[str, dict]:
     """Pull text + cost data out of an A2A result envelope.
 
-    Tolerant of both the A2A 1.0 part shape (untyped — a part carries a
-    ``text`` or ``data`` field directly) and the legacy 0.x shape (parts
-    tagged with ``kind``)."""
+    Text is read from parts, tolerant of both the A2A 1.0 part shape (untyped — a part
+    carries a ``text`` or ``data`` field directly) and the legacy 0.x shape (parts tagged
+    with ``kind``). Cost comes from the **metadata map keyed by the cost-v1 extension
+    URI** (protolabs-a2a 0.3.0) on the artifact or the status message — it is no longer a
+    DataPart in ``parts[]``."""
+    import protolabs_a2a as pa
+
     text_parts: list[str] = []
     usage: dict = {}
 
-    def _scan(parts: list[dict] | None) -> None:
-        nonlocal usage
+    def _scan_text(parts: list[dict] | None) -> None:
         for p in parts or []:
             if p.get("text"):
                 text_parts.append(p["text"])
-            elif isinstance(p.get("data"), dict) and "usage" in p["data"]:
-                usage = dict(p["data"]["usage"])
-                if "durationMs" in p["data"]:
-                    usage["durationMs"] = p["data"]["durationMs"]
+
+    def _scan_cost(metadata: dict | None) -> None:
+        nonlocal usage
+        payload = pa.parse_cost(metadata)
+        if payload and isinstance(payload.get("usage"), dict):
+            usage = dict(payload["usage"])
+            if "durationMs" in payload:
+                usage["durationMs"] = payload["durationMs"]
 
     for art in result.get("artifacts") or []:
-        _scan(art.get("parts"))
+        _scan_text(art.get("parts"))
+        _scan_cost(art.get("metadata"))
     status = result.get("status") or {}
     msg = status.get("message") or {}
-    _scan(msg.get("parts"))
+    _scan_text(msg.get("parts"))
+    _scan_cost(msg.get("metadata"))
     return "\n".join(text_parts).strip(), usage

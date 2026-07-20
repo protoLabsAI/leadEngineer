@@ -45,6 +45,62 @@ def _load_secrets_doc(config_dir: Path) -> dict:
         return {}
 
 
+def _read_config_docs(p: Path) -> tuple[dict, dict, bool]:
+    """The file-reading half of ``from_yaml``: (host ⊕ agent) merged doc + secrets
+    overlay. The third element is False when there is nothing to parse (no agent
+    file and no host layer) — ``from_yaml``'s defaults short-circuit."""
+    host_layer = _load_host_layer()  # {} when absent/unreadable — never crashes boot
+    if not p.exists() and not host_layer:
+        return {}, {}, False
+
+    agent_data: dict = {}
+    if p.exists():
+        with open(p) as f:
+            agent_data = yaml.safe_load(f) or {}
+
+    # Host is the base; the agent leaf overlays it (agent wins). No host layer ⇒
+    # merged is exactly the agent doc — the pre-cascade input, unchanged.
+    if host_layer:
+        # Surface silent shadowing of a box default by the agent leaf (issue #1459).
+        _warn_shadowed_host_keys(host_layer, agent_data)
+    merged = _deep_merge_dicts(copy.deepcopy(host_layer), agent_data) if host_layer else agent_data
+
+    return merged, _load_secrets_doc(p.parent), True
+
+
+def load_config_docs(path: str | Path) -> tuple[dict, dict]:
+    """Public doc loader for callers that need the raw (merged, secrets) pair without
+    a full parse — the secrets refresh loop and operator sync/test routes (ADR 0080)."""
+    merged, secrets, _ = _read_config_docs(Path(path))
+    return merged, secrets
+
+
+def _hydrate_external_secrets(merged: dict, secrets: dict) -> None:
+    """External secrets-manager hydration (ADR 0080): populate ``os.environ`` from the
+    configured manager BEFORE the dataclass parse, so the env fallback tier (model
+    api_key / auth token, plugin ``requires_env``, MCP child env) sees manager values
+    on every load path — boot, ``--setup``, hot-reload, CLIs, fleet members.
+
+    Inert without an enabled ``secrets_manager`` section (no import, no network).
+    Never breaks config load: fetch failures warn and fall through to whatever the
+    env already has — except ``secrets_manager.required: true``, which propagates so
+    a boot with a hard manager dependency fails fast instead of serving a
+    half-configured agent."""
+    if not isinstance(merged, dict) or not (merged.get("secrets_manager") or {}).get("enabled"):
+        return
+    try:
+        from infra.secrets import SecretsRequiredError, hydrate_from_docs
+    except Exception as e:  # noqa: BLE001 — hydration must not take config load down
+        log.warning("[secrets] hydration unavailable (import failed): %s", e)
+        return
+    try:
+        hydrate_from_docs(merged, secrets)
+    except SecretsRequiredError:
+        raise
+    except Exception as e:  # noqa: BLE001 — belt-and-suspenders around the never-raise contract
+        log.warning("[secrets] hydration failed — continuing with the existing environment: %s", e)
+
+
 def _resolve_plugin_config(data: dict, secrets: dict, config_dir: Path) -> dict:
     """Resolve each enabled plugin's declared config section (ADR 0019).
 
@@ -139,6 +195,21 @@ def _env_default(name: str, default, cast=str):
         return cast(raw)
     except (TypeError, ValueError):
         return default
+
+
+def _default_filesystem_allow_run() -> bool:
+    """Tier-aware app-default for ``filesystem.allow_run`` (#1849). ``run_command``
+    is HITL-gated (``run_requires_approval``) — safe when an operator is watching to
+    approve each call, but on a headless/A2A-only instance there's no one to click
+    approve, so the pending ``interrupt()`` checkpoints the turn forever and every
+    later message queues behind it. Default stays ON for an interactive tier
+    (someone's presumably watching); default OFF for the 'none' (headless) UI tier.
+    Reads ``PROTOAGENT_UI`` directly rather than via ``_env_default`` because this is
+    a derived boolean, not a passthrough value — ``server/__init__`` mirrors the
+    FINAL resolved tier there once, whether it came from ``--ui``, ``PROTOAGENT_UI``,
+    or the deprecated ``--headless`` alias. An explicit ``filesystem.allow_run`` in
+    config always wins over this default regardless of tier."""
+    return os.environ.get("PROTOAGENT_UI", "").strip().lower() != "none"
 
 
 def _host_scoped_fields():
@@ -237,6 +308,10 @@ class LangGraphConfig:
     # images as native multimodal parts straight to the model instead of routing
     # them through the extraction pipeline. Off → images go through the pipeline.
     model_vision: bool = False
+    # Pinned go-to models (#1957) — the chat `/model` quick-switch shows these (in
+    # order) instead of the gateway's full list. Console-consumed via the settings
+    # schema; empty = no favorites, /model falls back to the full model list.
+    model_favorites: list[str] = field(default_factory=list)
 
     # Per-call timeout (seconds) on the model client + transient-retry cap. Bounds
     # a hung/slow gateway so a turn surfaces a clean error instead of blocking the
@@ -382,6 +457,15 @@ class LangGraphConfig:
     goal_eval_model: str = ""  # blank = main model (llm verifier / fuzzy goals)
     goal_verify_timeout: float = 120.0  # seconds for command/test/ci verifiers
 
+    # Self-authored persona (guarded, default OFF). When on, the lead agent gets the
+    # ``edit_soul`` tool — it can rewrite SECTIONS of its own ``SOUL.md`` (persona /
+    # identity ONLY, never operating doctrine — ADR 0079). Every edit is snapshotted to
+    # soul-history (#1691) and reversible, and takes effect on the NEXT turn (a graph
+    # reload). This crosses the operator-trust boundary that keeps "SOUL rewrite" an
+    # ``/api`` operator capability (ADR 0066/0081), so it stays off unless an operator
+    # opts in via ``soul.self_edit_enabled: true``.
+    soul_self_edit_enabled: bool = False
+
     # Knowledge store — sqlite + FTS5, see ``knowledge/store.py``.
     # The default path lives under ``/sandbox/`` to play well with the
     # bundled Docker volume; the store falls back to
@@ -418,12 +502,37 @@ class LangGraphConfig:
     image_describe_model: str = ""
     # Semantic recall (ADR 0021): when True, the knowledge store is the
     # HybridKnowledgeStore (FTS5 + vector embeddings via `embed_model`, fused
-    # with RRF). On by default — semantic recall finds paraphrases keyword search
-    # misses; the circuit breaker falls back to FTS5 on an embedding outage.
-    knowledge_embeddings: bool = True
+    # with RRF). OFF by default (#1681): out of the box the app must not depend
+    # on an optional gateway route — a gateway without a working embedding model
+    # turned recall (which runs pre-model on every turn) into a per-turn stall.
+    # Opt in when your gateway serves `embed_model`; keyword recall works
+    # everywhere, and the circuit breaker still guards runtime outages when on.
+    knowledge_embeddings: bool = False
     # How many recalled chunks are injected per turn. Bumped 5 → 10 (RAG bake-off:
     # more candidates in-context lifted answer quality at sub-million-chunk scale).
     knowledge_top_k: int = 10
+    # Namespace scope for the AUTO-INJECT RAG search (ADR 0069 D3a). Empty (the
+    # default) = unfiltered — today's behavior, so box-commons sharing keeps
+    # working. When set, only chunks whose `namespace` matches a listed value
+    # are auto-injected; include "" to also match un-namespaced chunks. Gates
+    # only what enters the prompt unasked — memory_recall stays unscoped.
+    knowledge_inject_namespaces: list[str] = field(default_factory=list)
+    # Trust floor for the AUTO-INJECT RAG hits (ADR 0069 D8). Rows rank into
+    # deterministic trust tiers by source_type (knowledge/trust.py): 3 =
+    # operator-authored, 2 = agent-derived (extracted facts, harvest,
+    # memory_ingest), 1 = ingested/external (web, YouTube, PDF, media) and
+    # unknown. 1 (default) excludes nothing — low tiers are only down-weighted
+    # (ranked below higher tiers); 2 drops external/ingested content from
+    # auto-injection; 3 auto-injects operator-authored rows only. memory_recall
+    # is never gated — excluded content stays reachable on demand.
+    knowledge_inject_min_trust: int = 1
+    # Hot-memory write confirm gate (ADR 0069 D8). When True, the agent's own
+    # write path (memory_ingest) refuses domain="hot" writes with an error
+    # telling it to ask the operator — only operator surfaces (console
+    # knowledge/memory routes) put facts in front of the model every turn.
+    # Default False: single-operator boxes keep the frictionless flow; every
+    # hot write emits a `memory.hot_written` bus event either way.
+    knowledge_hot_write_confirm: bool = False
     # Hybrid-retrieval tuning (HybridKnowledgeStore knobs, ADR 0021) — surfaced so
     # they're tunable without editing the store / via the retrieval eval:
     #   vector_k  — FTS5 + vector candidates fused per query (the RRF pool).
@@ -479,6 +588,12 @@ class LangGraphConfig:
     # Retention guardrail (ADR 0006) — turns older than this are pruned by the
     # periodic maintenance loop so the store can't grow unbounded. 0 = keep forever.
     telemetry_retention_days: int = 90
+    # Fleet trace export (ADR 0006 / #1897) — write one per-turn trajectory JSONL
+    # row (OpenAI chat format) to ``<instance>/fleet-traces/`` for the agent-fleet
+    # flywheel. OFF by default; ``PROTOAGENT_FLEET_TRACE_EXPORT`` env overrides in
+    # both directions (and can point at an explicit path). Dumps stay on the
+    # machine until shipped (scripts/setup_fleet_tracing.sh).
+    fleet_trace_export_enabled: bool = False
     # Inbox/Activity retention — delivered inbox items and activity log entries
     # are pruned by the same maintenance loop. 0 = keep forever.
     inbox_retention_days: int = 90
@@ -490,6 +605,11 @@ class LangGraphConfig:
     # Background subagent threads (a2a:background:*) get a tighter cap — we only
     # resume-from-latest, never time-travel, so retaining more than 1 is waste.
     checkpoint_background_keep: int = 1
+    # Push-resume (ADR 0070 D1): when a background job finishes, self-submit a nudge
+    # turn into the session that spawned it, so its <task-notification> drains
+    # immediately and the agent briefs the operator — instead of the report waiting
+    # for that session's next manual turn. False restores pull-only delivery.
+    background_auto_resume: bool = True
     checkpoint_max_age_days: int = 30
     checkpoint_prune_interval_hours: int = 6
     # When a session is retired (aged out or deleted), summarize it into the
@@ -551,6 +671,12 @@ class LangGraphConfig:
     mcp_servers: list[dict] = field(default_factory=list)
     mcp_timeout_seconds: float = 20.0
     mcp_denylist: list[str] = field(default_factory=list)
+    # Persistent sessions (default ON): each server keeps ONE long-lived MCP
+    # session reused across tool calls, auto-reconnected once when it dies.
+    # OFF restores stateless per-call sessions — for stdio servers that means a
+    # fresh subprocess (~1s of spawn overhead) per invocation. A single server
+    # can opt out alone with ``persistent: false`` on its ``servers`` entry.
+    mcp_persistent_sessions: bool = True
     # Tier (ADR 0041) — does this agent run the box-shared MCP commons? "scoped"
     # (default/blank) = only this agent's ``mcp.servers``; "layered" = also run the
     # box commons (``~/.protoagent/commons/mcp-servers.json``), ∪ private (private
@@ -565,11 +691,22 @@ class LangGraphConfig:
     # exposed (empty = none). Served standalone via ``python -m server.operator_mcp``.
     operator_mcp_enabled: bool = False
     operator_mcp_tools: list[str] = field(default_factory=list)
+    # Curated profile preset over the allowlist (ADR 0075 D3): "" (default) = use
+    # ``operator_mcp_tools`` verbatim (deny-by-default); "read-only" = reads/queries
+    # only; "full" = everything (≡ "*"). A profile UNIONs with any explicit names.
+    # env PROTOAGENT_MCP_TRUST=full forces "full" (vouch for the client). The safe
+    # middle tier "safe-operator" arrives with the ops layer (ADR 0075 D2).
+    operator_mcp_profile: str = ""
 
     # Agent runtime (ADR 0033) — which brain executes a turn. "native" = the built-in
     # LangGraph loop (default). "acp:<agent>" (e.g. "acp:codex", "acp:claude") = an
     # external coding agent drives the turn over ACP, mounting the operator MCP bus.
     agent_runtime: str = "native"
+    # Developer channel (ADR 0068) — which pre-release feature tier this instance exposes:
+    # "prod" (released only) | "beta" (opt-in previews) | "dev" (everything, incl. in-progress).
+    # The dev sandbox instance defaults to "dev"; env fallback PROTOAGENT_CHANNEL. Read by
+    # ``runtime.flags`` to resolve developer flags.
+    developer_channel: str = "prod"
     # ACP launch overrides (ADR 0033) — per-agent ``{command, args}`` from the YAML
     # ``acp.agents`` block, e.g. ``acp: {agents: {claude: {command: claude-agent-acp}}}``.
     # ``runtime.acp_runtime.adapter_for`` reads this to override the built-in default
@@ -592,6 +729,17 @@ class LangGraphConfig:
     # Optional source allowlist for git-URL installs (ADR 0027 D3) — host/org globs
     # (e.g. ``github.com/protoLabsAI/*``); empty = any URL allowed (gated install).
     plugins_sources_allow: list[str] = field(default_factory=list)
+    # Opt-in auto-update policy (#1720), keyed by plugin id. Each value is a policy
+    # dict ``{"track": "main", "when": "idle"}`` — ``track`` opts the plugin in (a
+    # non-empty value; the actual ref comes from the lock), ``when`` gates the
+    # safe-moment (``idle`` = defer while a chat turn is/was just in flight;
+    # ``always`` = update on the next sweep regardless). Empty = manual-only
+    # updates (the default). A pinned-to-SHA plugin is never auto-updated.
+    plugins_update_policy: dict = field(default_factory=dict)
+    # Auto-update sweep cadence in hours (mirrors ``checkpoint_prune_interval_hours``);
+    # ``0`` disables the loop entirely. Only plugins listed in ``update_policy`` are
+    # ever touched, so this is a safe non-zero default.
+    plugins_autoupdate_interval_hours: int = 6
     # Plugin-declared config sections (ADR 0019), keyed by the claimed top-level
     # section. Each value is the section's resolved config (manifest defaults ⊕
     # YAML ⊕ secrets overlay). A plugin reads its own via plugin_config["<section>"].
@@ -661,11 +809,31 @@ class LangGraphConfig:
     fleet_port_base: int = 7870  # workspace agents get port_base+1, +2, …
     discovery_port_min: int = 7860  # fleet discovery scan window (inclusive)
     discovery_port_max: int = 7910
-    discovery_mdns: bool = True  # advertise + browse the _protoagent._tcp mDNS channel
+    # Off by default (#1802) — an agent should not announce itself on the LAN unless
+    # the operator opts in. mDNS advertises this agent (and browses siblings) on the
+    # _protoagent._tcp channel; default-off keeps a fleet quiet on the network
+    # (privacy/security). Local-fleet enumeration is disk-based, so the console is
+    # unaffected; set fleet.discovery.mdns: true to restore LAN auto-discovery.
+    discovery_mdns: bool = False  # advertise + browse the _protoagent._tcp mDNS channel
     fleet_max_warm: int = 0  # warm-agent cap (0 = unlimited); env: PROTOAGENT_FLEET_MAX_WARM
     fleet_warm_grace_seconds: int = (
         0  # spare agents touched within N s from LRU eviction; env: PROTOAGENT_FLEET_WARM_GRACE
     )
+    # Member ids/names (re)started at hub boot (ADR 0072 autostart slice) — a container
+    # recreate/host restart kills the detached member processes, and without this the
+    # declared crew stays down until re-activated by hand. env: PROTOAGENT_FLEET_AUTOSTART
+    # (comma-separated). See graph/fleet/supervisor.start_autostart_members.
+    fleet_autostart: list[str] = field(default_factory=list)
+
+    # System lifecycle reactions (ADR 0074) — a top-level ``lifecycle_hooks:`` YAML list
+    # of ``{event, prompt?, webhook?, session?}`` entries the runtime runs when a system
+    # lifecycle event fires. ``event`` is one of ``app_loaded`` / ``agent_active`` /
+    # ``system_wake``; ``prompt`` enqueues a follow-up turn (in ``session``, or the event's
+    # own session for agent_active); ``webhook`` POSTs the event. **Opt-in**: empty ⇒ NOTHING
+    # fires beyond the ADR 0039 bus broadcast (plugins can still react via the bus / a
+    # ``register_lifecycle_hook`` hook). List of dicts, so it round-trips via config_io.py §B
+    # (like ``filesystem_projects`` / ``mcp_servers``), not the string_list-typed FIELDS.
+    lifecycle_hooks: list[dict] = field(default_factory=list)
 
     # Operator-console directory allowlist — the extra directories the
     # React console's tasks/notes APIs may read and write. The protoAgent
@@ -687,11 +855,15 @@ class LangGraphConfig:
     # under the workspace root (``..``/symlink escapes refused). A capable, safe
     # first run: the agent can actually work with files, but only inside the fence.
     # ``projects`` entries: ``{name, path, write: true|false}`` register extra dirs.
-    # ``allow_run`` adds the dual-use ``run_command`` power tool. ON by default
-    # now that it's gated: run_command (like execute_code) is fenced cwd but
-    # arbitrary argv (not a real sandbox), so each call pauses for HITL approval
-    # (``run_requires_approval``) — the operator sees the command + approves. A
-    # fork can drop the gate inside a hardened container / trusted autonomous run.
+    # ``allow_run`` adds the dual-use ``run_command`` power tool. Gated: run_command
+    # (like execute_code) is fenced cwd but arbitrary argv (not a real sandbox), so
+    # each call pauses for HITL approval (``run_requires_approval``) — the operator
+    # sees the command + approves. This dataclass default (True) is what a directly
+    # constructed config gets; ``from_dict``/``from_yaml`` resolve an UNSET value
+    # through ``_default_filesystem_allow_run()`` instead, which flips to False on a
+    # headless instance — no operator means a pending approval wedges the turn
+    # forever (#1849). Explicit config always wins either way. A fork can also drop
+    # the approval gate itself inside a hardened container / trusted autonomous run.
     filesystem_enabled: bool = True
     filesystem_allow_run: bool = True
     filesystem_run_requires_approval: bool = True
@@ -702,6 +874,16 @@ class LangGraphConfig:
     # gate is then always enforced.
     filesystem_bypass_allowed: bool = True
     filesystem_projects: list[dict] = field(default_factory=list)
+
+    # Core media output store (#1929) — tool-generated binary artifacts
+    # (images/audio/video) persisted via ``registry.save_media()`` and served on
+    # ``/media/<file>``. Gated by default: each saved URL carries a per-file HMAC
+    # signature (an inline ``<img>`` can't send a bearer header), so unsigned
+    # requests still hit the default-deny gate. ``public`` opts the whole store
+    # out of the auth gate (explicit exposure); ``retention_days`` prunes files
+    # older than N days on each save (0 = keep forever). See infra/media.py.
+    media_public: bool = False
+    media_retention_days: int = 0
 
     # Egress allowlist (ADR 0008) — deny-by-default outbound-host allowlist
     # enforced in ``fetch_url`` (the model-chosen-host exfil/SSRF vector). Empty
@@ -715,6 +897,25 @@ class LangGraphConfig:
     # outbound destination is allowed iff every resolved IP is inside a listed
     # CIDR. Enforced via ``policy.set_callback_allowlist``.
     security_callback_allowlist: list[str] = field(default_factory=list)
+
+    # External secrets manager (ADR 0080) — pull env vars from Infisical (etc.) at
+    # config load, on hot-reload, and on a refresh interval. client_id/client_secret
+    # are the bootstrap machine identity: SECRET_PATHS entries, overlaid from
+    # secrets.yaml exactly like model.api_key, with INFISICAL_CLIENT_ID /
+    # INFISICAL_CLIENT_SECRET as the env fallback.
+    secrets_manager_enabled: bool = False
+    secrets_manager_provider: str = "infisical"
+    secrets_manager_host: str = "https://us.infisical.com"
+    secrets_manager_project_id: str = ""
+    secrets_manager_environment: str = "prod"
+    secrets_manager_path: str = "/"
+    secrets_manager_recursive: bool = True
+    secrets_manager_client_id: str = ""
+    secrets_manager_client_secret: str = ""
+    secrets_manager_refresh_seconds: int = 300
+    secrets_manager_required: bool = False
+    secrets_manager_override_env: bool = False
+    secrets_manager_timeout_seconds: float = 10.0
 
     def __post_init__(self):
         # PROTOAGENT_MODEL wins over the YAML/default model so an eval sweep can
@@ -751,23 +952,14 @@ class LangGraphConfig:
         (zero-migration). Secrets stay leaf-only (sibling ``secrets.yaml``).
         """
         p = Path(path)
-        host_layer = _load_host_layer()  # {} when absent/unreadable — never crashes boot
-        if not p.exists() and not host_layer:
+        merged, secrets, present = _read_config_docs(p)
+        if not present:
             return cls()
 
-        agent_data: dict = {}
-        if p.exists():
-            with open(p) as f:
-                agent_data = yaml.safe_load(f) or {}
-
-        # Host is the base; the agent leaf overlays it (agent wins). No host layer ⇒
-        # merged is exactly the agent doc — the pre-cascade input, unchanged.
-        if host_layer:
-            # Surface silent shadowing of a box default by the agent leaf (issue #1459).
-            _warn_shadowed_host_keys(host_layer, agent_data)
-        merged = _deep_merge_dicts(copy.deepcopy(host_layer), agent_data) if host_layer else agent_data
-
-        secrets = _load_secrets_doc(p.parent)
+        # External secrets-manager hydration (ADR 0080) — before the parse, so the
+        # env fallbacks consulted below (and later, lazily, by create_llm / plugin
+        # requires_env gates) already see manager-sourced values.
+        _hydrate_external_secrets(merged, secrets)
         return cls.from_dict(merged, secrets=secrets, config_dir=p.parent)
 
     @classmethod
@@ -825,6 +1017,9 @@ class LangGraphConfig:
         secret_api_key = secrets.get("model", {}).get("api_key")
         secret_auth_token = secrets.get("auth", {}).get("token")
         secret_federation_token = secrets.get("auth", {}).get("federation_token")
+        secrets_manager = data.get("secrets_manager", {})
+        secret_sm_client_id = secrets.get("secrets_manager", {}).get("client_id")
+        secret_sm_client_secret = secrets.get("secrets_manager", {}).get("client_secret")
 
         config = cls(
             model_provider=model.get("provider", cls.model_provider),
@@ -834,6 +1029,7 @@ class LangGraphConfig:
             temperature=model.get("temperature", cls.temperature),
             max_tokens=model.get("max_tokens", cls.max_tokens),
             model_vision=model.get("vision", cls.model_vision),
+            model_favorites=list(model.get("favorites", []) or []),
             max_iterations=model.get("max_iterations", cls.max_iterations),
             request_timeout=model.get("request_timeout", cls.request_timeout),
             llm_max_retries=model.get("max_retries", cls.llm_max_retries),
@@ -874,6 +1070,7 @@ class LangGraphConfig:
             goal_no_progress_limit=data.get("goal", {}).get("no_progress_limit", cls.goal_no_progress_limit),
             goal_eval_model=data.get("goal", {}).get("eval_model", cls.goal_eval_model),
             goal_verify_timeout=data.get("goal", {}).get("verify_timeout", cls.goal_verify_timeout),
+            soul_self_edit_enabled=data.get("soul", {}).get("self_edit_enabled", cls.soul_self_edit_enabled),
             subagent_max_concurrency=subagents.get("max_concurrency", cls.subagent_max_concurrency),
             subagent_output_truncate=subagents.get("output_truncate", cls.subagent_output_truncate),
             knowledge_db_path=knowledge.get("db_path", cls.knowledge_db_path),
@@ -884,6 +1081,7 @@ class LangGraphConfig:
             telemetry_enabled=data.get("telemetry", {}).get("enabled", cls.telemetry_enabled),
             telemetry_db_path=data.get("telemetry", {}).get("db_path", cls.telemetry_db_path),
             telemetry_retention_days=data.get("telemetry", {}).get("retention_days", cls.telemetry_retention_days),
+            fleet_trace_export_enabled=data.get("telemetry", {}).get("fleet_trace_export", cls.fleet_trace_export_enabled),
             inbox_retention_days=data.get("inbox", {}).get("retention_days", cls.inbox_retention_days),
             activity_retention_days=data.get("activity", {}).get("retention_days", cls.activity_retention_days),
             checkpoint_keep_per_thread=data.get("checkpoint", {}).get(
@@ -892,6 +1090,7 @@ class LangGraphConfig:
             checkpoint_background_keep=data.get("checkpoint", {}).get(
                 "background_keep", cls.checkpoint_background_keep
             ),
+            background_auto_resume=data.get("background", {}).get("auto_resume", cls.background_auto_resume),
             checkpoint_max_age_days=data.get("checkpoint", {}).get("max_age_days", cls.checkpoint_max_age_days),
             checkpoint_prune_interval_hours=data.get("checkpoint", {}).get(
                 "prune_interval_hours", cls.checkpoint_prune_interval_hours
@@ -907,6 +1106,9 @@ class LangGraphConfig:
             image_describe_model=knowledge.get("image_describe_model", cls.image_describe_model),
             knowledge_embeddings=knowledge.get("embeddings", cls.knowledge_embeddings),
             knowledge_top_k=knowledge.get("top_k", cls.knowledge_top_k),
+            knowledge_inject_namespaces=list(knowledge.get("inject_namespaces", []) or []),
+            knowledge_inject_min_trust=knowledge.get("inject_min_trust", cls.knowledge_inject_min_trust),
+            knowledge_hot_write_confirm=knowledge.get("hot_write_confirm", cls.knowledge_hot_write_confirm),
             knowledge_vector_k=knowledge.get("vector_k", cls.knowledge_vector_k),
             knowledge_rrf_k=knowledge.get("rrf_k", cls.knowledge_rrf_k),
             knowledge_min_score=knowledge.get("min_score", cls.knowledge_min_score),
@@ -934,15 +1136,24 @@ class LangGraphConfig:
             mcp_servers=list(mcp.get("servers", []) or []),
             mcp_timeout_seconds=mcp.get("timeout_seconds", cls.mcp_timeout_seconds),
             mcp_denylist=list(mcp.get("denylist", []) or []),
+            mcp_persistent_sessions=bool(
+                mcp.get("persistent_sessions", cls.mcp_persistent_sessions)
+            ),
             mcp_scope=mcp.get("scope", cls.mcp_scope),
             operator_mcp_enabled=operator_mcp.get("enabled", cls.operator_mcp_enabled),
             operator_mcp_tools=list(operator_mcp.get("tools", []) or []),
+            operator_mcp_profile=str(operator_mcp.get("profile", "") or "").strip(),
             agent_runtime=str(data.get("agent_runtime", cls.agent_runtime) or "native"),
+            developer_channel=str((data.get("developer", {}) or {}).get("channel", cls.developer_channel) or "prod"),
             acp_agents=dict(acp.get("agents", {}) or {}),
             plugins_enabled=list(plugins.get("enabled", []) or []),
             plugins_disabled=list(plugins.get("disabled", []) or []),
             plugins_dir=plugins.get("dir", cls.plugins_dir),
             plugins_sources_allow=list((plugins.get("sources", {}) or {}).get("allow", []) or []),
+            plugins_update_policy=dict(plugins.get("update_policy", {}) or {}),
+            plugins_autoupdate_interval_hours=int(
+                plugins.get("autoupdate_interval_hours", cls.plugins_autoupdate_interval_hours) or 0
+            ),
             identity_name=identity.get("name", cls.identity_name),
             identity_operator=identity.get("operator", cls.identity_operator),
             identity_org=identity.get("org", cls.identity_org),
@@ -952,6 +1163,31 @@ class LangGraphConfig:
             instance_id=data.get("instance", {}).get("id", "") or data.get("instance_id", cls.instance_id),
             auth_token=secret_auth_token or auth.get("token", cls.auth_token),
             federation_token=secret_federation_token or auth.get("federation_token", cls.federation_token),
+            secrets_manager_enabled=bool(secrets_manager.get("enabled", cls.secrets_manager_enabled)),
+            secrets_manager_provider=str(
+                secrets_manager.get("provider", cls.secrets_manager_provider) or "infisical"
+            ),
+            secrets_manager_host=str(secrets_manager.get("host", cls.secrets_manager_host) or ""),
+            secrets_manager_project_id=str(secrets_manager.get("project_id", cls.secrets_manager_project_id) or ""),
+            secrets_manager_environment=str(
+                secrets_manager.get("environment", cls.secrets_manager_environment) or "prod"
+            ),
+            secrets_manager_path=str(secrets_manager.get("path", cls.secrets_manager_path) or "/"),
+            secrets_manager_recursive=bool(secrets_manager.get("recursive", cls.secrets_manager_recursive)),
+            secrets_manager_client_id=secret_sm_client_id
+            or secrets_manager.get("client_id", cls.secrets_manager_client_id),
+            secrets_manager_client_secret=secret_sm_client_secret
+            or secrets_manager.get("client_secret", cls.secrets_manager_client_secret),
+            secrets_manager_refresh_seconds=int(
+                secrets_manager.get("refresh_seconds", cls.secrets_manager_refresh_seconds) or 0
+            ),
+            secrets_manager_required=bool(secrets_manager.get("required", cls.secrets_manager_required)),
+            secrets_manager_override_env=bool(
+                secrets_manager.get("override_env", cls.secrets_manager_override_env)
+            ),
+            secrets_manager_timeout_seconds=float(
+                secrets_manager.get("timeout_seconds", cls.secrets_manager_timeout_seconds) or 10.0
+            ),
             autostart_on_boot=runtime.get("autostart_on_boot", cls.autostart_on_boot),
             # Box runtime (Host layer, ADR 0047 D8) — file > env > default. The env
             # fallback only fires when the merged dict omits the key (zero-migration).
@@ -964,10 +1200,20 @@ class LangGraphConfig:
             fleet_warm_grace_seconds=warm.get(
                 "grace_seconds", _env_default("PROTOAGENT_FLEET_WARM_GRACE", cls.fleet_warm_grace_seconds, int)
             ),
+            fleet_autostart=list(
+                fleet.get(
+                    "autostart",
+                    [s.strip() for s in os.environ.get("PROTOAGENT_FLEET_AUTOSTART", "").split(",") if s.strip()],
+                )
+                or []
+            ),
+            # System lifecycle reactions (ADR 0074) — top-level ``lifecycle_hooks:`` list.
+            # Opt-in: absent/empty ⇒ [] ⇒ nothing fires beyond the bus broadcast.
+            lifecycle_hooks=list(data.get("lifecycle_hooks", []) or []),
             operator_allowed_dirs=list(operator.get("allowed_dirs", []) or []),
             operator_project_dir=str(operator.get("project_dir", "") or ""),
             filesystem_enabled=data.get("filesystem", {}).get("enabled", cls.filesystem_enabled),
-            filesystem_allow_run=data.get("filesystem", {}).get("allow_run", cls.filesystem_allow_run),
+            filesystem_allow_run=data.get("filesystem", {}).get("allow_run", _default_filesystem_allow_run()),
             filesystem_run_requires_approval=data.get("filesystem", {}).get(
                 "run_requires_approval", cls.filesystem_run_requires_approval
             ),
@@ -975,6 +1221,10 @@ class LangGraphConfig:
                 "bypass_allowed", cls.filesystem_bypass_allowed
             ),
             filesystem_projects=list(data.get("filesystem", {}).get("projects", []) or []),
+            media_public=bool((data.get("media", {}) or {}).get("public", cls.media_public)),
+            media_retention_days=int(
+                (data.get("media", {}) or {}).get("retention_days", cls.media_retention_days) or 0
+            ),
             egress_allowed_hosts=list(data.get("egress", {}).get("allowed_hosts", []) or []),
             security_callback_allowlist=list((data.get("security") or {}).get("callback_allowlist", []) or []),
             plugin_config=_resolve_plugin_config(data, secrets, config_dir),

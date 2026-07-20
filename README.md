@@ -4,6 +4,11 @@
 
 # protoAgent
 
+[![Checks](https://github.com/protoLabsAI/protoAgent/actions/workflows/checks.yml/badge.svg)](https://github.com/protoLabsAI/protoAgent/actions/workflows/checks.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+[![Docs](https://img.shields.io/badge/docs-agent.protolabs.studio-9b87f2)](https://agent.protolabs.studio/docs/)
+[![GitHub Template](https://img.shields.io/badge/template-use%20this%20repo-9b87f2)](https://github.com/new?template_name=protoAgent&template_owner=protoLabsAI)
+
 A lean, A2A-native agent on LangGraph — ships a small core, grows with git-URL plugins.
 Run one agent or orchestrate a fleet; drive it from a console, the OpenAI-compatible API,
 or A2A. Local-first, yours to fork.
@@ -38,10 +43,11 @@ rename / release-pipeline wiring.
 | LLM gateway | `graph/llm.py` | OpenAI-compatible client pointed at LiteLLM — swap models by editing the gateway config, not the fork |
 | Subagents | `graph/subagents/config.py` | DeerFlow-pattern delegation via a `task()` tool; one worked example ships — a `researcher` (web + memory, plan→search→synthesize→cite) |
 | Delegate to other agents | `plugins/delegates/`, `plugins/coding_agent/` | **`delegate_to`** routes a sub-task to another agent or endpoint over **a2a / openai / acp** — a **built-in** registry, managed + hot-swappable from the console (**Workspace settings ▸ Delegates**), with a health prober. The **acp** type spawns a CLI coding agent (e.g. protoCLI) over the Agent Client Protocol. See [Delegates](./docs/guides/delegates.md), [Spawn CLI coding agents](./docs/guides/coding-agents.md), ADR [0024](./docs/adr/0024-spawn-cli-coding-agents-acp.md) / [0025](./docs/adr/0025-unified-delegate-registry-and-panel.md) |
-| Starter tools | `tools/lg_tools.py` | Default-on set: 4 keyless general (`current_time`, `calculator` safe AST eval, `web_search` via DuckDuckGo, `fetch_url`) + 2 HITL (`ask_human`, `request_user_input`) + 3 curation (`recent_activity`/`list_skills`/`save_skill`) + 3 goal (`set_goal`/`update_goal_plan`/`abandon_goal`) + 3 watch (`create_watch`/`list_watches`/`clear_watch`), plus — when their store is present — 4 memory + 3 scheduler + 4 tasks + 1 inbox. **Not** in `get_all_tools`: notes/docs tools (on-by-default plugins), `delegate_to` (built-in `delegates` plugin), GitHub read tools (opt-in `github` plugin). Drop any via `tools.disabled`; add via a plugin. See [Starter tools](./docs/reference/starter-tools.md) |
+| Starter tools | `tools/lg_tools.py` | Default-on set: 4 keyless general (`current_time`, `calculator` safe AST eval, `web_search` via DuckDuckGo, `fetch_url`) + 2 HITL (`ask_human`, `request_user_input`) + 3 curation (`recent_activity`/`list_skills`/`save_skill`) + 3 goal (`set_goal`/`update_goal_plan`/`abandon_goal`) + 3 watch (`create_watch`/`list_watches`/`clear_watch`), plus — when their store is present — 4 memory + 3 scheduler + 4 tasks + 1 inbox. Opt-in (off by default): 1 persona (`edit_soul`, guarded self-authored SOUL behind `soul.self_edit_enabled`, ADR 0081). **Not** in `get_all_tools`: notes/docs tools (on-by-default plugins), `delegate_to` (built-in `delegates` plugin), GitHub read tools (opt-in `github` plugin). Drop any via `tools.disabled`; add via a plugin. See [Starter tools](./docs/reference/starter-tools.md) |
 | File GitHub issues | `tools/gh_issue.py` | **`/issue`** — a user-only chat command **and** a 🐛 utility-bar form dialog that file a GitHub issue via the `gh` CLI, scaffolding + enforcing the required sections so it clears the repo's issue gate. **Not** an agent tool — creating issues stays in your hands (the `github` plugin's GitHub tools are read-only). Repos are a quick-toggle list configured under **Settings ▸ System ▸ GitHub** (`github.repos` + `github.default_repo`), pairing with the portfolio manager's many-repo setup. See [File GitHub issues](./docs/guides/file-github-issues.md) |
 | Knowledge store | `knowledge/store.py`, `knowledge/hybrid_store.py`, `ingestion/` | sqlite + FTS5 keyword search by default; an optional **hybrid** store adds embeddings + RRF fusion, and the **ingestion pipeline** pulls in txt/md/html/pdf/web/YouTube/audio/video sources. One `chunks` table for operator notes and conversation findings. Default-on; turn off with `middleware.knowledge: false` |
-| Extensibility | `graph/skills/`, `tools/mcp_tools.py`, `graph/plugins/`, `plugins/` | Opt-in ways to extend a running agent without forking: **`SKILL.md` skills** (AgentSkills format, loaded on demand), **MCP servers** (external tools over stdio/HTTP), and **plugins** — drop-in packages that add tools, skills, subagents, workflows, FastAPI routes, background surfaces, managed MCP servers, **console rail views**, and their own config/secrets/Settings. Plugins are **installable from a git URL** (`python -m server plugin install <url>`, pinned in `plugins.lock`) and shareable as repos — a repo is a full bundle. The first-party **Telegram** (`plugins/telegram`) integration ships bundled; **Discord**, **Slack**, and **Google** Gmail/Calendar install as external plugins from their own repos. See [Skills](./docs/guides/skills.md), [MCP](./docs/guides/mcp.md), [Plugins](./docs/guides/plugins.md), [Plugin console views](./docs/guides/plugin-views.md), [Install & publish plugins](./docs/guides/plugin-registry.md), ADR [0001](./docs/adr/0001-extensibility-and-plugin-architecture.md) / [0018](./docs/adr/0018-plugin-surfaces-routes-subagents.md) / [0019](./docs/adr/0019-plugin-config-settings-secrets.md) / [0026](./docs/adr/0026-plugin-contributed-console-surfaces.md) / [0027](./docs/adr/0027-install-plugins-from-git-url.md) |
+| Extensibility | `graph/skills/`, `tools/mcp_tools.py`, `graph/plugins/`, `plugins/` | Opt-in ways to extend a running agent without forking: **`SKILL.md` skills** (AgentSkills format, loaded on demand), **MCP servers** (external tools over stdio/HTTP), and **plugins** — drop-in packages that add tools, skills, subagents, workflows, FastAPI routes, background surfaces, managed MCP servers, **console rail views**, and their own config/secrets/Settings. Plugins are **installable from a git URL** (`protoagent plugin install <url>`, pinned in `plugins.lock`) and shareable as repos — a repo is a full bundle. The first-party **Telegram** (`plugins/telegram`) integration ships bundled; **Discord**, **Slack**, and **Google** Gmail/Calendar install as external plugins from their own repos. See [Skills](./docs/guides/skills.md), [MCP](./docs/guides/mcp.md), [Plugins](./docs/guides/plugins.md), [Plugin console views](./docs/guides/plugin-views.md), [Install & publish plugins](./docs/guides/plugin-registry.md), ADR [0001](./docs/adr/0001-extensibility-and-plugin-architecture.md) / [0018](./docs/adr/0018-plugin-surfaces-routes-subagents.md) / [0019](./docs/adr/0019-plugin-config-settings-secrets.md) / [0026](./docs/adr/0026-plugin-contributed-console-surfaces.md) / [0027](./docs/adr/0027-install-plugins-from-git-url.md) |
+| Media output channel | `infra/media.py`, `server/media.py`, `graph/multimodal.py` | Tool-generated binary artifacts, both directions: `registry.save_media()` persists an image/audio/video into a core store served by one `GET /media/<file>` route (per-file HMAC-signed URLs render inline in chat even under a bearer gate; `media.public` / `media.retention_days` config), and `multimodal_tool_result()` lets a tool return an image a **vision model actually sees** as ToolMessage content blocks (text-only models degrade to the caption/describe path). See [Plugins ▸ Tapping core deeper](./docs/guides/plugins.md#consumption-sdk) (#1929/#1930) |
 | Scheduler | `scheduler/` | `schedule_task` / `list_schedules` / `cancel_schedule` tools backed by a bundled sqlite scheduler. Multi-agent-safe — every job is namespaced by `AGENT_NAME`. See [Schedule future work](./docs/guides/scheduler.md) |
 | Eval harness | `evals/` | Side-effect-verified A2A test harness — audit log + reply text + KB state. `python -m evals.runner` against a running agent. See [Eval your fork](./docs/guides/evals.md) |
 | Tracing | `observability/tracing.py` | Langfuse trace_session with distributed `a2a.trace` propagation and the OTel cross-context-detach filter |
@@ -78,6 +84,21 @@ through every wizard step with screenshots.
 
 Once you're happy and want to ship it as your own image in your
 own GHCR: [Customize & deploy](./docs/guides/customize-and-deploy.md).
+
+## One-command install (Docker)
+
+No clone, no Python — for a fresh box you just SSH'd into. Pulls the published
+image, runs it, and walks a CLI wizard (the same `/api/config/*` endpoints the
+browser wizard uses) to configure a provider, model, and agent name:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/protoLabsAI/protoAgent/main/scripts/install.sh | sh
+```
+
+Re-running updates the image (the data volume is preserved) and offers to
+re-run the wizard. Works over a plain SSH session — with no TTY it starts the
+container and points you at the console to finish. See
+[Deploy with Docker → one-command install](./docs/guides/deploy-docker.md#one-command-install).
 
 ## Run headless
 
@@ -140,8 +161,8 @@ python -m server plugin uninstall your-plugin --purge                # removes c
 
 **Browse the directory → [agent.protolabs.studio/plugins](https://agent.protolabs.studio/plugins)**
 
-First-party plugins ship in `plugins/` — `delegates` is a built-in, `notes`, `docs`, and
-`artifact` are on by default, and the rest are opt-in (enable via `plugins.enabled`):
+First-party plugins ship in `plugins/` — `delegates` is a built-in, `notes`, `docs`,
+`artifact`, and `craft` are on by default, and the rest are opt-in (enable via `plugins.enabled`):
 
 | Plugin | Adds | What it does |
 | --- | --- | --- |
@@ -149,6 +170,7 @@ First-party plugins ship in `plugins/` — `delegates` is a built-in, `notes`, `
 | [`notes`](./plugins/notes/) | tools · view | **On by default** — one shared markdown note the agent and operator both read/write |
 | [`docs`](./plugins/docs/) | tools · view · skill | **On by default** — offline search over protoAgent's own docs |
 | [`artifact`](./plugins/artifact/) | tools · view · skill | **On by default** — generative UI; `show_artifact` renders charts, diagrams, Mermaid, Markdown, or live React into a sandboxed panel ([ADR 0038](./docs/adr/0038-generative-ui-artifacts-two-mode.md)) |
+| [`craft`](./plugins/craft/) | skills · subagent | **On by default** — engineering rituals as user-only slash commands (`/grill`, `/standup`, `/code-review`, `/writing-skills`) + the `skill_writer` subagent; prompt-only |
 | [`plugin-devkit`](./plugins/plugin-devkit/) | tool · subagent · skill · workflow · view | The authoring kit + reference plugin — the agent can scaffold and build its own plugins |
 | [`workflows`](./plugins/workflows/) | tools | Declarative multi-step subagent workflows (DAG recipes) |
 | [`telegram`](./plugins/telegram/) | surface | Run the agent as a Telegram bot — the reference [communication plugin](./docs/guides/communication-plugins.md) |
@@ -293,3 +315,9 @@ This is a template repo — bugs and improvements to the shared
 runtime (the `server/` package, `graph/agent.py`, extension
 support, release pipeline) land here. Domain-specific agent logic
 lives in the fork, not here.
+
+## License
+
+protoAgent is released under the [MIT License](./LICENSE) — fork it,
+build on it, ship it. Bundled first-party plugins carry their own
+`LICENSE` (also MIT).

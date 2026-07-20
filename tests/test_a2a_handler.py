@@ -38,6 +38,7 @@ from google.protobuf.json_format import MessageToDict
 
 import protolabs_a2a as pa
 from a2a_impl.executor import _CONTEXT_MIME, ProtoAgentExecutor, TurnOutcome, set_terminal_hook
+from a2a_impl.registry import OwnedProducerActiveTaskRegistry, harden_active_task_registry
 
 A2A_HEADERS = {"A2A-Version": "1.0"}
 
@@ -73,20 +74,22 @@ def test_read_data_returns_none_for_non_data_part():
     assert pa.read_data(pa.text_part("hi")) == (None, None)
 
 
-# ── protolabs_a2a: the four extensions ────────────────────────────────────────
+# ── protolabs_a2a: the four extensions (URI-keyed metadata since 0.3.0) ───────
+# Each `*_metadata` helper returns a {<EXT_URI>: payload} fragment that rides the
+# message/artifact metadata map. The extension URI is now the ONLY discriminator —
+# the old MIME-typed DataPart shape (and its *_MIME constants) is gone.
 
 
-def test_cost_extension_mime_uri_and_payload():
-    assert pa.COST_MIME == "application/vnd.protolabs.cost-v1+json"
+def test_cost_extension_uri_and_payload():
     assert pa.COST_EXT_URI == "https://proto-labs.ai/a2a/ext/cost-v1"
-    part = pa.emit_cost(
+    meta = pa.cost_metadata(
         {"input_tokens": 1500, "output_tokens": 420},
         duration_ms=900,
         cost_usd=0.0123,
         success=True,
     )
-    assert part["metadata"]["mimeType"] == pa.COST_MIME
-    payload = pa.parse_cost(part)
+    assert set(meta) == {pa.COST_EXT_URI}  # the URI key IS the discriminator
+    payload = pa.parse_cost(meta)
     assert payload["usage"] == {"input_tokens": 1500, "output_tokens": 420}
     assert payload["durationMs"] == 900
     assert payload["costUsd"] == 0.0123
@@ -94,33 +97,30 @@ def test_cost_extension_mime_uri_and_payload():
 
 
 def test_cost_omits_costusd_when_not_supplied():
-    part = pa.emit_cost({"input_tokens": 10, "output_tokens": 5}, duration_ms=10)
-    assert "costUsd" not in pa.parse_cost(part)
+    meta = pa.cost_metadata({"input_tokens": 10, "output_tokens": 5}, duration_ms=10)
+    assert "costUsd" not in pa.parse_cost(meta)
 
 
-def test_confidence_extension_mime_uri_and_payload():
-    assert pa.CONFIDENCE_MIME == "application/vnd.protolabs.confidence-v1+json"
+def test_confidence_extension_uri_and_payload():
     assert pa.CONFIDENCE_EXT_URI == "https://proto-labs.ai/a2a/ext/confidence-v1"
-    part = pa.emit_confidence(0.9, explanation="sure", success=True)
-    assert pa.parse_confidence(part) == {"confidence": 0.9, "explanation": "sure", "success": True}
+    meta = pa.confidence_metadata(0.9, explanation="sure", success=True)
+    assert pa.parse_confidence(meta) == {"confidence": 0.9, "explanation": "sure", "success": True}
 
 
-def test_worldstate_delta_mime_and_uri_both_carry_v1():
-    """The MIME (...worldstate-delta-v1+json) and the card URI
-    (.../worldstate-delta-v1) both carry -v1, matching the other three
-    extensions. Locking this prevents a silent interop break."""
-    assert pa.WORLDSTATE_DELTA_MIME == "application/vnd.protolabs.worldstate-delta-v1+json"
+def test_worldstate_delta_uri_carries_v1():
+    """The extension URI (.../worldstate-delta-v1) carries -v1, matching the other three.
+    Locking it prevents a silent interop break — since 0.3.0 this URI is both the
+    agent-card declaration AND the metadata key the payload rides under."""
     assert pa.WORLDSTATE_DELTA_EXT_URI == "https://proto-labs.ai/a2a/ext/worldstate-delta-v1"
-    part = pa.emit_worldstate_delta([{"domain": "board", "path": "x", "op": "inc", "value": 1}])
-    assert part["metadata"]["mimeType"] == pa.WORLDSTATE_DELTA_MIME
-    assert pa.parse_worldstate_delta(part)["deltas"][0]["op"] == "inc"
+    meta = pa.worldstate_delta_metadata([{"domain": "board", "path": "x", "op": "inc", "value": 1}])
+    assert set(meta) == {pa.WORLDSTATE_DELTA_EXT_URI}
+    assert pa.parse_worldstate_delta(meta)["deltas"][0]["op"] == "inc"
 
 
-def test_tool_call_extension_mime_uri_and_payload():
-    assert pa.TOOL_CALL_MIME == "application/vnd.protolabs.tool-call-v1+json"
+def test_tool_call_extension_uri_and_payload():
     assert pa.TOOL_CALL_EXT_URI == "https://proto-labs.ai/a2a/ext/tool-call-v1"
-    part = pa.emit_tool_call("id1", "file_bug", "completed", args={"x": 1}, result="ok")
-    assert pa.parse_tool_call(part) == {
+    meta = pa.tool_call_metadata("id1", "file_bug", "completed", args={"x": 1}, result="ok")
+    assert pa.parse_tool_call(meta) == {
         "toolCallId": "id1",
         "name": "file_bug",
         "phase": "completed",
@@ -129,11 +129,23 @@ def test_tool_call_extension_mime_uri_and_payload():
     }
 
 
-def test_parsers_return_none_on_mime_mismatch():
-    cost = pa.emit_cost({"input_tokens": 1, "output_tokens": 1})
+def test_parsers_return_none_on_uri_mismatch():
+    cost = pa.cost_metadata({"input_tokens": 1, "output_tokens": 1})
     assert pa.parse_confidence(cost) is None
     assert pa.parse_worldstate_delta(cost) is None
     assert pa.parse_tool_call(cost) is None
+
+
+def test_merge_extension_metadata_folds_fragments_into_one_map():
+    """0.3.0's merge helper folds several URI-keyed fragments into ONE metadata map —
+    exactly how the terminal artifact carries cost + worldstate together."""
+    merged = pa.merge_extension_metadata(
+        pa.cost_metadata({"input_tokens": 1, "output_tokens": 1}),
+        pa.worldstate_delta_metadata([{"domain": "b", "path": "x", "op": "set", "value": 1}]),
+    )
+    assert set(merged) == {pa.COST_EXT_URI, pa.WORLDSTATE_DELTA_EXT_URI}
+    assert pa.parse_cost(merged) is not None
+    assert pa.parse_worldstate_delta(merged) is not None
 
 
 # ── protolabs_a2a: agent card ─────────────────────────────────────────────────
@@ -178,7 +190,7 @@ def test_build_agent_card_omits_bearer_when_not_configured():
 # ── ProtoAgentExecutor end-to-end (through a2a-sdk) ───────────────────────────
 
 
-def _build_app(stream_fn, *, bearer=None, api_key="", allowed_origins=None):
+def _build_app(stream_fn, *, bearer=None, api_key="", allowed_origins=None, task_store=None):
     """Mount a real a2a-sdk app driven by ProtoAgentExecutor(stream_fn)."""
     card = pa.build_agent_card(
         name="test",
@@ -190,11 +202,16 @@ def _build_app(stream_fn, *, bearer=None, api_key="", allowed_origins=None):
     )
     handler = DefaultRequestHandler(
         agent_executor=ProtoAgentExecutor(stream_fn),
-        task_store=InMemoryTaskStore(),
+        task_store=task_store if task_store is not None else InMemoryTaskStore(),
         agent_card=card,
         push_config_store=InMemoryPushNotificationConfigStore(),
     )
+    # Mirror production wiring (#1713): every test turn runs through the
+    # owned-producer registry, exactly like server/__init__.py mounts it.
+    assert harden_active_task_registry(handler)
+    _HANDLERS.append(handler)
     app = FastAPI()
+    app.state.a2a_handler = handler
     if bearer is not None or api_key or allowed_origins is not None:
         from a2a_impl import auth
 
@@ -251,6 +268,29 @@ def _clear_terminal_hook():
     set_terminal_hook(None)
 
 
+# Handlers built by _build_app during the current test — drained at teardown so
+# their retire-then-remove cleanup tasks (#1713) finish inside the test's event
+# loop instead of being destroyed pending when pytest closes it.
+_HANDLERS: list = []
+
+
+@pytest.fixture(autouse=True)
+def _fast_retire(monkeypatch):
+    """Shrink the producer flush grace so teardown drains stay fast in tests."""
+    monkeypatch.setattr("a2a_impl.registry.FLUSH_GRACE_S", 0.02)
+
+
+@pytest.fixture(autouse=True)
+async def _drain_a2a_cleanup():
+    yield
+    for handler in _HANDLERS:
+        reg = getattr(handler, "_active_task_registry", None)
+        tasks = set(getattr(reg, "_cleanup_tasks", ()) or ())
+        if tasks:
+            await asyncio.wait(tasks, timeout=5)
+    _HANDLERS.clear()
+
+
 @pytest.mark.asyncio
 async def test_send_message_runs_to_completed_with_text_artifact():
     async def stream(text, ctx, *, resume=False, caller_trace=None, **kwargs):
@@ -270,10 +310,11 @@ async def test_send_message_runs_to_completed_with_text_artifact():
 
 
 @pytest.mark.asyncio
-async def test_terminal_artifact_carries_all_extensions_in_order():
-    """text → worldstate-delta → cost-v1 → context-v1, matching the order the
-    hand-rolled handler emitted (consumers read parts in order); the context-v1
-    readout (#1372) trails as a pure append."""
+async def test_terminal_artifact_carries_all_extensions():
+    """Since protolabs-a2a 0.3.0 the telemetry extensions ride the artifact's METADATA
+    keyed by extension URI (worldstate-delta + cost), so `parts` carries only real
+    content: the answer text plus the context-v1 readout (#1372), which is a
+    template-local extension and stays a DataPart."""
 
     async def stream(text, ctx, *, resume=False, caller_trace=None, **kwargs):
         yield ("text", "done text")
@@ -287,19 +328,26 @@ async def test_terminal_artifact_carries_all_extensions_in_order():
         task = (await _send_msg(c)).json()["result"]["task"]
         final = await _poll_terminal(c, task["id"])
 
-    parts = final["artifacts"][0]["parts"]
+    artifact = final["artifacts"][0]
+    parts = artifact["parts"]
+    # Content parts only: text, then the context-v1 DataPart as a pure append.
     assert parts[0]["text"] == "done text"
     mimes = [p.get("metadata", {}).get("mimeType") for p in parts[1:]]
-    assert mimes == [pa.WORLDSTATE_DELTA_MIME, pa.COST_MIME, _CONTEXT_MIME]
+    assert mimes == [_CONTEXT_MIME]
+
+    # The two SDK extensions now ride the artifact metadata, keyed by URI.
+    meta = artifact.get("metadata") or {}
+    assert {pa.COST_EXT_URI, pa.WORLDSTATE_DELTA_EXT_URI} <= set(meta)
+    assert pa.parse_worldstate_delta(meta)["deltas"][0]["op"] == "inc"
     # cost-v1 payload carries the SUMMED token usage (100+140 input) + the turn duration.
-    cost = pa.parse_cost(parts[2])
+    cost = pa.parse_cost(meta)
     assert cost["usage"]["input_tokens"] == 240
     assert cost["success"] is True
     # durationMs is present (proto-JSON round-trips numbers as floats, so compare numerically).
     assert isinstance(cost["durationMs"], (int, float)) and cost["durationMs"] >= 0
     # context-v1 carries the PEAK prompt size (max single call's input_tokens), the live
     # context-window fill — distinct from the summed spend above.
-    _ctx_mime, ctx = pa.read_data(parts[3])
+    _ctx_mime, ctx = pa.read_data(parts[1])
     assert _ctx_mime == _CONTEXT_MIME
     assert ctx["contextTokens"] == 140
 
@@ -351,9 +399,10 @@ async def test_input_required_parks_task_with_question():
 
 
 @pytest.mark.asyncio
-async def test_tool_events_surface_as_tool_call_dataparts():
-    """tool_start/tool_end become tool-call-v1 DataParts on working status
-    frames — observed via the streaming endpoint (the real consumer path; a
+async def test_tool_events_surface_as_tool_call_metadata():
+    """tool_start/tool_end become tool-call-v1 **metadata** on working status frames
+    (protolabs-a2a 0.3.0 — keyed by the extension URI, no longer a DataPart in
+    `parts[]`) — observed via the streaming endpoint (the real consumer path; a
     GetTask poll only sees the collapsed terminal state)."""
     import json
 
@@ -386,10 +435,9 @@ async def test_tool_events_surface_as_tool_call_dataparts():
                 msg = status.get("message")
                 if not msg:
                     continue
-                for part in msg.get("parts", []):
-                    payload = pa.parse_tool_call(part)
-                    if payload is not None:
-                        tool_payloads.append(payload)
+                payload = pa.parse_tool_call(msg.get("metadata"))
+                if payload is not None:
+                    tool_payloads.append(payload)
 
     phases = [p["phase"] for p in tool_payloads]
     assert "started" in phases and "completed" in phases
@@ -401,14 +449,15 @@ async def test_tool_events_surface_as_tool_call_dataparts():
 @pytest.mark.asyncio
 async def test_errored_tool_end_surfaces_phase_failed():
     """A tool_end flagged error → a phase=\"failed\" tool-call DataPart (the card
-    renders the X), carrying the error text. A declined run_command takes this path."""
+    renders the X), carrying the error text. A genuine command failure takes this
+    path — a DECLINE no longer does (#1692: it returns a normal result now)."""
     import json
 
     async def stream(text, ctx, *, resume=False, caller_trace=None, **kwargs):
-        yield ("tool_start", {"id": "t1", "name": "run_command", "input": {"command": "rm -rf /"}})
+        yield ("tool_start", {"id": "t1", "name": "run_command", "input": {"command": "false"}})
         yield (
             "tool_end",
-            {"id": "t1", "name": "run_command", "output": "Command declined by the operator — not run", "error": True},
+            {"id": "t1", "name": "run_command", "output": "Error: command exited 1", "error": True},
         )
         yield ("done", "ok")
 
@@ -434,15 +483,14 @@ async def test_errored_tool_end_surfaces_phase_failed():
                 msg = status.get("message")
                 if not msg:
                     continue
-                for part in msg.get("parts", []):
-                    p = pa.parse_tool_call(part)
-                    if p is not None:
-                        payloads.append(p)
+                p = pa.parse_tool_call(msg.get("metadata"))
+                if p is not None:
+                    payloads.append(p)
 
     failed = next((p for p in payloads if p["phase"] == "failed"), None)
     assert failed is not None, [p["phase"] for p in payloads]
     assert failed["name"] == "run_command"
-    assert "declined" in (failed.get("error") or "")
+    assert "exited 1" in (failed.get("error") or "")
 
 
 @pytest.mark.asyncio
@@ -453,16 +501,16 @@ async def test_text_deltas_stream_as_incremental_artifact_frames():
     import json
 
     async def stream(text, ctx, *, resume=False, caller_trace=None, **kwargs):
-        # each chunk is over the executor's flush threshold so it emits a frame
-        yield ("text", "First sentence of the streamed answer here. ")
-        yield ("text", "Second sentence that continues the answer. ")
-        yield ("text", "Third and final sentence to wrap it up.")
-        yield (
-            "done",
-            "First sentence of the streamed answer here. "
-            "Second sentence that continues the answer. "
-            "Third and final sentence to wrap it up.",
-        )
+        # Each chunk is over the executor's flush threshold (_FLUSH_CHARS) so it
+        # emits its own artifact-update frame instead of buffering to turn end.
+        pad = " more padding words to cross the flush threshold and force a frame."
+        s1 = "First sentence of the streamed answer here." + pad * 3
+        s2 = "Second sentence that continues the answer." + pad * 3
+        s3 = "Third and final sentence to wrap it up." + pad * 3
+        yield ("text", s1)
+        yield ("text", s2)
+        yield ("text", s3)
+        yield ("done", s1 + s2 + s3)
 
     app = _build_app(stream)
     artifact_texts: list[str] = []
@@ -494,6 +542,248 @@ async def test_text_deltas_stream_as_incremental_artifact_frames():
     assert len(artifact_texts) >= 2, artifact_texts
     assert any("First sentence" in t for t in artifact_texts)
     assert "Third and final sentence" in "".join(artifact_texts)
+
+
+# ── Durable-store pair: #1710 reasoning flood + #1709 truncated artifact ──────
+
+_REASONING_MIME = "application/vnd.protolabs.reasoning-v1+json"
+
+
+def _reasoning_texts_from_history(history: list[dict]) -> list[str]:
+    """The concatenated reasoning text of each all-reasoning history Message."""
+    out: list[str] = []
+    for m in history or []:
+        parts = m.get("parts") or []
+        texts: list[str] | None = []
+        for p in parts:
+            mime = (p.get("metadata") or {}).get("mimeType")
+            if mime == _REASONING_MIME and isinstance(p.get("data"), dict):
+                texts.append(p["data"].get("text", ""))
+            else:
+                texts = None
+                break
+        if texts:
+            out.append("".join(texts))
+    return out
+
+
+@pytest.mark.asyncio
+async def test_reasoning_flood_coalesces_in_durable_history(tmp_path):
+    """#1710: a token-per-event reasoning stream (~200 deltas) lands in durable
+    task history as ONE coalesced reasoning Message carrying the full text —
+    not a Message row per word — so GetTask history stays conversation-shaped."""
+    from a2a_impl.stores import ReasoningCoalescingTaskStore, make_sqlite_engine
+
+    words = [f" think{i}" for i in range(200)]
+
+    async def stream(text, ctx, *, resume=False, caller_trace=None, **kwargs):
+        for w in words:
+            yield ("reasoning", w)
+        yield ("done", "short answer")
+
+    store = ReasoningCoalescingTaskStore(make_sqlite_engine(str(tmp_path / "a2a-tasks.db")))
+    await store.initialize()
+    app = _build_app(stream, task_store=store)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test", timeout=30) as c:
+        task = (await _send_msg(c)).json()["result"]["task"]
+        final = await _poll_terminal(c, task["id"])
+
+    assert final["status"]["state"] == "TASK_STATE_COMPLETED"
+    history = final.get("history") or []
+    reasoning = _reasoning_texts_from_history(history)
+    assert len(reasoning) == 1, f"expected ONE coalesced reasoning Message, got {len(reasoning)} in {len(history)} rows"
+    assert reasoning[0] == "".join(words)  # nothing dropped by coalescing
+    # The flood never lands as per-word rows: user message + reasoning (+ status moves).
+    assert len(history) <= 4, f"history bloated: {len(history)} rows"
+    # The answer artifact is unaffected.
+    parts = final["artifacts"][0]["parts"]
+    assert parts[0]["text"] == "short answer"
+
+
+@pytest.mark.asyncio
+async def test_reasoning_stream_stays_live_but_batched():
+    """The live thinking bubble still fills incrementally — multiple reasoning
+    frames on the wire, batched to ~_FLUSH_CHARS granularity (not one WORKING
+    frame per token), with no reasoning content lost and the tail flushed
+    before the answer text frame (stream order)."""
+    import json
+
+    words = [f" w{i}" for i in range(120)]
+    answer = "answer text long enough to flush as its own frame"
+
+    async def stream(text, ctx, *, resume=False, caller_trace=None, **kwargs):
+        for w in words:
+            yield ("reasoning", w)
+        yield ("text", answer)
+        yield ("done", answer)
+
+    app = _build_app(stream)
+    reasoning_frames: list[str] = []
+    saw_artifact_frame = False
+    reasoning_after_artifact = False
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test", timeout=30) as c:
+        async with c.stream(
+            "POST",
+            "/a2a",
+            headers=A2A_HEADERS,
+            json={
+                "jsonrpc": "2.0",
+                "id": "s",
+                "method": "SendStreamingMessage",
+                "params": {"message": {"messageId": "m", "role": "ROLE_USER", "parts": [{"text": "hi"}]}},
+            },
+        ) as resp:
+            assert resp.status_code == 200
+            async for line in resp.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                result = json.loads(line[5:].strip()).get("result", {})
+                status = result.get("statusUpdate", {}).get("status", {})
+                for part in (status.get("message") or {}).get("parts", []):
+                    if (part.get("metadata") or {}).get("mimeType") == _REASONING_MIME:
+                        reasoning_frames.append(part.get("data", {}).get("text", ""))
+                        if saw_artifact_frame:
+                            reasoning_after_artifact = True
+                if result.get("artifactUpdate"):
+                    saw_artifact_frame = True
+
+    assert "".join(reasoning_frames) == "".join(words)  # wire carries ALL reasoning
+    # Live (more than one frame) but batched (far fewer frames than tokens).
+    assert 2 <= len(reasoning_frames) < len(words) // 2, len(reasoning_frames)
+    # The buffered reasoning tail flushed BEFORE the answer frame (stream order).
+    assert saw_artifact_frame and not reasoning_after_artifact
+
+
+@pytest.mark.asyncio
+async def test_finalize_repairs_durable_artifact_after_downstream_frame_loss(monkeypatch):
+    """#1709: mid-stream artifact-append frames lost DOWNSTREAM of the executor
+    (emitted, but never persisted) — the terminal last_chunk frame must REPLACE
+    the artifact with the canonical text so the durable task self-heals, instead
+    of appending meta-only and permanently sealing the truncation."""
+    from a2a.server.tasks.task_manager import TaskManager
+    from a2a.types import TaskArtifactUpdateEvent
+
+    chunks = [
+        "First chunk of the streamed answer, well over the flush threshold. ",
+        "Second chunk that the durable store never sees. ",
+        "Third chunk, also lost downstream of the executor.",
+    ]
+    full = "".join(chunks)
+
+    async def stream(text, ctx, *, resume=False, caller_trace=None, **kwargs):
+        for c in chunks:
+            yield ("text", c)
+        yield ("usage", {"input_tokens": 100, "output_tokens": 50, "cost_usd": 0.001})
+        yield ("done", full)
+
+    orig_process = TaskManager.process
+
+    async def lossy_process(self, event):
+        # The forensic loss shape from #1709: mid-stream appends vanish; the
+        # first (create) frame and the terminal last_chunk frame arrive.
+        if isinstance(event, TaskArtifactUpdateEvent) and event.append and not event.last_chunk:
+            return event
+        return await orig_process(self, event)
+
+    monkeypatch.setattr(TaskManager, "process", lossy_process)
+
+    app = _build_app(stream)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test", timeout=10) as c:
+        task = (await _send_msg(c)).json()["result"]["task"]
+        final = await _poll_terminal(c, task["id"])
+
+    assert final["status"]["state"] == "TASK_STATE_COMPLETED"
+    parts = final["artifacts"][0]["parts"]
+    text_parts = [p["text"] for p in parts if p.get("text")]
+    # The canonical answer, exactly once — neither truncated nor doubled.
+    assert text_parts == [full]
+    # The telemetry still lands exactly once. Cost now rides the artifact's metadata
+    # keyed by URI — a map, so a replayed frame can't duplicate it the way a repeated
+    # DataPart could; assert it survived the repair and still parses.
+    meta = final["artifacts"][0].get("metadata") or {}
+    assert pa.parse_cost(meta) is not None
+
+
+@pytest.mark.asyncio
+async def test_streamed_answer_lands_exactly_once_in_durable_artifact():
+    """Normal (no-loss) path: the authoritative terminal REPLACE leaves the
+    durable artifact holding ONE canonical text part — the streamed chunk parts
+    don't linger (concat readers of the stored task would re-join them with
+    separators) and the replace doesn't double the answer."""
+
+    chunks = ["First streamed chunk, over the threshold. ", "Second streamed chunk, also flushed."]
+    full = "".join(chunks)
+
+    async def stream(text, ctx, *, resume=False, caller_trace=None, **kwargs):
+        for c in chunks:
+            yield ("text", c)
+        yield ("done", full)
+
+    app = _build_app(stream)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test", timeout=10) as c:
+        task = (await _send_msg(c)).json()["result"]["task"]
+        final = await _poll_terminal(c, task["id"])
+
+    text_parts = [p["text"] for p in final["artifacts"][0]["parts"] if p.get("text")]
+    assert text_parts == [full]
+
+
+@pytest.mark.asyncio
+async def test_terminal_replace_wire_shape_omits_append_key():
+    """The CONSUMER CONTRACT of the terminal replace, at the wire level: proto3
+    gives the A2A ``append`` bool no presence, so the SDK OMITS the key when it's
+    False — the terminal frame arrives as ``{artifact: <full text + meta>,
+    lastChunk: true}`` with NO ``append`` key at all. Every frame consumer must
+    read that ABSENCE as replace (only an explicit ``true`` appends); mapping
+    absent→append re-appends the whole canonical answer and doubles every
+    streamed turn (the operator-console regression this locks against —
+    ``artifactAppends`` in apps/web/src/lib/api.ts, mirrored by
+    evals/client.py)."""
+    import json
+
+    chunks = ["First streamed chunk, over the flush threshold. ", "Second streamed chunk, also flushed."]
+    full = "".join(chunks)
+
+    async def stream(text, ctx, *, resume=False, caller_trace=None, **kwargs):
+        for c in chunks:
+            yield ("text", c)
+        yield ("done", full)
+
+    app = _build_app(stream)
+    artifact_frames: list[dict] = []
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test", timeout=30) as c:
+        async with c.stream(
+            "POST",
+            "/a2a",
+            headers=A2A_HEADERS,
+            json={
+                "jsonrpc": "2.0",
+                "id": "s",
+                "method": "SendStreamingMessage",
+                "params": {"message": {"messageId": "m", "role": "ROLE_USER", "parts": [{"text": "hi"}]}},
+            },
+        ) as resp:
+            assert resp.status_code == 200
+            async for line in resp.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                update = json.loads(line[5:].strip()).get("result", {}).get("artifactUpdate")
+                if update:
+                    artifact_frames.append(update)
+
+    assert len(artifact_frames) >= 2  # streamed chunks + the terminal replace
+    terminal, mid = artifact_frames[-1], artifact_frames[:-1]
+    # Terminal frame: last chunk, full canonical text — and the ``append`` key is
+    # ABSENT (proto3 omitted-false), which consumers MUST read as replace.
+    assert terminal.get("lastChunk") is True
+    assert "append" not in terminal, f"expected proto3 to omit append=False, got {terminal.get('append')!r}"
+    terminal_texts = [p["text"] for p in terminal["artifact"]["parts"] if p.get("text")]
+    assert terminal_texts == [full]
+    # Mid-stream chunks after the first carry an EXPLICIT append=true — the only
+    # value a consumer may treat as append. (The first chunk creates the artifact
+    # with append=False, so it too arrives with the key omitted.)
+    assert "append" not in mid[0]
+    assert all(f.get("append") is True for f in mid[1:])
 
 
 @pytest.mark.asyncio
@@ -697,3 +987,138 @@ def test_extract_image_parts_empty_when_no_message():
     from a2a_impl.executor import _extract_image_parts
 
     assert _extract_image_parts(_t.SimpleNamespace(message=None)) == []
+
+
+# ── a2a_impl.registry: producer-task ownership at turn teardown (#1713) ───────
+# a2a-sdk 1.1.0's ActiveTask teardown drops the last strong reference to the
+# still-pending `producer:<task_id>` task without cancelling or awaiting it, so
+# cyclic GC destroys it ("Task was destroyed but it is pending!"). The hardened
+# registry must own the producer/consumer tasks for their lifetime: awaited
+# (grace to flush) or cancelled+awaited before the ActiveTask is dropped.
+
+
+def _hardened_registry() -> OwnedProducerActiveTaskRegistry:
+    from a2a.server.tasks import InMemoryTaskStore as _Store
+
+    return OwnedProducerActiveTaskRegistry(agent_executor=None, task_store=_Store())
+
+
+async def test_harden_swaps_registry_preserving_wiring():
+    async def stream(text, ctx, *, resume=False, caller_trace=None, **kwargs):
+        yield ("done", "ok")
+
+    app = _build_app(stream)
+    handler = app.state.a2a_handler
+    reg = handler._active_task_registry
+    assert isinstance(reg, OwnedProducerActiveTaskRegistry)
+    # Same executor/store the stock registry was built with — only the cleanup
+    # behavior changes.
+    assert reg._agent_executor is handler.agent_executor
+    assert reg._task_store is handler.task_store
+
+
+def test_harden_degrades_gracefully_on_moved_internals():
+    """If an a2a-sdk upgrade moves _active_task_registry, hardening must warn and
+    no-op — never crash the mount."""
+
+    class _NotAHandler:
+        pass
+
+    assert harden_active_task_registry(_NotAHandler()) is False
+
+
+async def test_cleanup_retires_stuck_producer_instead_of_dropping_it():
+    """A producer parked forever (the active_task.py:566 close-join hang) is
+    cancelled and awaited by the cleanup path — not left pending for the GC."""
+    import types as _t
+
+    reg = _hardened_registry()
+    hang = asyncio.Event()
+
+    async def _stuck():
+        await hang.wait()
+
+    async def _done():
+        return None
+
+    stub = _t.SimpleNamespace(
+        task_id="t-1713",
+        _producer_task=asyncio.create_task(_stuck(), name="producer:t-1713"),
+        _consumer_task=asyncio.create_task(_done(), name="consumer:t-1713"),
+    )
+    reg._active_tasks["t-1713"] = stub
+
+    reg._on_active_task_cleanup(stub)
+
+    async with asyncio.timeout(10):
+        while reg._cleanup_tasks or "t-1713" in reg._active_tasks:
+            await asyncio.sleep(0.005)
+
+    assert stub._producer_task.done()
+    assert stub._producer_task.cancelled()  # stuck → cancelled+awaited, not dropped
+    assert stub._consumer_task.done()
+    assert await reg.get("t-1713") is None  # still removed from the registry
+
+
+async def test_cleanup_lets_flushing_producer_finish_without_cancel():
+    """A producer that completes within the grace window flushes naturally —
+    awaited to completion, never cancelled."""
+    import types as _t
+
+    reg = _hardened_registry()
+    flushed = asyncio.Event()
+
+    async def _flushing():
+        await asyncio.sleep(0)  # one loop iteration, like a completing queue-join
+        flushed.set()
+
+    stub = _t.SimpleNamespace(
+        task_id="t-flush",
+        _producer_task=asyncio.create_task(_flushing(), name="producer:t-flush"),
+        _consumer_task=None,  # start()-failure path leaves these unset — must not crash
+    )
+    reg._active_tasks["t-flush"] = stub
+
+    reg._on_active_task_cleanup(stub)
+
+    async with asyncio.timeout(10):
+        while reg._cleanup_tasks or "t-flush" in reg._active_tasks:
+            await asyncio.sleep(0.005)
+
+    assert flushed.is_set()
+    assert stub._producer_task.done()
+    assert not stub._producer_task.cancelled()
+
+
+async def test_turn_teardown_retires_real_producer_task(monkeypatch):
+    """End-to-end through the real SDK: after a SendMessage turn completes, the
+    ActiveTask's producer/consumer tasks are done (retired) by the time the
+    registry drops it — the exact guarantee whose absence caused #1713."""
+    retired = []
+    orig = OwnedProducerActiveTaskRegistry._retire_and_remove
+
+    async def spy(self, active_task):
+        await orig(self, active_task)
+        retired.append(active_task)
+
+    monkeypatch.setattr(OwnedProducerActiveTaskRegistry, "_retire_and_remove", spy)
+
+    async def stream(text, ctx, *, resume=False, caller_trace=None, **kwargs):
+        yield ("text", "hello ")
+        yield ("done", "hello world")
+
+    app = _build_app(stream)
+    reg = app.state.a2a_handler._active_task_registry
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        task = (await _send_msg(c)).json()["result"]["task"]
+        final = await _poll_terminal(c, task["id"])
+        assert final["status"]["state"] == "TASK_STATE_COMPLETED"
+
+    # Wait for the turn's retire-then-remove cleanup to run.
+    async with asyncio.timeout(10):
+        while not retired or reg._cleanup_tasks or reg._active_tasks:
+            await asyncio.sleep(0.005)
+
+    for active in retired:
+        assert active._producer_task is not None and active._producer_task.done()
+        assert active._consumer_task is not None and active._consumer_task.done()

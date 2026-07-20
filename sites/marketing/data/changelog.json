@@ -1,5 +1,451 @@
 [
   {
+    "version": "v0.104.5",
+    "date": "2026-07-20",
+    "changes": [
+      "A token-gated instance's own desktop app can reach it again.",
+      "The /code-review panel got sharper prompts",
+      "Settings ▸ Devices is hidden behind a developer flag (settings.devices, default off).",
+      "graph.sdk.start_goal_loop / stop_goal_loop are back — watch-based this time"
+    ]
+  },
+  {
+    "version": "v0.104.4",
+    "date": "2026-07-19",
+    "changes": [
+      "\"Allow devices on my network\" can no longer stop the app from starting."
+    ]
+  },
+  {
+    "version": "v0.104.3",
+    "date": "2026-07-19",
+    "changes": [
+      "Enabling network access no longer hands you a secret you can't see.",
+      "The token prompt says where the token lives.",
+      "The desktop app authenticates itself instead of asking you for a token it already has."
+    ]
+  },
+  {
+    "version": "v0.104.2",
+    "date": "2026-07-19",
+    "changes": [
+      "The desktop app no longer hangs on launch after enabling network access."
+    ]
+  },
+  {
+    "version": "v0.104.1",
+    "date": "2026-07-19",
+    "changes": [
+      "Pairing works in the desktop app."
+    ]
+  },
+  {
+    "version": "v0.104.0",
+    "date": "2026-07-18",
+    "changes": [
+      "Mobile is a chat-first app, not a shrunken console.",
+      "Add a phone by scanning a QR, and revoke it individually.",
+      "A managed Node runtime, provisioned on demand.",
+      "Bundles can seed MCP servers",
+      "A read-write-no-delete fence mode for the filesystem toolset",
+      "Telemetry extensions moved to URI-keyed metadata",
+      "Settings ▸ Integrations is now Plugins, matching what the section actually contains.",
+      "The console consumes @protolabsai/ui 0.57, which ships the touch floor upstream",
+      "A chat tab doing background work shows a processing dot",
+      "\"+\" no longer piles up empty chats.",
+      "Dropped the per-row \"open in new window\" action from the fleet switcher, which duplicated the row's own click behaviour.",
+      "uv is pinned to 0.11.29 in both release workflows"
+    ]
+  },
+  {
+    "version": "v0.103.2",
+    "date": "2026-07-17",
+    "changes": [
+      "Overlays no longer inherit the styles of the surface that opened them"
+    ]
+  },
+  {
+    "version": "v0.103.1",
+    "date": "2026-07-17",
+    "changes": [
+      "Dialogs opened from inside Settings are usable again.",
+      "QuickSetting chip dialogs honour depends_on.",
+      "uv.lock re-locked after the protolabs-agent PyPI rename: it still recorded protolabs-a2a as a git ref pinned to v0.2.0 while pyproject.toml had moved to the PyPI range >=0.2.1,<0.3"
+    ]
+  },
+  {
+    "version": "v0.103.0",
+    "date": "2026-07-17",
+    "changes": [
+      "Cowork mode — a prepackaged knowledge-worker archetype.",
+      "Archetype preview — see what you're committing to before you pick.",
+      "The wizard now finishes the mechanical setup it starts.",
+      "Notes render markdown as you type",
+      "Two core settings sections no longer file themselves under Integrations by accident.",
+      "A rejected settings save no longer leaves disk ahead of the running agent.",
+      "The shared note is guarded against lost updates",
+      "Console responses are gzip-compressed",
+      "ADR 0084"
+    ]
+  },
+  {
+    "version": "v0.102.0",
+    "date": "2026-07-16",
+    "changes": [
+      "Registered ACP coding agents now surface in the runtime + model pickers (#1993).",
+      "The agent can refine its own persona — a guarded edit_soul tool, off by default (#1985).",
+      "Chat: a stalled turn self-heals, so a large answer never spins \"Working…\" forever (#1982).",
+      "Chat: currency amounts no longer render as LaTeX math (#1983).",
+      "Console: chat report cards and system notes share a quieter, consistent elevation (#1992)."
+    ]
+  },
+  {
+    "version": "v0.101.0",
+    "date": "2026-07-12",
+    "changes": [
+      "HITL forms honor schema defaults and are fully keyboard-operable (#1978).",
+      "Plugins: uninstall now tears down live state (#1955).",
+      "MCP tool calls reuse one persistent session per server (default ON).",
+      "Favorite models + /model quick-switch (#1957).",
+      "Chat image controls: top-right action cluster + fullscreen Lightbox (#1960).",
+      "Chat image attachments are bridged into the media store so tools can act on them (#1969).",
+      "HITL forms float above the chat instead of shifting it (#1973)."
+    ]
+  },
+  {
+    "version": "v0.100.0",
+    "date": "2026-07-12",
+    "changes": [
+      "Secrets manager: pull env vars from external secrets managers — Infisical first (#1963).",
+      "Console: Settings ▸ Secrets panel for the secrets manager (#1965).",
+      "Plugins: surfaces reconcile on config hot-reload (#1961).",
+      "Plugins: refresh the last boot-only plugin wiring on hot-reload (#1958).",
+      "MCP: normalize discovered tool names to the documented <server>__<tool> form (#1962).",
+      "Plugins: consolidate the seam reference; fill gaps; fix drift (#1959)."
+    ]
+  },
+  {
+    "version": "v0.99.0",
+    "date": "2026-07-12",
+    "changes": [
+      "Plugins: an optional tier for requires_pip (#1953).",
+      "CI guard: the public roadmap can't rot silently (#1945).",
+      "Console: wait tool blocks surface a real waiting state (#1914).",
+      "Console: server-relative /media/ URLs render cross-origin (#1946).",
+      "Console: multimodal tool results render their text, not the raw envelope (#1947).",
+      "OpenAI-compat: /v1/chat/completions accepts multimodal content lists (#1943, #1949).",
+      "Console: the selected agent theme renders on first load (#1916).",
+      "Console: the mobile notch/status bar matches the header, not the accent (#1923)."
+    ]
+  },
+  {
+    "version": "v0.98.0",
+    "date": "2026-07-11",
+    "changes": [
+      "Autonomous operating model — goals · tasks · scheduling · watches as one OODA loop.",
+      "Media output channel for plugin tools (#1929).",
+      "Multimodal ToolMessage — a tool can return an image the vision model actually sees (#1930).",
+      "Reusable gateway HTTP client for plugins (#1931).",
+      "orgChart plugin (#1925).",
+      "Guide: safely exposing a protoAgent to the world (#1920)",
+      "Goal turns fire on turn 1 and are headless-safe (#1910/#1911/#1912).",
+      "Console: a completed long tool-call turn could render its reply twice (#1938).",
+      "Console: the auth dialog is a blocking modal (#1926)",
+      "task_output background-job tool.",
+      "Fleet delegation biases to fire-and-forget."
+    ]
+  },
+  {
+    "version": "v0.97.0",
+    "date": "2026-07-08",
+    "changes": [
+      "Fleet trace export → the agent-fleet flywheel (the \"Observe\" seam, #1897).",
+      "Fleet-trace sink + PII redaction (scripts/sync_fleet_traces.sh, scripts/redact_fleet_traces.py).",
+      "Portable per-rig setup (scripts/setup_fleet_tracing.sh).",
+      "Bigger touch targets on phones.",
+      "Docs reader is a master-detail flow on phones.",
+      "Settings collapses to a single column on phones.",
+      "Modals/overlays use dvh on mobile.",
+      "Mobile viewport correctness for the console."
+    ]
+  },
+  {
+    "version": "v0.96.0",
+    "date": "2026-07-07",
+    "changes": [
+      "Hermes is a first-class agent runtime",
+      "Fleet-wide distributed Langfuse tracing.",
+      "filesystem.allow_run defaults OFF on the headless tier",
+      "A fleet member's plugin views 401'd through a token-gated hub",
+      "A subagent hitting max_turns failed its whole delegation (GRAPH_RECURSION_LIMIT).",
+      "Fleet members no longer inherit the hub's identity.",
+      "An agent tracing to its own Langfuse project now produces a whole trace",
+      "A background knowledge-ingest job now wakes the agent when it finishes",
+      "Quieter plugin hot-reload logs"
+    ]
+  },
+  {
+    "version": "v0.95.1",
+    "date": "2026-07-07",
+    "changes": [
+      "A2A producer tasks GC'd while pending at turn end (#1713).",
+      "Classic A2A message/send got -32601 Method not found (#1854).",
+      "Artifact panel kept the stale palette after an app-theme switch (#1872).",
+      "Installed-plugin workflow recipes were silently invisible (#1867)."
+    ]
+  },
+  {
+    "version": "v0.95.0",
+    "date": "2026-07-06",
+    "changes": [
+      "Findings source attribution — non-LLM panel members."
+    ]
+  },
+  {
+    "version": "v0.93.1",
+    "date": "2026-07-05",
+    "changes": [
+      "Supervisor on_crash bounded retry — RetryAfter + on_crash_max_attempts (#1823)."
+    ]
+  },
+  {
+    "version": "v0.93.0",
+    "date": "2026-07-05",
+    "changes": [
+      "protoagent model — point at a local LLM in one line.",
+      "Operator-MCP profiles + an env override, so \"operate over MCP\" is safe by default.",
+      "A first-class protoagent command — the terminal control plane.",
+      "React artifacts get a full design-system component set (@pl/ui), not just 9 primitives.",
+      "The shared ops/ layer — one operation, three projections.",
+      "GET /api/mcp/exposed — see which tools the operator MCP would hand a foreign client.",
+      "BREAKING: the goal API is only under the plural /api/goals* now.",
+      "/v1/chat/completions reports real token usage now, not zeros.",
+      "The plugin update-CHECK now authenticates private repos too, not just install.",
+      "The operator MCP no longer hands a foreign client HITL tools that hang it.",
+      "plugin install of a PRIVATE GitHub repo now works on the default git path."
+    ]
+  },
+  {
+    "version": "v0.92.0",
+    "date": "2026-07-05",
+    "changes": [
+      "System lifecycle events",
+      "Bulk delete-by-source in the Knowledge view",
+      "web_search (DuckDuckGo) failed with CERTIFICATE_VERIFY_FAILED in the desktop app."
+    ]
+  },
+  {
+    "version": "v0.91.0",
+    "date": "2026-07-04",
+    "changes": [
+      "Goal completion contracts",
+      "Fleet members can autostart on boot",
+      "Guided goal-creation form",
+      "Composer/HITL forms support conditional fields",
+      "/goal {json} carries the completion contract",
+      "delegate_to no longer hard-fails on member turns >60s",
+      "Memory ▸ Injections is legible to non-developers"
+    ]
+  },
+  {
+    "version": "v0.90.0",
+    "date": "2026-07-04",
+    "changes": [
+      "Background fan-outs report back in ONE briefing, not N",
+      "Career Coach in the plugin catalog",
+      "Server-initiated turns show a \"responding…\" indicator",
+      "Shift over the add-chat button previews incognito",
+      "Chat errors surface as a toast, not an inline banner",
+      "Browser-style UI zoom (⌘/Ctrl + / - / 0)",
+      "A saved theme survives a reload",
+      "Scaffolded plugins that register a subagent or use Knobs pass their own smoke test"
+    ]
+  },
+  {
+    "version": "v0.89.0",
+    "date": "2026-07-04",
+    "changes": [
+      "Quick-chat with any fleet agent from the command palette",
+      "SOUL.md keeps a version history — never lose a persona iteration",
+      "Telemetry is tagged with the active persona revision",
+      "Browser-style UI zoom — ⌘/Ctrl + / - / 0",
+      "Plugin setup: a \"needs setup\" cue + guided config for unconfigured plugins",
+      "Plugins declare required config and degrade gracefully when it's missing",
+      "Opt-in plugin auto-update policy",
+      "coder.solve() can run one forced rung, for testing",
+      "Plugins can open a form in the chat, not just reply",
+      "/effort opens a picker in the composer",
+      "Watches honor their per-watch interval_s cadence",
+      "Hot-reloading a plugin refreshes its goal/watch verifier + hook registries",
+      "Plugin smoke tests can assert surface lifecycle wiring",
+      "The plugin loader no longer nags about the prescribed /api/plugins/<id> data router",
+      "A manifest-less ghost dir under plugins/ no longer blocks install/uninstall",
+      "A dropped provider stream reconnects instead of killing the turn",
+      "A locked checkpoint write no longer silently kills a background turn"
+    ]
+  },
+  {
+    "version": "v0.88.0",
+    "date": "2026-07-03",
+    "changes": [
+      "The Memory inspector tells the truth about what injects",
+      "Memory view accuracy and polish"
+    ]
+  },
+  {
+    "version": "v0.87.0",
+    "date": "2026-07-03",
+    "changes": [
+      "wait no longer stacks wake-ups — one pending wait per thread",
+      "Dismiss a hard turn-error bubble in place"
+    ]
+  },
+  {
+    "version": "v0.86.0",
+    "date": "2026-07-03",
+    "changes": [
+      "Declining a command is no longer a scary full-screen error",
+      "Long commands and errors scroll instead of filling the chat"
+    ]
+  },
+  {
+    "version": "v0.85.0",
+    "date": "2026-07-02",
+    "changes": [
+      "Semantic recall (embeddings) now ships OFF by default",
+      "Windows reinstall over kept data no longer fails on a running server",
+      "current_time works on Windows (and database-less hosts)",
+      "A hung gateway embedding route can no longer freeze chat"
+    ]
+  },
+  {
+    "version": "v0.84.0",
+    "date": "2026-07-02",
+    "changes": [
+      "The Windows desktop sidecar no longer self-kills ~2s after boot",
+      "Desktop's system-wide hotkeys are now rebindable, visible, and self-healing"
+    ]
+  },
+  {
+    "version": "v0.83.0",
+    "date": "2026-07-02",
+    "changes": [
+      "One-line background results render as a compact inline note, not a report card",
+      "Per-subagent tool fences now apply to detached background jobs",
+      "Desktop no longer aborts on launch when a global hotkey is already taken",
+      "Desktop no longer launches into a silently dead window when port 7870 is taken or the server dies",
+      "Release-tag-pinned plugins now see updates."
+    ]
+  },
+  {
+    "version": "v0.82.0",
+    "date": "2026-07-02",
+    "changes": [
+      "The console now says what each subagent does",
+      "Plugin metric timeseries — sdk.record_metric / metric_history / metric_last",
+      "Typed event contracts — emits: entries can declare payload schemas",
+      "Knowledge lifecycle — sdk.knowledge_purge + epoch scoping",
+      "Plugin-view event bridge: replay-on-subscribe + hidden delivery",
+      "graph.sdk.react_on — reactive-rule sugar",
+      "Plugins own their recurring cadence — and it dies with them",
+      "Plugins can now enumerate and remove watches",
+      "graph.sdk.spawn_background + graph.sdk.background_status",
+      "Parallel approval-gated tool calls no longer crash the resume.",
+      "Re-installing a plugin from its own origin converges instead of erroring.",
+      "Testkit FakeRegistry now mirrors the full PluginRegistry surface"
+    ]
+  },
+  {
+    "version": "v0.81.0",
+    "date": "2026-07-02",
+    "changes": [
+      "seccomp-profile.json moved to deploy/.",
+      "The in-app update notes now match the Discord release announcement"
+    ]
+  },
+  {
+    "version": "v0.80.0",
+    "date": "2026-07-02",
+    "changes": [
+      "Remote fleet members are fully manageable from the console",
+      "A down or mis-tokened fleet agent gives you a way out instead of a boot hang.",
+      "Background results are pushed, indexed, and worker-disposable",
+      "The Work surface is card-first — no tabs",
+      "The background report card is a real card",
+      "/compact is now behind the chat.compact developer flag",
+      "tools.disabled now actually removes any tool — including run_command — and the filesystem knobs are per-agent Settings toggles.",
+      "Fleet: the hub no longer lends a remote member's token over an unauthenticated WebSocket, and live events now work through a token-gated hub."
+    ]
+  },
+  {
+    "version": "v0.79.0",
+    "date": "2026-07-01",
+    "changes": [
+      "Memory-regression evals",
+      "Memory inspector console surface",
+      "Incognito thread toggle in the console",
+      "Trust-tiered injection",
+      "Hot-memory write visibility",
+      "Supersede-don't-delete staleness",
+      "Namespace-scoped auto-injection",
+      "Incognito threads",
+      "Per-turn memory-injection record",
+      "Memory-inspector REST surface",
+      "recall_session(session_id) starter tool",
+      "Knowledge Base view — collapsible source grouping + Shift+click quick-delete.",
+      "One-command install",
+      "Agent archetypes are a data-driven registry",
+      "CI workflows are fork-friendly",
+      "Fleet \"New agent\" now applies the archetype's persona",
+      "Cross-session memory injection is now an attributed digest inside an untrusted-reference envelope",
+      "Memory rows carry provenance.",
+      "The docs build now gates every PR.",
+      "Settings string_list fields can now carry an empty-string entry",
+      "Chat code blocks: no empty header gap, a distinct lighter well, and no panel-stretch.",
+      "Chat session-identity hygiene",
+      "Artifact plugin (0.15.0) — pointer lock now works in games/canvas/3D artifacts.",
+      "Artifact plugin (0.15.0) — SVG / Mermaid now render crisply instead of pixelating on zoom.",
+      "Artifact plugin (0.15.0) — the selected artifact + version now survive a tab switch.",
+      "A stale untracked plugin copy no longer shadows a newer bundled one.",
+      "Plugin install git clone --no-hardlinks",
+      "Console dev server no longer defaults to the prod backend.",
+      "Removed the broken built-in \"Project Manager\" archetype.",
+      "Instance collision warning no longer false-alarms on a shared box root",
+      "Setup wizard: the archetype bundle-install result is no longer swallowed.",
+      "Setup wizard: picking a persona-less archetype no longer blanks the editor."
+    ]
+  },
+  {
+    "version": "v0.78.0",
+    "date": "2026-07-01",
+    "changes": [
+      "Developer panel — view & toggle developer flags",
+      "Developer flags — backend foundation",
+      "Chat composer: terminal-style input history",
+      "Artifact panel: pan & zoom for diagrams",
+      "registerKeybinding on the fork extension seam",
+      "Watch primitive — supervise many external conditions at once",
+      "sdk.run_in_session(session_id, prompt)",
+      "Two-credential auth: auth.federation_token",
+      "Console set-goal form",
+      "Chat: slash commands trigger mid-input + render as command bubbles",
+      "Agent switcher: always available, with a Fleet-settings shortcut",
+      "Chat: Cmd/Ctrl+O toggles the latest tool-call block",
+      "Chat: /compact — summarize + archive a long thread",
+      "Knowledge panel: Upload / Add now open in a dialog",
+      "Goal mode is now drive-only; the monitor disposition is retired",
+      "Goal continuation protocol → tools",
+      "The A2A-streaming and non-streaming goal drive loops are unified (#1497), fixing a fresh-context thread-id drift.",
+      "Settings sub-panels share one container",
+      "wait tool output is conversational",
+      "Desktop app builds are on-demand",
+      "RCE-via-chat closed",
+      "Watch evaluation is serialized per watch id",
+      "New ADR 0066 (federation token + operator channel) and ADR 0067 (watch primitive); ADR 0030 marked superseded",
+      "PROTO.md § Run it"
+    ]
+  },
+  {
     "version": "v0.77.0",
     "date": "2026-07-01",
     "changes": [

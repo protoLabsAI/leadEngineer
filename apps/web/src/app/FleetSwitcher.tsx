@@ -1,13 +1,15 @@
 import { useQuery } from "@tanstack/react-query";
-import { Check, ChevronDown, ExternalLink, Plus } from "lucide-react";
+import { Check, ChevronDown, Plus, Settings } from "lucide-react";
 import type { ReactNode } from "react";
 
 import { Menu, MenuItem, MenuSeparator } from "@protolabsai/ui/menu";
+import { Tooltip } from "@protolabsai/ui/overlays";
 import { Badge } from "@protolabsai/ui/primitives";
 import { StatusDot } from "@protolabsai/ui/data";
 
 import { agentHref, api, currentSlug } from "../lib/api";
 import { queryKeys } from "../lib/queries";
+import { fleetSettingsDisabledReason } from "./fleetSettingsGate";
 
 // The URL slug is the agent's STABLE id, never its (editable) display name — renaming an agent
 // must not change its URL/bookmarks. `host` is the reserved slug for this instance.
@@ -15,19 +17,30 @@ const slugOf = (a: { id: string; host?: boolean }) => (a.host ? "host" : a.id);
 
 // Topbar agent switcher (ADR 0042 slug routing). The focused agent lives in the URL
 // (/app/agent/<slug>/), so picking one NAVIGATES there — each window is its own agent, a reload
-// can't desync, and you can open a second agent in a new window. Single-agent (just the host) →
-// plain name, no dropdown. The dropdown is the DS Menu (#1078): open/close, outside-click, focus
-// trap, and the trailing per-row "open in a new window" action all come from @protolabsai/ui.
-export function FleetSwitcher({ fallbackName, onNewAgent }: { fallbackName: ReactNode; onNewAgent?: () => void }) {
-  // Poll so the topbar reflects the fleet live (a newly-added agent makes the switcher appear).
+// can't desync. The dropdown ALWAYS shows (so New agent + Fleet settings are reachable even with a
+// single agent); only a hard fleet-API error falls back to the plain name. The dropdown is the DS
+// Menu (#1078): open/close, outside-click, and focus trap all come from @protolabsai/ui.
+export function FleetSwitcher({
+  fallbackName,
+  onNewAgent,
+  onManageFleet,
+}: {
+  fallbackName: ReactNode;
+  onNewAgent?: () => void;
+  onManageFleet?: () => void;
+}) {
+  // Poll so the topbar reflects the fleet live (a newly-added agent shows up in the list).
   const fleet = useQuery({ queryKey: queryKeys.fleet, queryFn: () => api.fleet(), retry: false, refetchInterval: 3_000 });
 
   const agents = fleet.data?.agents ?? [];
   const slug = currentSlug(); // the agent THIS window is on
   const current = agents.find((a) => slugOf(a) === slug);
+  // Fleet settings are hub-only (#1708): non-null in a member window (a hub slug window,
+  // or a spawned workspace member reached directly) — the item disables with this tooltip.
+  const fleetSettingsBlocked = fleetSettingsDisabledReason(agents, slug);
 
-  // Solo (just the host) or no hub → plain name, no switcher.
-  if (fleet.isError || agents.length <= 1) return <>{fallbackName}</>;
+  // Only a hard fleet-API error hides the switcher; otherwise it's always available.
+  if (fleet.isError) return <>{fallbackName}</>;
 
   return (
     <Menu
@@ -47,17 +60,6 @@ export function FleetSwitcher({ fallbackName, onNewAgent }: { fallbackName: Reac
             onSelect={() => {
               if (!isCurrent) window.location.href = agentHref(slugOf(a)); // navigate → this agent
             }}
-            // Non-current rows get a trailing "open in a new window" action (two agents at once —
-            // the point of slug routing); it doesn't trigger the row's navigate or close the menu.
-            action={
-              isCurrent
-                ? undefined
-                : {
-                    icon: <ExternalLink size={13} />,
-                    label: "Open in a new window",
-                    onClick: () => window.open(agentHref(slugOf(a)), "_blank", "noopener"),
-                  }
-            }
           >
             <span className="fleet-switcher-name">
               {a.name}
@@ -67,10 +69,24 @@ export function FleetSwitcher({ fallbackName, onNewAgent }: { fallbackName: Reac
           </MenuItem>
         );
       })}
-      <MenuSeparator />
+      {agents.length > 0 ? <MenuSeparator /> : null}
       <MenuItem icon={<Plus size={14} />} onSelect={() => onNewAgent?.()}>
         New agent
       </MenuItem>
+      {fleetSettingsBlocked ? (
+        // Disabled, not hidden — discoverable: the tooltip says WHERE fleet settings live.
+        // The DS Tooltip's own wrapper span is the hover target (a disabled Radix menu item
+        // is pointer-events:none, so the item itself can't fire the tooltip).
+        <Tooltip label={fleetSettingsBlocked} side="left">
+          <MenuItem icon={<Settings size={14} />} disabled>
+            Fleet settings
+          </MenuItem>
+        </Tooltip>
+      ) : (
+        <MenuItem icon={<Settings size={14} />} onSelect={() => onManageFleet?.()}>
+          Fleet settings
+        </MenuItem>
+      )}
     </Menu>
   );
 }

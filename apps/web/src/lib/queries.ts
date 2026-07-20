@@ -17,6 +17,7 @@ export const queryKeys = {
   inbox: ["inbox"] as const,
   schedules: ["schedules"] as const,
   runtime: ["runtime"] as const,
+  nodeRuntime: ["runtime", "node"] as const,
   delegates: ["delegates"] as const,
   delegateTypes: ["delegates", "types"] as const,
   acpAgents: ["acp", "agents"] as const,
@@ -26,6 +27,14 @@ export const queryKeys = {
   archetypes: ["archetypes"] as const,
   playbooks: ["playbooks"] as const,
   knowledge: ["knowledge"] as const,
+  flags: ["flags"] as const,
+  secretsStatus: ["secrets", "status"] as const,
+  // Memory inspector (ADR 0069 D7) — subtree so one invalidate refreshes all panels.
+  memory: ["memory"] as const,
+  memorySessions: ["memory", "sessions"] as const,
+  memoryHot: ["memory", "hot"] as const,
+  memoryInjections: ["memory", "injections"] as const,
+  memoryInjectionDetail: (id: number) => ["memory", "injections", "detail", id] as const,
 };
 
 // The fleet of workspace agents (ADR 0042). `running` is a live-pid probe, so poll
@@ -35,6 +44,25 @@ export const fleetQuery = () =>
     queryKey: queryKeys.fleet,
     queryFn: () => api.fleet(),
     refetchInterval: 3_000,
+  });
+
+// Developer flags (ADR 0068) — the active channel + resolved flag states. Static per
+// process (channel + registry don't change without a config edit / restart), so no poll.
+export const flagsQuery = () =>
+  queryOptions({
+    queryKey: queryKeys.flags,
+    queryFn: () => api.flags(),
+    staleTime: 5 * 60_000,
+  });
+
+// External secrets-manager status (ADR 0080) — last hydration outcome + owned var
+// names. Slow poll so a background-loop refresh shows up while the panel is open;
+// Sync-now invalidates immediately.
+export const secretsStatusQuery = () =>
+  queryOptions({
+    queryKey: queryKeys.secretsStatus,
+    queryFn: () => api.secretsStatus(),
+    refetchInterval: 30_000,
   });
 
 // Archetypes for the new-agent picker (Basic + installed bundles) — config, not live.
@@ -150,6 +178,15 @@ export const runtimeStatusQuery = () =>
     queryFn: () => api.runtimeStatus(),
   });
 
+// Managed Node runtime (ADR 0085) — status + install progress. Polls once a second
+// only while an install is in flight (the download takes seconds); idle otherwise.
+export const nodeRuntimeQuery = () =>
+  queryOptions({
+    queryKey: queryKeys.nodeRuntime,
+    queryFn: () => api.nodeRuntime(),
+    refetchInterval: (query) => (query.state.data?.install.state === "running" ? 1_000 : false),
+  });
+
 // The HUB's runtime status (never slug-routed) — used ONLY for the tenant uid, which
 // must track the origin's backend, not the focused agent. A separate key from the
 // slug-routed `runtime` so switching agents never confuses it; the uid is stable, so
@@ -161,7 +198,7 @@ export const hostRuntimeStatusQuery = () =>
     staleTime: Infinity,
   });
 
-// Delegate registry (ADR 0025) — read non-suspense in the Settings → Integrations
+// Delegate registry (ADR 0025) — read non-suspense in the Settings → Capabilities
 // panel so a 404 (delegates plugin disabled) degrades gracefully instead of
 // blanking Settings. Invalidated after create/update/delete.
 export const delegatesQuery = () =>

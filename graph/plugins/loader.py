@@ -35,6 +35,7 @@ class PluginLoadResult:
     goal_verifiers: dict = field(default_factory=dict)  # name -> verifier fn (ADR 0028)
     goal_hooks: list = field(default_factory=list)  # {on_achieved, on_failed} (ADR 0028)
     watch_hooks: list = field(default_factory=list)  # {on_met, on_expired, on_stalled} (ADR 0067)
+    lifecycle_hooks: list = field(default_factory=list)  # {on_app_loaded, on_agent_active, on_system_wake} (ADR 0074)
     knowledge_stores: dict = field(default_factory=dict)  # name -> backend factory (ADR 0031)
     embedders: dict = field(default_factory=dict)  # name -> embed_fn factory (ADR 0031)
     a2a_skills: list = field(default_factory=list)  # A2A card skill specs (#570)
@@ -50,9 +51,43 @@ class PluginLoadResult:
     meta: list[dict] = field(default_factory=list)
 
 
-def discover_plugins(roots: list[Path]) -> list[PluginManifest]:
-    """Find plugins (dirs with a manifest) under *roots*. Live overrides bundle
-    by id (later root wins)."""
+def _version_key(v: str) -> tuple[int, int, int]:
+    """Best-effort semver sort key: ``"0.14.0" → (0, 14, 0)``. A non-numeric part
+    sorts as ``-1`` so a malformed version can't spuriously beat a real one."""
+    parts: list[int] = []
+    for p in str(v or "0").split(".")[:3]:
+        m = re.match(r"\d+", p.strip())
+        parts.append(int(m.group()) if m else -1)
+    while len(parts) < 3:
+        parts.append(0)
+    return (parts[0], parts[1], parts[2])
+
+
+def _tracked_ids() -> set[str]:
+    """Plugin ids recorded in ``plugins.lock`` — an INTENTIONAL install/override, vs
+    an untracked hand-placed/leftover copy. Best-effort (empty on any error)."""
+    try:
+        from graph.plugins import installer
+
+        return {e.get("id") for e in installer._read_lock().get("plugins", []) if e.get("id")}
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def discover_plugins(roots: list[Path], *, tracked_ids: set[str] | None = None) -> list[PluginManifest]:
+    """Find plugins (dirs with a manifest) under *roots*, later roots (the live/installed
+    dir) taking precedence over earlier ones (the bundled dir) by id — but ONLY when the live
+    copy that is UNTRACKED (not in ``plugins.lock``) only wins when it's NOT OLDER than the
+    bundled one.
+
+    This stops a stale, untracked leftover from shadowing the bundled plugin: a plugin that was
+    once git-installed (e.g. artifact @ 0.11.3) and later bundled in-tree at a newer version
+    (0.14.0) would otherwise stay stuck on the old installed copy forever, never updating with
+    the app. An intentional install/override (tracked in the lock) still wins at ANY version;
+    a same-or-newer untracked copy (a dev override) still wins too. ``tracked_ids`` defaults to
+    the ``plugins.lock`` ids."""
+    if tracked_ids is None:
+        tracked_ids = _tracked_ids()
     by_id: dict[str, PluginManifest] = {}
     for root in roots:
         if not (root and root.exists() and root.is_dir()):
@@ -61,7 +96,14 @@ def discover_plugins(roots: list[Path]) -> list[PluginManifest]:
             if not child.is_dir():
                 continue
             manifest = load_manifest(child)
-            if manifest is not None:
+            if manifest is None:
+                continue
+            incumbent = by_id.get(manifest.id)
+            if (
+                incumbent is None
+                or manifest.id in tracked_ids
+                or _version_key(manifest.version) >= _version_key(incumbent.version)
+            ):
                 by_id[manifest.id] = manifest
     return list(by_id.values())
 
@@ -84,6 +126,18 @@ def _plugin_module_name(plugin_id: str) -> str:
     return "protoagent_plugin_" + re.sub(r"\W", "_", plugin_id)
 
 
+def purge_plugin_modules(plugin_id: str) -> None:
+    """Drop a plugin's module subtree from ``sys.modules`` so the next reload
+    re-execs every file from disk. The loader re-execs the entry ``__init__`` each
+    reload, but a multi-file plugin's ``from .tools import …`` resolves the SUBMODULE
+    through ``sys.modules`` — which still holds the OLD code after a force
+    re-install. Scoped to the plugin's own prefix; the reload rebuilds it. Shared by
+    the console Update route and the auto-update loop (#1720)."""
+    prefix = _plugin_module_name(plugin_id)
+    for name in [n for n in list(sys.modules) if n == prefix or n.startswith(prefix + ".")]:
+        sys.modules.pop(name, None)
+
+
 def _load_plugin_module(manifest: PluginManifest, entry: Path):
     """Import a plugin's entry ``__init__.py`` as a **package** so it can have
     sibling modules and use relative imports (``from .tools import …``). The
@@ -95,9 +149,9 @@ def _load_plugin_module(manifest: PluginManifest, entry: Path):
     # __init__.py. Without this, ``from .tools import x`` resolves a stale cached
     # ``mod_name.tools`` and an edit to a sibling module silently has no effect until a
     # process restart (breaking the devkit's "edit then reload_plugins" loop). On a first
-    # load this is a no-op (nothing cached). Previously only the update route purged.
-    for _name in [n for n in list(sys.modules) if n == mod_name or n.startswith(mod_name + ".")]:
-        sys.modules.pop(_name, None)
+    # load this is a no-op (nothing cached). Shares the one purge implementation with
+    # the console Update route and the auto-update loop (#1720).
+    purge_plugin_modules(manifest.id)
     spec = importlib.util.spec_from_file_location(mod_name, str(entry), submodule_search_locations=[str(manifest.path)])
     if spec is None or spec.loader is None:
         raise RuntimeError(f"could not create import spec for {entry}")
@@ -154,30 +208,17 @@ def run_plugin_mcp_main(plugin_id: str) -> None:
 def _host_version() -> str:
     """The running protoAgent version, for the manifest compat gate.
 
-    Same resolution order as the A2A card (``server.a2a._package_version`` —
-    not imported here, ``graph`` must not depend on ``server``): installed
-    package metadata first, then the repo ``pyproject.toml`` ``[project].version``.
+    Delegates to the shared resolver ``infra.paths.package_version()`` — the same
+    source the A2A card advertises (``server.a2a._package_version``; ``graph``
+    must not import ``server``, so both delegate to the ``infra`` leaf) — so the
+    gate and the card can never disagree. The resolver prefers the repo
+    ``pyproject.toml`` over installed metadata: on a dev checkout the editable
+    install's dist-info goes stale on version bumps, and this gate used to refuse
+    valid plugins because of it (#1644).
     """
-    try:
-        from importlib.metadata import PackageNotFoundError, version
+    from infra.paths import package_version
 
-        try:
-            return version("protoagent")
-        except PackageNotFoundError:
-            pass
-    except ImportError:  # pragma: no cover - importlib.metadata always present on 3.11+
-        pass
-
-    from infra.paths import instance_paths
-
-    pyproject = instance_paths().app_root / "pyproject.toml"
-    try:
-        m = re.search(r'^version\s*=\s*"([^"]+)"', pyproject.read_text(), re.MULTILINE)
-        if m:
-            return m.group(1)
-    except OSError:
-        pass
-    return "0.0.0"
+    return package_version()
 
 
 def _min_version_gate(manifest: PluginManifest) -> str | None:
@@ -254,6 +295,83 @@ def _warn_unserved_views(manifest: PluginManifest, routers: list[dict]) -> None:
             )
 
 
+def _sweep_plugin_jobs(plugin_id: str) -> None:
+    """Cancel a not-enabled plugin's ``plugin:<id>:*`` scheduler jobs (#1642) —
+    best-effort, never breaks a load. See ``sdk.cancel_plugin_jobs``."""
+    try:
+        from graph.sdk import cancel_plugin_jobs
+
+        cancelled = cancel_plugin_jobs(plugin_id)
+    except Exception:  # noqa: BLE001 — hygiene must never break plugin loading
+        return
+    if cancelled:
+        log.info("[plugins] %s is disabled — cancelled %d scheduled job(s) it owned", plugin_id, cancelled)
+
+
+# ── Required-config / incomplete-plugin gate (#1719) ─────────────────────────
+# A plugin marks a setting `required: true` (a `settings[]` field spec) to say "I
+# need this to function". If the resolved config leaves a required field blank, the
+# plugin still LOADS but is flagged `incomplete`, and its tools are swapped for a
+# same-signature stand-in that returns a friendly "needs setup" notice instead of
+# erroring cryptically. Enable/disable stays whole-plugin; this is a soft gate.
+
+
+def _is_blank(value: object) -> bool:
+    """A config value that counts as 'not provided' — ``None``, an empty/whitespace
+    string, or an empty collection. ``0``/``False`` are real values, not blank."""
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, (list, tuple, set, dict)):
+        return len(value) == 0
+    return False
+
+
+def _missing_required_config(manifest: PluginManifest, resolved: dict) -> list[dict]:
+    """Required settings (``settings[].required``) left blank in the resolved config.
+    Returns ``[{key, label}]`` — empty ⇒ the plugin has everything it declared it needs.
+    Secrets resolve into ``resolved`` too (unset ⇒ ``""``), so this covers API keys."""
+    out: list[dict] = []
+    for spec in manifest.settings:
+        if not (isinstance(spec, dict) and spec.get("required")):
+            continue
+        key = str(spec.get("key") or "").strip()
+        if not key:
+            continue
+        if _is_blank(resolved.get(key)):
+            out.append({"key": key, "label": str(spec.get("label") or key)})
+    return out
+
+
+def _needs_config_tool(orig, plugin_name: str, needs: list[dict]):
+    """Same-signature stand-in for a tool whose plugin is missing required config —
+    the model sees the same name/description/args but the call returns a friendly
+    'needs setup' notice, so the agent can point the operator at configuration instead
+    of surfacing a cryptic KeyError/None-credential failure (#1719)."""
+    from langchain_core.tools import StructuredTool
+
+    fields = ", ".join(n["label"] for n in needs) or "required config"
+    msg = (
+        f"⚠️ The {plugin_name} plugin needs setup before this tool works — "
+        f"missing: {fields}. Ask the operator to complete it in the plugin's settings."
+    )
+
+    def _blocked(*_args, **_kwargs) -> str:
+        return msg
+
+    async def _ablocked(*_args, **_kwargs) -> str:
+        return msg
+
+    return StructuredTool(
+        name=orig.name,
+        description=orig.description,
+        args_schema=orig.args_schema,
+        func=_blocked,
+        coroutine=_ablocked,
+    )
+
+
 def load_plugins(config, *, core_tool_names: set[str] | None = None) -> PluginLoadResult:
     """Load enabled plugins and collect their contributions.
 
@@ -283,6 +401,11 @@ def load_plugins(config, *, core_tool_names: set[str] | None = None) -> PluginLo
             # aren't optional add-ons) — the flag rides along in /api/runtime/status.
             "builtin": manifest.builtin,
             "loaded": False,
+            # Required-config gate (#1719) — set True + populated below when an enabled
+            # plugin loads but a `required: true` setting is blank. Present on every
+            # entry so consumers can rely on the shape.
+            "incomplete": False,
+            "needs_config": [],
             "tools": [],
             "skills": 0,
             # Console surfaces (ADR 0026) — the rail reads these from /api/runtime/status. Views
@@ -292,9 +415,22 @@ def load_plugins(config, *, core_tool_names: set[str] | None = None) -> PluginLo
             # surfaced for discoverability (the console can show a plugin's event catalog).
             "emits": list(manifest.emits) if enabled else [],
             "subscribes": list(manifest.subscribes) if enabled else [],
+            # Typed event contracts (#1636) — topic → {summary?, schema?} for emits
+            # entries that declared a payload shape. Rides /api/runtime/status so a
+            # cross-plugin consumer can discover the contract instead of reverse-
+            # engineering the emitter. Declarative only — no publish-time validation.
+            "emits_schemas": dict(manifest.emits_schemas) if enabled else {},
         }
 
         if not enabled:
+            # Lifecycle hygiene (#1642): a disabled plugin must not keep a recurring
+            # cadence firing — sweep its `plugin:<id>:*` scheduler jobs on every
+            # (re)load. The console disable toggle and a hand-edited config both
+            # funnel through a (re)load, so this one hook covers both; uninstall is
+            # covered by the installer (the manifest is gone from disk, so this loop
+            # can't see it). Pre-setup loads run before the scheduler is wired
+            # (STATE.scheduler is None → no-op).
+            _sweep_plugin_jobs(manifest.id)
             result.meta.append(entry)
             continue
 
@@ -325,9 +461,9 @@ def load_plugins(config, *, core_tool_names: set[str] | None = None) -> PluginLo
         except Exception as exc:  # noqa: BLE001 — a bad plugin must not break boot
             # Clear diagnostic when an enabled plugin's declared deps aren't
             # installed (ADR 0027 D4: install fetches code; deps are explicit).
-            if isinstance(exc, ModuleNotFoundError) and manifest.requires_pip:
+            if isinstance(exc, ModuleNotFoundError) and (manifest.requires_pip or manifest.optional_pip):
                 entry["error"] = (
-                    f"declared deps not installed ({', '.join(manifest.requires_pip)}) — "
+                    f"declared deps not installed ({', '.join([*manifest.requires_pip, *manifest.optional_pip])}) — "
                     f"run: python -m server plugin install-deps {manifest.id}"
                 )
             else:
@@ -336,13 +472,27 @@ def load_plugins(config, *, core_tool_names: set[str] | None = None) -> PluginLo
             result.meta.append(entry)
             continue
 
+        # Required-config gate (#1719) — the plugin loaded, but if it declared
+        # required settings that are still blank, flag it incomplete and swap its
+        # tools for needs-setup stand-ins (below) so a misconfigured plugin degrades
+        # gracefully instead of erroring mid-call.
+        needs_config = _missing_required_config(manifest, pconf)
+        if needs_config:
+            entry["incomplete"] = True
+            entry["needs_config"] = needs_config
+            log.warning(
+                "[plugins] %s loaded but missing required config (%s) — its tools return a needs-setup notice",
+                manifest.id,
+                ", ".join(n["key"] for n in needs_config),
+            )
+
         kept = []
         for tool in registry.tools:
             if tool.name in seen_tool_names:
                 log.warning("[plugins] %s: tool %s collides with an existing tool — skipped", manifest.id, tool.name)
                 continue
             seen_tool_names.add(tool.name)
-            kept.append(tool)
+            kept.append(_needs_config_tool(tool, manifest.name or manifest.id, needs_config) if needs_config else tool)
 
         result.tools.extend(kept)
         # Attribute each kept tool to this plugin (display name, id fallback) for the Tools tab.
@@ -389,6 +539,7 @@ def load_plugins(config, *, core_tool_names: set[str] | None = None) -> PluginLo
             result.goal_verifiers[name] = fn
         result.goal_hooks.extend(registry.goal_hooks)  # ADR 0028 D4
         result.watch_hooks.extend(registry.watch_hooks)  # ADR 0067
+        result.lifecycle_hooks.extend(registry.lifecycle_hooks)  # ADR 0074
         for name, factory in registry.knowledge_stores.items():  # ADR 0031
             if name in result.knowledge_stores:
                 log.warning("[plugins] %s: knowledge backend %s collides — skipped", manifest.id, name)
@@ -417,14 +568,16 @@ def load_plugins(config, *, core_tool_names: set[str] | None = None) -> PluginLo
         result.meta.append(entry)
         log.info(
             "[plugins] loaded %s: %d tool(s), %d skill dir(s), %d route(s), "
-            "%d surface(s), %d subagent(s), %d mcp server(s)",
+            "%d surface(s), %d subagent(s), %d middleware, %d mcp server(s), %d chat command(s)",
             manifest.id,
             len(kept),
             len(registry.skill_dirs),
             len(registry.routers),
             len(registry.surfaces),
             len(registry.subagents),
+            len(registry.middleware),
             len(registry.mcp_servers),
+            len(registry.chat_commands),
         )
 
     return result

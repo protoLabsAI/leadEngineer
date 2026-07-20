@@ -86,6 +86,12 @@ class Delegate:
     allow_kinds: list[str] = field(default_factory=list)
     deny_kinds: list[str] = field(default_factory=list)
     confirm: bool = False
+    # acp managed git (ADR 0076): the framework owns branch/commit/push/PR; the
+    # coder edits files only. Off by default — non-worktree setups keep the old
+    # coder-owns-git mode.
+    manage_git: bool = False
+    base_branch: str = "main"
+    branch_prefix: str = ""  # empty ⇒ the delegate's name
 
 
 def _secret(raw: dict, value_key: str, env_key: str) -> str:
@@ -114,7 +120,12 @@ class Adapter:
     def parse(self, raw: dict) -> Delegate:
         raise NotImplementedError
 
-    async def dispatch(self, d: Delegate, query: str, *, timeout: float | None = None) -> str:
+    async def dispatch(
+        self, d: Delegate, query: str, *, timeout: float | None = None, item_id: str | None = None
+    ) -> str:
+        """Dispatch ``query`` to ``d``. ``item_id`` is the work-item identity used by
+        adapters that manage a git lifecycle (acp, ADR 0076); identity-less adapters
+        accept and ignore it, so the registry can forward it uniformly."""
         raise NotImplementedError
 
     async def probe(self, d: Delegate) -> dict:
@@ -231,8 +242,10 @@ class A2aAdapter(Adapter):
                 "number",
                 default=300,
                 help="Max seconds to wait for a long-running delegated task to finish before "
-                "giving up locally — the peer keeps working. Raise it for slow agents (e.g. a "
-                "code build); the old fixed 30s cut long tasks off mid-flight.",
+                "giving up locally — the peer keeps working. Also caps the initial synchronous "
+                "SendMessage read, so a peer that answers inline (protoAgent's own server does) "
+                "may legitimately take up to this long to reply — the old flat 60s hard-failed "
+                "every member turn beyond it (#1778). Raise it for slow agents (e.g. a code build).",
             ),
         ]
 
@@ -250,7 +263,9 @@ class A2aAdapter(Adapter):
             d.poll_timeout_s = 300.0
         return d
 
-    async def dispatch(self, d: Delegate, query: str, *, timeout: float | None = None) -> str:
+    async def dispatch(
+        self, d: Delegate, query: str, *, timeout: float | None = None, item_id: str | None = None
+    ) -> str:
         import time
 
         import httpx
@@ -305,23 +320,47 @@ class A2aAdapter(Adapter):
             return data.get("result") or {}
 
         poll_timeout = d.poll_timeout_s if d.poll_timeout_s and d.poll_timeout_s > 0 else 300.0
+        # Fleet tracing: when this dispatch runs inside a traced turn, hand the
+        # peer our Langfuse trace context as ``a2a.trace`` metadata — the shape
+        # a2a_impl/executor._extract_caller_trace reads on the receiving side
+        # (camelCase traceId/spanId, threaded into trace_session as
+        # caller_trace_id/caller_span_id → the peer JOINS our trace). Attached at
+        # BOTH request level (preferred by the receiver's metadata merge) and
+        # message level (fallback for peers whose SDK drops request metadata).
+        # Absent when tracing is off — the request is byte-identical to before.
+        send_params: dict = {
+            "message": {
+                "role": "ROLE_USER",
+                "parts": [{"text": query}],
+                "messageId": str(uuid.uuid4()),
+            }
+        }
+        try:
+            from observability import tracing
+
+            tctx = tracing.current_trace_context()
+        except Exception:  # noqa: BLE001 — tracing must never break a dispatch
+            tctx = None
+        if tctx:
+            wire = {"traceId": tctx["trace_id"]}
+            if tctx.get("span_id"):
+                wire["spanId"] = tctx["span_id"]
+            send_params["metadata"] = {"a2a.trace": wire}
+            send_params["message"]["metadata"] = {"a2a.trace": wire}
         # A2A 1.0 (a2a-sdk >=1.0): JSON-RPC `SendMessage` / `GetTask`, the ROLE_USER
         # enum, and a `result.task` envelope. (`message/send` + lowercase `user` is
-        # the v0.3 legacy dialect, which 1.0 servers reject with -32601.) The per-request
-        # client timeout caps a single call; the poll DEADLINE caps the overall wait for a
-        # long-running task — so a 2-minute delegated task no longer fails at the old 30s.
-        async with httpx.AsyncClient(timeout=timeout or 60) as client:
-            result = await _rpc(
-                client,
-                "SendMessage",
-                {
-                    "message": {
-                        "role": "ROLE_USER",
-                        "parts": [{"text": query}],
-                        "messageId": str(uuid.uuid4()),
-                    }
-                },
-            )
+        # the v0.3 legacy dialect, which 1.0 servers reject with -32601.)
+        #
+        # A *synchronous* peer — protoAgent's own A2A server answers SendMessage INLINE,
+        # holding the connection open for the whole delegated turn before returning the final
+        # Message — so the initial SendMessage READ must be allowed to run as long as the task
+        # legitimately might (poll_timeout), NOT the flat 60s that hard-failed every member turn
+        # >60s (#1778: hub→member delegation silently fell back on any non-trivial turn). Connect
+        # stays short so an unreachable peer still fails fast; the same client serves the GetTask
+        # poll loop, which returns quickly regardless. An explicit ``timeout`` still overrides.
+        read_budget = timeout if timeout is not None else poll_timeout
+        async with httpx.AsyncClient(timeout=httpx.Timeout(read_budget, connect=10.0)) as client:
+            result = await _rpc(client, "SendMessage", send_params)
             text = _extract_text(result)
             if text:
                 return text
@@ -422,7 +461,9 @@ class OpenAiAdapter(Adapter):
             d.temperature = 0.4
         return d
 
-    async def dispatch(self, d: Delegate, query: str, *, timeout: float | None = None) -> str:
+    async def dispatch(
+        self, d: Delegate, query: str, *, timeout: float | None = None, item_id: str | None = None
+    ) -> str:
         import httpx
 
         messages = []
@@ -506,6 +547,29 @@ class AcpAdapter(Adapter):
                 help="Ask the operator before each call.",
             ),
             FieldSpec("timeout_s", "Timeout (s)", "number", default=600),
+            FieldSpec(
+                "manage_git",
+                "Managed git",
+                "select",
+                options=["false", "true"],
+                default="false",
+                help="Framework owns branch/commit/push/PR (ADR 0076); the coder only edits "
+                "files. Needs workdir to be a git checkout with an `origin` remote.",
+            ),
+            FieldSpec(
+                "base_branch",
+                "Base branch",
+                "text",
+                placeholder="main",
+                help="Managed git: branches are cut from fresh origin/<base> and PRs target it.",
+            ),
+            FieldSpec(
+                "branch_prefix",
+                "Branch prefix",
+                "text",
+                placeholder="(delegate name)",
+                help="Managed git: branch names are <prefix>/<slug>-<id7>. Empty ⇒ the delegate's name.",
+            ),
         ]
 
     def parse(self, raw: dict) -> Delegate:
@@ -534,6 +598,9 @@ class AcpAdapter(Adapter):
         d.allow_kinds = [str(k).lower() for k in (raw.get("allow_kinds") or [])]
         d.deny_kinds = [str(k).lower() for k in (raw.get("deny_kinds") or [])]
         d.confirm = str(raw.get("confirm", "")).strip().lower() in ("1", "true", "yes")
+        d.manage_git = str(raw.get("manage_git", "")).strip().lower() in ("1", "true", "yes")
+        d.base_branch = str(raw.get("base_branch") or "main").strip() or "main"
+        d.branch_prefix = str(raw.get("branch_prefix", "")).strip()
         return d
 
     @staticmethod
@@ -554,7 +621,12 @@ class AcpAdapter(Adapter):
             "deny_kinds": d.deny_kinds,
         }
 
-    async def dispatch(self, d: Delegate, query: str, *, timeout: float | None = None) -> str:
+    async def dispatch(self, d: Delegate, query: str, *, timeout: float | None = None, item_id: str | None = None) -> str:
+        if d.manage_git:
+            return await self._dispatch_managed(d, query, timeout=timeout, item_id=item_id)
+        return await self._prompt(d, query, timeout=timeout)
+
+    async def _prompt(self, d: Delegate, query: str, *, timeout: float | None = None) -> str:
         # Reuse the ADR 0024 ACP client + by-kind permission policy.
         from plugins.coding_agent import _client_for, _drop_client, _make_permission
         from plugins.coding_agent.acp_client import AcpError
@@ -575,6 +647,46 @@ class AcpAdapter(Adapter):
             raise
         except AcpError as exc:
             raise DelegateError(str(exc))
+
+    async def _dispatch_managed(
+        self, d: Delegate, query: str, *, timeout: float | None = None, item_id: str | None = None
+    ) -> str:
+        """Managed-git dispatch (ADR 0076): claim → PR pre-flight → branch setup →
+        edit-only coder run → framework-owned commit/rebase/push/PR. The claim dedups
+        in-flight duplicates (fan-out of one item); the PR pre-flight dedups across
+        restarts. On a coder failure the worktree keeps its edits and a re-run's
+        idempotent lifecycle adopts them."""
+        from plugins.coding_agent import git_harness as harness
+
+        iid = (item_id or "").strip() or harness.derive_item_id(query)
+        # Name the work, not the wrapper: infer a conventional-commit title from the task
+        # (project_board wraps features in a coder preamble whose first line is boilerplate,
+        # which the deterministic first-line slug would otherwise bake into the branch/PR).
+        # Best-effort — falls back to the deterministic title. Uniqueness is the id suffix.
+        title = (await harness.infer_title(query)) or harness.title_from(query)
+        branch = harness.mint_branch(d.branch_prefix or d.name, title, iid)
+        holder = harness.claim(iid, d.name)
+        if holder is not None:
+            return (
+                f"Item `{iid}` is already being built by {holder!r} (branch `{branch}`) — not "
+                "dispatching a duplicate. Wait for the in-flight run instead of re-fanning this item."
+            )
+        try:
+            workdir = os.path.expanduser(d.workdir)
+            existing = await harness.preflight_pr(workdir, iid)
+            if existing:
+                return f"An open PR already exists for item `{iid}` (branch `{branch}`): {existing} — not dispatching a duplicate."
+            prep = await harness.prepare(workdir, base=d.base_branch, branch=branch)
+            if prep.error:
+                return f"Error: managed-git setup for {d.name!r} failed: {prep.error}"
+            reply = await self._prompt(d, query + harness.edit_only_directive(branch), timeout=timeout)
+            outcome = await harness.finish(
+                workdir, base=d.base_branch, branch=branch, item_id=iid, title=title
+            )
+            notes = "".join(f"\n- note: {n}" for n in prep.notes)
+            return f"{reply}\n\n{outcome.render()}{notes}"
+        finally:
+            harness.release(iid)
 
     async def teardown(self, d: Delegate) -> bool:
         """Evict + terminate the cached ACP subprocess for this delegate.

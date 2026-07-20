@@ -8,6 +8,14 @@ Every env var the template reads at runtime.
 |---|---|
 | `OPENAI_API_KEY` | LiteLLM gateway master key (or direct provider key if not using a gateway). Read by `graph/llm.py`. |
 
+## External secrets manager (ADR 0080)
+
+| Variable | Default | What |
+|---|---|---|
+| `INFISICAL_CLIENT_ID` | (unset) | Universal-auth machine-identity client id — the env fallback for `secrets_manager.client_id` (`secrets.yaml` wins when present). |
+| `INFISICAL_CLIENT_SECRET` | (unset) | Machine-identity client secret — env fallback for `secrets_manager.client_secret`. |
+| `PROTOAGENT_NO_SECRETS_HYDRATE` | (unset) | Any non-empty value disables secrets-manager env hydration entirely (debugging escape hatch). |
+
 ## Identity
 
 | Variable | Default | What |
@@ -42,6 +50,7 @@ The hub spawns local fleet members as detached `--ui none` processes on their ow
 
 | Variable | Default | Purpose |
 |---|---|---|
+| `PROTOAGENT_FLEET_AUTOSTART` | (unset) | Comma-separated member ids or display names the hub **(re)starts on boot** (ADR 0072) — a container recreate or host restart kills the members' detached processes and `fleet.json` keeps now-dead pids, so without this a declared crew stays down until re-activated by hand. The config key `fleet.autostart: [id, …]` is the durable form; this env var is the Docker/headless fallback. Idempotent (already-running members skipped), best-effort (a missing workspace is logged and skipped), and hub-only. Pairs with the config-as-code deploy pattern — see the [fleet guide](../guides/fleet.md#deploying-a-team). |
 | `PROTOAGENT_FLEET_KEEP_MEMBERS_ON_EXIT` | (unset) | By default the hub **spins its local members down when it shuts down** ("host down → fleet down" — keeps a rebuilt hub from leaving members running stale code; sessions resume from their `instance.id`-scoped checkpoints on the next switch, so it stops processes, not work). Set `1`/`true` to keep members running across a hub restart — for genuinely long-running detached agents. |
 | `PROTOAGENT_FLEET_MAX_WARM` | `0` | Keep-N-warm cap: at most this many members stay running; switching to another resumes it and evicts the least-recently-active beyond the cap (`0`/unset = unlimited). |
 | `PROTOAGENT_FLEET_WARM_GRACE` | `0` | Seconds a just-active member is spared from keep-warm eviction (may be mid background turn); `0` = pure LRU. |
@@ -62,7 +71,7 @@ When unset, startup logs a WARNING (`"A2A auth token not configured — endpoint
 
 | Variable | Default | What |
 |---|---|---|
-| `A2A_PUBLIC_URL` | (unset — `http://127.0.0.1:<bound-port>`) | The externally-reachable base URL advertised in the agent card's `supportedInterfaces[].url` (where peers send `message/send`). **Set this for any deployed agent** — behind a proxy / in a container the bound port isn't the address clients use. The `/a2a` JSON-RPC suffix is appended automatically (e.g. `A2A_PUBLIC_URL=https://gina.example.com` → card url `https://gina.example.com/a2a`). Unset, it falls back to the actually-bound loopback port (correct for local + the dynamic-port desktop sidecar, where the caller is on the same host). |
+| `A2A_PUBLIC_URL` | (unset — `http://127.0.0.1:<bound-port>`) | The externally-reachable base URL advertised in the agent card's `supportedInterfaces[].url` (where peers send `message/send`). **Set this for any deployed agent** — behind a proxy / in a container the bound port isn't the address clients use. The `/a2a` JSON-RPC suffix is appended automatically (e.g. `A2A_PUBLIC_URL=https://gina.example.com` → card url `https://gina.example.com/a2a`). Unset, it falls back to the actually-bound loopback port (correct for local + the dynamic-port desktop sidecar, where the caller is on the same host). **Fleet members** don't set this themselves — the supervisor derives it as `{hub_public_url}/agents/<slug>` so each member advertises its own [A2A tenant sub-path](a2a-endpoints.md#fleet-multi-tenancy-agents-slug) ([ADR 0042](../adr/0042-fleet-supervisor-unified-console.md)); an explicit per-workspace value still wins. |
 
 This is independent of the legacy `<AGENT_NAME>_API_KEY` header-based scheme (X-API-Key) documented above. You can enable one, both, or neither; bearer is the preferred mechanism going forward.
 
@@ -127,8 +136,9 @@ The bundled scheduler is enabled by default. See [Schedule future work](/guides/
 | `LANGFUSE_PUBLIC_KEY` | Langfuse project public key |
 | `LANGFUSE_SECRET_KEY` | Langfuse project secret key |
 | `LANGFUSE_HOST` | Langfuse host URL (e.g. `https://langfuse.company.com`). Falls back to `LANGFUSE_URL`, then `http://host.docker.internal:3001`. |
+| `PROTOAGENT_FLEET_TRACE_EXPORT` | Fleet trace export (the flywheel Observe, #1897). Unset → off (or the `telemetry.fleet_trace_export` config toggle decides). `1`/`on` → on at `<instance>/fleet-traces/`; a path → on there; `0`/`off` → hard-off, overriding the config toggle. See [Observability ▸ Fleet trace export](/guides/observability#fleet-trace-export-the-flywheel-observe). |
 
-If both keys are unset, tracing is disabled and every helper in `tracing.py` becomes a no-op.
+If both Langfuse keys are unset, distributed tracing is disabled and every helper in `tracing.py` becomes a no-op. Fleet trace export is independent — it needs no Langfuse.
 
 ## Logging
 

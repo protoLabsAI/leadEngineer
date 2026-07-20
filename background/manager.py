@@ -27,6 +27,10 @@ log = logging.getLogger(__name__)
 
 _DEFAULT_FIRE_TIMEOUT_S = 1800.0  # background turns can run long (research + tools); generous
 _DEFAULT_MAX_CONCURRENCY = 3  # cap on concurrent background turns so a fan-out can't swamp the gateway
+# Straggler safety valve (#1766): if a fan-out batch hasn't fully settled within this many
+# seconds (a member hung), force a PARTIAL push-resume so the finished reports still land.
+_DEFAULT_BATCH_JOIN_TIMEOUT_S = 900.0
+_TERMINAL_STATUSES = ("completed", "failed", "canceled")
 
 
 class BackgroundManager:
@@ -42,6 +46,7 @@ class BackgroundManager:
         bearer_token: str | None = None,
         fire_timeout_s: float | None = None,
         max_concurrency: int | None = None,
+        batch_join_timeout_s: float | None = None,
         event_publish=None,
         on_terminal=None,
     ) -> None:
@@ -82,12 +87,31 @@ class BackgroundManager:
             except ValueError:
                 self._max_concurrency = _DEFAULT_MAX_CONCURRENCY
         self._sem = asyncio.Semaphore(self._max_concurrency)
+        # Straggler-join timeout (#1766). Env ``BACKGROUND_BATCH_JOIN_TIMEOUT_S``.
+        if batch_join_timeout_s is not None:
+            self._batch_join_timeout_s = batch_join_timeout_s
+        else:
+            try:
+                self._batch_join_timeout_s = float(
+                    os.environ.get("BACKGROUND_BATCH_JOIN_TIMEOUT_S", _DEFAULT_BATCH_JOIN_TIMEOUT_S)
+                )
+            except ValueError:
+                self._batch_join_timeout_s = _DEFAULT_BATCH_JOIN_TIMEOUT_S
         # Hold the detached fire tasks so they aren't GC'd mid-flight (the cause of
         # "Task was destroyed but it is pending"); discard on completion.
         self._fire_tasks: set[asyncio.Task] = set()
         # job_id -> the running asyncio.Task for a ``spawn_work`` (deterministic) job, so
         # ``cancel`` can stop the coroutine directly (a work job has no A2A task handle).
         self._work_tasks: dict[str, asyncio.Task] = {}
+        # Fan-out batch-join (#1766). A batch (all jobs sharing a spawning turn id)
+        # push-resumes ONCE, when its last member settles. ``_joined_batches`` is the
+        # single-fire guard — a SYNCHRONOUS check-and-set (``_claim_batch``) so two
+        # concurrent settles, or a settle racing the straggler timeout, can't both fire.
+        # ``_batch_timeouts`` holds the per-batch straggler-timeout task (a hung member
+        # can't strand the finished reports forever); also kept in ``_fire_tasks`` so it
+        # isn't GC'd mid-sleep.
+        self._joined_batches: set[str] = set()
+        self._batch_timeouts: dict[str, asyncio.Task] = {}
 
     async def spawn(
         self,
@@ -96,17 +120,32 @@ class BackgroundManager:
         subagent_type: str,
         description: str,
         prompt: str,
+        origin_incognito: bool = False,
+        batch_id: str | None = None,
     ) -> str:
-        """Register a job and fire it detached. Returns the opaque job id immediately."""
+        """Register a job and fire it detached. Returns the opaque job id immediately.
+
+        ``origin_incognito`` records that the spawning thread was incognito (ADR 0069
+        D3b → ADR 0070): the completion then skips the push-resume nudge and the
+        knowledge-store indexing — no memory trail — while the report still lives in
+        the jobs DB and drains into the origin session normally.
+
+        ``batch_id`` (#1766) tags the job as a member of a fan-out spawned by one turn
+        (task_batch's specs, or several ``task(run_in_background=True)`` in a turn — all
+        stamp the emitting turn's id), so the completions coalesce into ONE push-resume
+        when the last member settles. ``None`` for a lone spawn (a singleton)."""
         job_id = self.store.create(
             agent_name=self.agent_name,
             origin_session=origin_session or "",
             subagent_type=subagent_type,
             description=description,
             prompt=prompt,
+            origin_incognito=origin_incognito,
+            batch_id=batch_id,
         )
         fired_prompt = _build_fired_prompt(subagent_type, description, prompt)
-        t = asyncio.create_task(self._fire(job_id, fired_prompt), name=f"background.fire.{job_id}")
+        fence = _subagent_fence(subagent_type)
+        t = asyncio.create_task(self._fire(job_id, fired_prompt, fence), name=f"background.fire.{job_id}")
         self._fire_tasks.add(t)
         t.add_done_callback(self._fire_tasks.discard)
         log.info("[background] spawned %s (%s): %s", job_id, subagent_type, description)
@@ -124,6 +163,8 @@ class BackgroundManager:
         description: str,
         work,
         detail: str = "",
+        origin_incognito: bool = False,
+        batch_id: str | None = None,
     ) -> str:
         """Register and run a deterministic background job — a plain coroutine, NOT an
         LLM subagent turn — through the same durable store + concurrency cap + event
@@ -141,6 +182,8 @@ class BackgroundManager:
             subagent_type=kind,
             description=description,
             prompt=detail,
+            origin_incognito=origin_incognito,
+            batch_id=batch_id,
         )
         t = asyncio.create_task(
             self._run_work(job_id, kind, description, origin_session or "", work),
@@ -198,6 +241,23 @@ class BackgroundManager:
         except Exception:  # noqa: BLE001 — the event is best-effort
             log.exception("[background] started-event publish failed for %s", job_id)
 
+    def _publish_turn(
+        self, topic: str, *, session_id: str, origin: str, trigger: str, ok: bool | None = None
+    ) -> None:
+        """Emit a turn-lifecycle event (#1767) around a server-initiated self-POST so an
+        open console can render its typing indicator during an otherwise-invisible turn
+        (the push-resume nudge holds the connection open for the WHOLE origin-session
+        turn). Best-effort — a publish failure never disturbs the fire."""
+        if self._publish is None:
+            return
+        data = {"session_id": session_id, "origin": origin, "trigger": trigger}
+        if ok is not None:
+            data["ok"] = ok
+        try:
+            self._publish(topic, data)
+        except Exception:  # noqa: BLE001 — the event is best-effort
+            log.exception("[background] %s publish failed for %s", topic, trigger)
+
     def _publish_completed(
         self, job_id: str, status: str, kind: str, description: str, origin_session: str, text: str
     ) -> None:
@@ -250,11 +310,7 @@ class BackgroundManager:
 
         import httpx
 
-        headers = {"Content-Type": "application/json", "A2A-Version": "1.0"}
-        if self._bearer:
-            headers["Authorization"] = f"Bearer {self._bearer}"
-        if self._api_key:
-            headers["X-API-Key"] = self._api_key
+        headers = self._a2a_headers()
         body = {
             "jsonrpc": "2.0",
             "id": str(uuid.uuid4()),
@@ -280,23 +336,26 @@ class BackgroundManager:
         )
         return {"ok": ok, "status": "canceled", "detail": f"Canceled {job_id}."}
 
-    async def _fire(self, job_id: str, prompt: str) -> None:
-        """POST the job to our own /a2a as a turn in a dedicated background context.
+    # ── self-POST mechanics (shared by _fire and resume_origin — ADR 0050/0070) ─
 
-        On any delivery failure (non-2xx / network / timeout), mark the job failed —
-        but only if the terminal hook hasn't already settled it (mark_complete is a
-        no-op on an already-terminal row), so a slow-turn timeout can't clobber a
-        result that actually landed.
-        """
-        import httpx
-
-        # A2A 1.0 wire shape (matches scheduler/local.py:_fire): SendMessage, ROLE_USER,
-        # {text} parts, contextId + metadata on the message, A2A-Version header.
+    def _a2a_headers(self) -> dict:
         headers = {"Content-Type": "application/json", "A2A-Version": "1.0"}
         if self._bearer:
             headers["Authorization"] = f"Bearer {self._bearer}"
         if self._api_key:
             headers["X-API-Key"] = self._api_key
+        return headers
+
+    async def _send_a2a_message(self, *, context_id: str, text: str, metadata: dict) -> None:
+        """POST one ``SendMessage`` turn to our own ``/a2a`` and hold the connection
+        open until the turn finishes (the A2A handler runs it synchronously).
+
+        A2A 1.0 wire shape (matches scheduler/local.py:_fire): SendMessage, ROLE_USER,
+        ``{text}`` parts, contextId + metadata on the message, A2A-Version header.
+        Raises on a non-2xx response or any network/timeout error — callers decide
+        what a delivery failure means (a job fire marks the row failed; a push-resume
+        nudge just logs and lets the drain deliver on the next manual turn)."""
+        import httpx
 
         message_id = str(uuid.uuid4())
         body = {
@@ -306,47 +365,279 @@ class BackgroundManager:
             "params": {
                 "message": {
                     "role": "ROLE_USER",
-                    "parts": [{"text": prompt}],
+                    "parts": [{"text": text}],
                     "messageId": message_id,
-                    # Dedicated, isolated context per job — keeps the background turn's
-                    # history out of the originating chat thread; the job id rides in
-                    # the context so the terminal hook can map back without metadata.
-                    "contextId": f"background:{job_id}",
-                    "metadata": {
-                        "origin": "background",
-                        "trigger": job_id,
-                        "background_job_id": job_id,
-                    },
+                    "contextId": context_id,
+                    "metadata": metadata,
                 },
             },
         }
+        async with httpx.AsyncClient(timeout=self._fire_timeout_s) as client:
+            r = await client.post(f"{self._invoke_url}/a2a", headers=self._a2a_headers(), json=body)
+        if r.status_code >= 400:
+            raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
+
+    async def _fire(self, job_id: str, prompt: str, fence: list[str] | None = None) -> None:
+        """POST the job to our own /a2a as a turn in a dedicated background context.
+
+        On any delivery failure (non-2xx / network / timeout), mark the job failed —
+        but only if the terminal hook hasn't already settled it (mark_complete is a
+        no-op on an already-terminal row), so a slow-turn timeout can't clobber a
+        result that actually landed.
+        """
         # Gate the actual self-POST on the concurrency semaphore so a fan-out can't open more
         # than ``_max_concurrency`` full turns at once. The slot is held for the WHOLE turn —
         # the A2A handler runs the turn synchronously before the POST returns — which is
         # exactly the bound we want (concurrent running turns, not just in-flight requests).
         async with self._sem:
             try:
-                async with httpx.AsyncClient(timeout=self._fire_timeout_s) as client:
-                    r = await client.post(f"{self._invoke_url}/a2a", headers=headers, json=body)
-                if r.status_code >= 400:
-                    log.error(
-                        "[background] fire failed for %s: HTTP %d %s",
-                        job_id,
-                        r.status_code,
-                        r.text[:200],
-                    )
-                    self.store.mark_complete(job_id, "failed", f"Background turn failed to start: HTTP {r.status_code}.")
+                await self._send_a2a_message(
+                    # Dedicated, isolated context per job — keeps the background turn's
+                    # history out of the originating chat thread; the job id rides in
+                    # the context so the terminal hook can map back without metadata.
+                    context_id=f"background:{job_id}",
+                    text=prompt,
+                    metadata={
+                        "origin": "background",
+                        "trigger": job_id,
+                        "background_job_id": job_id,
+                        # Per-subagent tool fence (#1639): the chat entry stamps this on
+                        # the turn's state and SubagentFenceMiddleware enforces it — the
+                        # same allowlist the in-graph task path applies, now on detached
+                        # runs too. Absent for non-registry types (no fence).
+                        **({"subagent_fence": fence} if fence else {}),
+                    },
+                )
             except Exception as exc:  # noqa: BLE001
-                log.exception("[background] fire exception for %s", job_id)
+                log.exception("[background] fire failed for %s", job_id)
                 self.store.mark_complete(job_id, "failed", f"Background turn delivery error: {exc}")
+
+    async def resume_origin(self, job) -> bool:
+        """Push-resume (ADR 0070 D1): submit a terse self-A2A nudge INTO the job's
+        origin session, so the origin agent runs a turn NOW — the notified-gated
+        drain (``server/chat.py``) attaches the actual ``<task-notification>`` to
+        that turn, and the agent briefs the operator against the new data.
+
+        Deliberately NOT gated on the concurrency semaphore: this is an
+        origin-session turn, not a background job — queuing the briefing behind
+        the very jobs it reports on would deadlock a full fan-out. A mid-turn
+        origin session is safe: the A2A server serializes turns per thread_id
+        (``server/chat.py:_thread_lock``), so the nudge queues and runs after the
+        in-flight turn. Never raises; returns whether the nudge was delivered.
+        On failure nothing is lost — ``notified`` is untouched, so the report
+        still drains on the session's next manual turn."""
+        verb = "failed" if job.status == "failed" else "finished"
+        text = (
+            f"[background job {job.id} ({job.description}) {verb} — its report notification "
+            "is attached to this turn; review it and brief the operator]"
+        )
+        # Turn-lifecycle events (#1767): the nudge holds the connection open for the whole
+        # origin-session turn (the agent briefs the operator against the drained report),
+        # which the console can't otherwise see — no typing indicator, no stream. Emit
+        # `turn.started` before and `turn.finished` after so an open origin-session tab
+        # renders its typing indicator ("responding to background reports…") for the turn.
+        session_id = job.origin_session
+        self._publish_turn("turn.started", session_id=session_id, origin="background-resume", trigger=job.id)
+        ok = False
+        try:
+            await self._send_a2a_message(
+                context_id=session_id,
+                text=text,
+                metadata={
+                    # NOT "background": the terminal hook routes origin=="background"
+                    # turns back into _handle_background_terminal — the nudge turn is
+                    # an ordinary origin-session turn with its own provenance.
+                    "origin": "background-resume",
+                    "trigger": job.id,
+                    "background_job_id": job.id,
+                },
+            )
+            ok = True
+            return True
+        except Exception as exc:  # noqa: BLE001 — push-resume is best-effort by contract
+            log.warning(
+                "[background] push-resume for %s into %s failed (%s) — the report will "
+                "drain on that session's next turn",
+                job.id,
+                job.origin_session,
+                exc,
+            )
+            return False
+        finally:
+            self._publish_turn(
+                "turn.finished", session_id=session_id, origin="background-resume", trigger=job.id, ok=ok
+            )
+
+    # ── fan-out batch-join (#1766) ────────────────────────────────────────────
+
+    def _claim_batch(self, batch_id: str) -> bool:
+        """Atomically claim a batch for its single join nudge. Returns ``True`` if THIS
+        caller won the claim (and must fire the join), ``False`` if the batch was already
+        joined. SYNCHRONOUS — no ``await`` between the membership check and the add — so two
+        concurrent settles (or a settle racing the straggler timeout) can't both win under
+        asyncio's single-threaded scheduling. This is the no-double-fire guarantee."""
+        if batch_id in self._joined_batches:
+            return False
+        self._joined_batches.add(batch_id)
+        return True
+
+    async def resume_for_terminal(self, job) -> bool | None:
+        """Batch-aware terminal delivery (#1766). The server calls this in place of
+        ``resume_origin`` when a background job settles, so a fan-out coalesces into ONE
+        push-resume instead of N drip-fed briefings.
+
+        - **Singleton** (no ``batch_id``, or a batch of one) → delegate to
+          ``resume_origin`` — the UNCHANGED single-job push-resume. Returns its bool.
+        - **Not the last member** to settle → hold: arm the straggler timeout once and
+          return ``None`` (nothing delivered, NOT a failure — the last member delivers).
+        - **Last member** to settle → win the single-fire claim and push-resume the WHOLE
+          fan-out once via ``resume_origin_batch`` (the per-session drain then attaches
+          every sibling report to that one turn). A duplicate last-member — the claim was
+          already taken by a sibling or the straggler timeout — returns ``None``.
+
+        Never raises. Incognito batches never reach here: the server's ``_should_auto_resume``
+        guard skips an incognito job before calling this (all members of one turn share the
+        incognito flag), so no push-resume fires — their reports still drain normally."""
+        batch_id = getattr(job, "batch_id", None)
+        if not batch_id or self.store.batch_size(batch_id) <= 1:
+            return await self.resume_origin(job)
+        if self.store.batch_outstanding(batch_id) > 0:
+            # Siblings still running — hold this completion; the last to settle fires the
+            # single coalesced nudge. Arm the straggler timeout so a hung member can't
+            # strand the finished reports forever.
+            self._ensure_batch_timeout(batch_id, job.origin_session)
+            return None
+        # Last member settled. Win the single-fire claim (or bail if a sibling / the
+        # timeout already fired), then push-resume the whole fan-out exactly once.
+        if not self._claim_batch(batch_id):
+            return None
+        self._cancel_batch_timeout(batch_id)  # settled naturally — no straggler nudge needed
+        return await self.resume_origin_batch(batch_id, job.origin_session)
+
+    def _ensure_batch_timeout(self, batch_id: str, origin_session: str) -> None:
+        """Arm ONE straggler-timeout task for a batch, idempotently. If the batch hasn't
+        joined within ``_batch_join_timeout_s`` (a member hung), force the join so the
+        already-finished reports still land. Best-effort; no-op off-loop or if already
+        armed/joined."""
+        if batch_id in self._batch_timeouts or batch_id in self._joined_batches:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+
+        async def _straggle() -> None:
+            try:
+                await asyncio.sleep(self._batch_join_timeout_s)
+                if not self._claim_batch(batch_id):
+                    return  # the batch joined normally while we slept
+                await self.resume_origin_batch(batch_id, origin_session)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — the straggler join is best-effort
+                log.exception("[background] batch straggler-join failed for %s", batch_id)
+
+        t = loop.create_task(_straggle(), name=f"background.batch-timeout.{batch_id}")
+        self._batch_timeouts[batch_id] = t
+        self._fire_tasks.add(t)  # hold a ref so the sleep isn't GC'd mid-flight
+        t.add_done_callback(self._fire_tasks.discard)
+        t.add_done_callback(lambda _t, b=batch_id: self._batch_timeouts.pop(b, None))
+
+    def _cancel_batch_timeout(self, batch_id: str) -> None:
+        """Cancel a batch's straggler timeout once the batch joined normally (no straggler
+        nudge needed). No-op when none is armed."""
+        t = self._batch_timeouts.pop(batch_id, None)
+        if t is not None and not t.done():
+            t.cancel()
+
+    async def resume_origin_batch(self, batch_id: str, origin_session: str) -> bool:
+        """Push-resume a whole fan-out ONCE (#1766). Same self-A2A mechanics as
+        ``resume_origin`` (a nudge into ``origin_session`` wrapped in ``turn.started`` /
+        ``turn.finished``), but the text summarizes the batch — the per-session drain
+        (``server/chat.py``) attaches EVERY sibling report to this one turn, so the agent
+        synthesizes a single briefing across all of them. If a straggler forced an early
+        join (members still running), the text says only the settled ones are attached and
+        the rest will notify separately. Never raises; returns whether the nudge landed —
+        on failure ``notified`` is untouched, so the reports still drain next manual turn."""
+        counts = self.store.batch_status_counts(batch_id)
+        total = self.store.batch_size(batch_id)
+        running = counts.get("running", 0)
+        settled_counts = {k: v for k, v in counts.items() if k in _TERMINAL_STATUSES}
+        settled = sum(settled_counts.values())
+        summary = ", ".join(f"{k} {v}" for k, v in sorted(settled_counts.items())) or "no reports"
+        if running > 0:
+            text = (
+                f"[{settled} of {total} background jobs from your fan-out have finished ({summary}); "
+                "their report notifications are attached to this turn — synthesize ONE briefing against "
+                f"them. The remaining {running} are still running and will notify separately.]"
+            )
+        else:
+            text = (
+                f"[all {total} background jobs from your fan-out have finished ({summary}) — their report "
+                "notifications are attached to this turn; synthesize ONE briefing against all of them]"
+            )
+        # Turn-lifecycle events (#1767), keyed on the batch id: the nudge holds the
+        # connection open for the whole origin-session briefing turn.
+        self._publish_turn("turn.started", session_id=origin_session, origin="background-resume", trigger=batch_id)
+        ok = False
+        try:
+            await self._send_a2a_message(
+                context_id=origin_session,
+                text=text,
+                metadata={
+                    "origin": "background-resume",
+                    "trigger": batch_id,
+                    "background_batch_id": batch_id,
+                },
+            )
+            ok = True
+            return True
+        except Exception as exc:  # noqa: BLE001 — push-resume is best-effort by contract
+            log.warning(
+                "[background] batch push-resume for %s into %s failed (%s) — the reports will "
+                "drain on that session's next turn",
+                batch_id,
+                origin_session,
+                exc,
+            )
+            return False
+        finally:
+            self._publish_turn(
+                "turn.finished", session_id=origin_session, origin="background-resume", trigger=batch_id, ok=ok
+            )
+
+
+def _subagent_fence(subagent_type: str) -> list[str]:
+    """The subagent's resolved tool allowlist for a detached run (#1639): the registry
+    ``tools`` with any config override applied — the SAME fence the in-graph ``task``
+    path enforces (mirrors ``operator_api.subagents.list_subagents``'s resolution).
+    Empty when the type isn't a registry subagent (no fence). Best-effort: a
+    resolution failure means no fence, never a failed fire."""
+    try:
+        from graph.subagents.config import SUBAGENT_REGISTRY
+
+        registry_def = SUBAGENT_REGISTRY.get(subagent_type)
+        if registry_def is None:
+            return []
+        tools = list(registry_def.tools or [])
+        try:
+            from runtime.state import STATE
+
+            override = getattr(STATE.graph_config, subagent_type, None) if STATE.graph_config else None
+            tools = list(getattr(override, "tools", None) or tools)
+        except Exception:  # noqa: BLE001 — config overlay is best-effort
+            pass
+        return tools
+    except Exception:  # noqa: BLE001
+        return []
 
 
 def _build_fired_prompt(subagent_type: str, description: str, prompt: str) -> str:
     """Compose the message the background turn runs.
 
-    The background turn runs the full lead graph (ADR 0050 — self-POST substrate), so the
-    subagent's own system prompt is prepended as role guidance rather than enforced as a
-    tool fence (per-subagent tool scoping for background jobs is deferred)."""
+    The background turn runs the full lead graph (ADR 0050 — self-POST substrate); the
+    subagent's own system prompt is prepended as role guidance, and the tool allowlist
+    is enforced separately via the ``subagent_fence`` fire metadata (#1639)."""
     role = ""
     try:
         from graph.prompts import build_subagent_prompt

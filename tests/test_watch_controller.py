@@ -164,7 +164,10 @@ async def test_met_enqueues_followup_turn_in_session(tmp_path, monkeypatch):
     )
     assert await c.evaluate(w.id) == "met"
     assert added and added[0]["context_id"] == "sess-7"  # follow-up turn fired into the target session
-    assert added[0]["prompt"] == "Run the smoke test."
+    # The reaction carries the creator's run_prompt AND what tripped (condition), so the agent
+    # orients on wake instead of getting a bare instruction (ADR 0079 wake-framing).
+    assert "Run the smoke test." in added[0]["prompt"]
+    assert "deploy done" in added[0]["prompt"]
 
 
 def test_clear(tmp_path):
@@ -226,3 +229,117 @@ async def test_concurrent_evaluate_finishes_once(tmp_path, monkeypatch):
     )
     await asyncio.gather(c.evaluate(w.id), c.evaluate(w.id))
     assert calls.count(f"watch-{w.id}") == 1  # not 2 — the lock prevented a double-finish
+
+
+# --- verifier invoker identity (#1641) --------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_evaluate_passes_watch_invoker_to_plugin_verifier(tmp_path):
+    # A plugin verifier registered via the normal path (PluginRegistry →
+    # set_plugin_verifiers) can tell WHICH watch is polling it — the key that
+    # lets one verifier hold per-watch state (e.g. a per-watch high-water mark)
+    # instead of one global mark.
+    from pathlib import Path
+
+    from graph.goals.types import VerifyResult
+    from graph.goals.verifiers import set_plugin_verifiers
+    from graph.plugins.registry import PluginRegistry
+
+    seen = []
+
+    async def probe(spec, ctx):
+        seen.append(ctx.invoker)
+        return VerifyResult(False, "still waiting")
+
+    reg = PluginRegistry("demo", Path("."))
+    reg.register_goal_verifier("probe", probe)  # → demo:probe
+    set_plugin_verifiers(reg.goal_verifiers)
+    try:
+        c = _ctrl(tmp_path)
+        _ok, _m, w1 = c.create(
+            condition="reach 1M",
+            verifier={"type": "plugin", "check": "demo:probe"},
+            interval_s=12.5,
+            run_session="ops",
+        )
+        assert await c.evaluate(w1.id) is None
+        _ok, _m, w2 = c.create(condition="other thing", verifier={"type": "plugin", "check": "demo:probe"})
+        assert await c.evaluate(w2.id) is None
+    finally:
+        set_plugin_verifiers({})
+    first, second = seen
+    assert first.kind == "watch" and first.id == w1.id
+    assert first.session_id == "ops"  # the watch's run_session is the owning session
+    assert first.interval_s == 12.5  # per-watch cadence override
+    assert second.kind == "watch" and second.id == w2.id and second.id != w1.id
+    assert second.session_id == ""  # no target session
+    assert second.interval_s == 30.0  # config-default cadence (the server tick fallback)
+
+
+# --- #1753: per-watch interval_s gates the cadence tick -----------------------
+
+
+def test_due_gate_semantics():
+    # _due decides whether a cadence tick should evaluate a watch. An explicit interval_s is a
+    # floor since last_checked; a default-cadence (None) or non-positive interval is always due.
+    from graph.watches.controller import WatchController
+    from graph.watches.types import Watch
+
+    now = 10_000.0
+
+    def w(**kw):
+        return Watch(id="w", condition="c", **kw)
+
+    assert WatchController._due(w(), now) is True  # default cadence → every tick
+    assert WatchController._due(w(interval_s=600), now) is True  # never checked → due now
+    assert WatchController._due(w(interval_s=600, last_checked=now - 60), now) is False  # floor not elapsed
+    assert WatchController._due(w(interval_s=600, last_checked=now - 601), now) is True  # floor elapsed
+    assert WatchController._due(w(interval_s=0, last_checked=now), now) is True  # non-positive → always due
+
+
+@pytest.mark.asyncio
+async def test_tick_all_skips_watch_not_yet_due(tmp_path, monkeypatch):
+    # #1753: a watch with interval_s=600 checked a minute ago must be SKIPPED by the global
+    # tick — not re-evaluated every cadence (which collapsed stall_after to ~minutes).
+    from time import time
+
+    c = _ctrl(tmp_path)
+    _ok, _m, wch = c.create(condition="slow", verifier={"type": "plugin", "check": "p:c"}, interval_s=600)
+    wch.last_checked = time() - 60
+    c.store.set(wch)
+
+    called = []
+
+    async def _spy(watch_id):
+        called.append(watch_id)
+        return None
+
+    monkeypatch.setattr(c, "evaluate", _spy)
+    assert await c.tick_all() == 0
+    assert called == []  # gated out — not due
+
+
+@pytest.mark.asyncio
+async def test_tick_all_evaluates_due_never_checked_and_default(tmp_path, monkeypatch):
+    # A watch past its floor, a never-checked one, and a default-cadence one are all due.
+    from time import time
+
+    c = _ctrl(tmp_path)
+    _ok, _m, due = c.create(
+        condition="due", watch_id="due", verifier={"type": "plugin", "check": "p:c"}, interval_s=600
+    )
+    due.last_checked = time() - 700
+    c.store.set(due)
+    c.create(condition="fresh", watch_id="fresh", verifier={"type": "plugin", "check": "p:c"}, interval_s=600)
+    c.create(condition="default", watch_id="default", verifier={"type": "plugin", "check": "p:c"})  # interval None
+
+    seen = []
+
+    async def _spy(watch_id):
+        seen.append(watch_id)
+        return None
+
+    monkeypatch.setattr(c, "evaluate", _spy)
+    await c.tick_all()
+    assert set(seen) == {"due", "fresh", "default"}

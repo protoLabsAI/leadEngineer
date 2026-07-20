@@ -776,7 +776,7 @@ _SHELL_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
   </div>
   <div id="stage">
     <div id="empty">No artifact yet. Ask the agent to render one — a chart, diagram, or widget.</div>
-    <iframe id="frame" sandbox="allow-scripts allow-pointer-lock" referrerpolicy="no-referrer"></iframe>
+    <iframe id="frame" sandbox="allow-scripts allow-pointer-lock" allow="pointer-lock" referrerpolicy="no-referrer"></iframe>
     <div id="editor">
       <textarea id="code" class="pl-input" spellcheck="false" placeholder="Edit the artifact source…"></textarea>
       <div id="ebar">
@@ -813,7 +813,17 @@ _SHELL_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
   // works from the sandbox; the shell validates e.source and calls the bearer-gated
   // endpoint. ask() rejects if the operator hasn't enabled it (ARTIFACT_ASK_ENABLED).
   var SHIM = '<script>(function(){var s=0,w={};'
-    + 'window.addEventListener("message",function(e){var m=e.data||{};if(m.type!=="protoArtifact:result")return;'
+    + 'window.addEventListener("message",function(e){var m=e.data||{};'
+    // Live re-theme (#1872): base() bakes the tokens in as literals at render time,
+    // so a later app-theme switch left the frame in the stale palette. The shell
+    // pushes fresh tokens; update :root + html/body in place (no re-render, so
+    // interactive artifact state survives).
+    + 'if(m.type==="protoArtifact:theme"&&m.tokens){var st=document.documentElement.style;'
+    + 'for(var k in m.tokens){if(k.indexOf("--pl-")===0)st.setProperty(k,String(m.tokens[k]));}'
+    + 'var bg=m.tokens["--pl-color-bg"],fg=m.tokens["--pl-color-fg"];'
+    + 'if(bg){st.background=bg;if(document.body)document.body.style.background=bg;}'
+    + 'if(fg&&document.body)document.body.style.color=fg;return;}'
+    + 'if(m.type!=="protoArtifact:result")return;'
     + 'var p=w[m.id];if(!p)return;delete w[m.id];m.error?p.reject(new Error(m.error)):p.resolve(m.text);});'
     + 'window.protoArtifact={ask:function(prompt){return new Promise(function(res,rej){var id=++s;w[id]={resolve:res,reject:rej};'
     + 'parent.postMessage({type:"protoArtifact:ask",id:id,prompt:String(prompt)},"*");'
@@ -905,53 +915,18 @@ _SHELL_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
     + '#md blockquote{margin:1em 0;padding-left:1em;border-left:3px solid var(--pl-color-border,rgba(255,255,255,.2));color:var(--pl-color-fg-muted,#9aa0aa)}'
     + '#md img{max-width:100%}#md .mermaid{background:none;border:0;padding:0}';
 
-  // Pan/zoom viewport for the GRAPHIC kinds (svg + mermaid — #1495). Both render an <svg>
-  // into the sandboxed frame; wrap it in a transform-driven viewport so large diagrams can be
-  // explored: scroll-wheel / pinch to zoom (cursor-anchored), click-drag to pan, Reset to re-fit.
+  // Crisp fit-to-window viewport for the GRAPHIC kinds (svg + mermaid — #1517). Both render an
+  // <svg> into the sandboxed frame; scale it as a VECTOR to fit the frame (max-width/height:100%,
+  // !important to beat mermaid's inline max-width:Npx on its own svg). No CSS transform / raster
+  // layer: transform-scaling rasterized the SVG at 1x then GPU-scaled the bitmap, so zooming in
+  // pixelated/blurred on WKWebView. This keeps it sharp at any size (pan/zoom traded for crispness).
   // Self-contained (needs no DS stylesheet) — styled off the base() token carry.
   var VP_CSS = '<style>html,body{margin:0;height:100%;overflow:hidden}'
-    + '#__vp{position:absolute;inset:0;overflow:hidden;cursor:grab;touch-action:none}'
-    + '#__vp.__drag{cursor:grabbing}'
-    + '#__cv{position:absolute;top:0;left:0;transform-origin:0 0;will-change:transform}'
-    + '#__zb{position:fixed;top:8px;right:8px;display:flex;gap:4px;z-index:2147483646;opacity:.4;transition:opacity .12s}'
-    + '#__zb:hover{opacity:1}'
-    + '#__zb button{height:26px;min-width:26px;padding:0 7px;font:13px/1 ui-sans-serif,system-ui,sans-serif;cursor:pointer;'
-    + 'color:var(--pl-color-fg,#ededed);background:var(--pl-color-bg,#18181b);'
-    + 'border:1px solid var(--pl-color-border,rgba(255,255,255,.16));border-radius:6px}'
-    + '#__zb button:hover{border-color:var(--pl-color-accent,#9b87f2)}</style>';
-  var ZBAR = '<div id="__zb"><button id="__zi" title="Zoom in" aria-label="Zoom in">+</button>'
-    + '<button id="__zo" title="Zoom out" aria-label="Zoom out">−</button>'
-    + '<button id="__zr" title="Reset view" aria-label="Reset view">Reset</button></div>';
-  // Transforms #__cv; exposes window.__artFit so an ASYNC renderer (mermaid) can re-fit once its
-  // <svg> exists. Cursor-anchored zoom keeps the point under the pointer fixed; fit() re-centers.
-  var PANZOOM = '<script>(function(){'
-    + 'var vp=document.getElementById("__vp"),cv=document.getElementById("__cv");if(!vp||!cv)return;'
-    + 'var k=1,x=0,y=0,MIN=0.05,MAX=40;'
-    + 'function apply(){cv.style.transform="translate("+x+"px,"+y+"px) scale("+k+")";}'
-    + 'function clamp(v){return v<MIN?MIN:(v>MAX?MAX:v);}'
-    + 'function fit(){cv.style.transform="none";'
-    + 'var r=cv.getBoundingClientRect(),cw=r.width,ch=r.height,vw=vp.clientWidth,vh=vp.clientHeight;'
-    + 'if(!cw||!ch){k=1;x=0;y=0;return apply();}'
-    + 'var s=Math.min((vw-24)/cw,(vh-24)/ch);if(!(s>0)||s>1)s=1;'
-    + 'k=s;x=(vw-cw*s)/2;y=(vh-ch*s)/2;apply();}'
-    + 'function zoomAt(px,py,f){var nk=clamp(k*f);f=nk/k;x=px-f*(px-x);y=py-f*(py-y);k=nk;apply();}'
-    + 'vp.addEventListener("wheel",function(e){e.preventDefault();var rc=vp.getBoundingClientRect();'
-    + 'zoomAt(e.clientX-rc.left,e.clientY-rc.top,Math.exp(-e.deltaY*0.0015));},{passive:false});'
-    + 'var dn=false,lx=0,ly=0;'
-    + 'vp.addEventListener("pointerdown",function(e){if(e.button!==0)return;dn=true;lx=e.clientX;ly=e.clientY;'
-    + 'vp.classList.add("__drag");try{vp.setPointerCapture(e.pointerId);}catch(_){}});'
-    + 'vp.addEventListener("pointermove",function(e){if(!dn)return;x+=e.clientX-lx;y+=e.clientY-ly;lx=e.clientX;ly=e.clientY;apply();});'
-    + 'function up(){dn=false;vp.classList.remove("__drag");}'
-    + 'vp.addEventListener("pointerup",up);vp.addEventListener("pointercancel",up);'
-    + 'function cz(f){var rc=vp.getBoundingClientRect();zoomAt(rc.width/2,rc.height/2,f);}'
-    + 'var zi=document.getElementById("__zi"),zo=document.getElementById("__zo"),zr=document.getElementById("__zr");'
-    + 'if(zi)zi.addEventListener("click",function(){cz(1.25);});'
-    + 'if(zo)zo.addEventListener("click",function(){cz(0.8);});'
-    + 'if(zr)zr.addEventListener("click",fit);'
-    + 'window.__artFit=fit;window.addEventListener("resize",fit);requestAnimationFrame(fit);'
-    + '})();<\/script>';
-  // Wrap graphic content in the viewport + controls (svg + mermaid share this).
-  function viewport(inner){ return VP_CSS + '<body><div id="__vp"><div id="__cv">' + inner + '</div></div>' + ZBAR + PANZOOM; }
+    + '#__vp{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:12px;box-sizing:border-box}'
+    + '#__vp pre.mermaid{display:contents}'
+    + '#__vp svg{max-width:100% !important;max-height:100% !important;width:auto !important;height:auto !important;display:block}</style>';
+  // Wrap graphic content in the fit-to-window viewport (svg + mermaid share this).
+  function viewport(inner){ return VP_CSS + '<body><div id="__vp">' + inner + '</div>'; }
 
   function srcdoc(kind, code) {
     if (kind === "html") return dsLink() + base(kind) + code;
@@ -959,9 +934,7 @@ _SHELL_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
     if (kind === "mermaid") return '<!doctype html>' + base(kind) + viewport('<pre class="mermaid">' + esc(code) + '</pre>') +
       cdn("mermaid") +
       '<script>mermaid.initialize({startOnLoad:false,theme:"dark"});'
-      + 'try{var __p=mermaid.run();if(__p&&__p.then)__p.then(function(){if(window.__artFit)window.__artFit();});}catch(_){}'
-      + 'setTimeout(function(){if(window.__artFit)window.__artFit();},80);'
-      + 'setTimeout(function(){if(window.__artFit)window.__artFit();},400);<\/script></body>';
+      + 'try{mermaid.run();}catch(_){}<\/script></body>';
     if (kind === "markdown") return mdDoc(code);
     // `react`: import map + UMD react/react-dom/babel, compiled as a MODULE so `import` works
     // (no-import artifacts still run — they use the UMD React/ReactDOM globals as before).
@@ -1019,6 +992,15 @@ _SHELL_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
       $estat=document.getElementById("estat");
   var editing=false;
 
+  // Persist the user's selection (artifact + version + whether to auto-follow the newest) so it
+  // STICKS across a tab-away/back — the plugin-view iframe unmounts on tab switch, so the shell
+  // reloads fresh; without this it snapped back to the latest artifact. Same-origin page → plain
+  // localStorage; best-effort (a blocked/full store just no-ops).
+  var SEL_KEY = "protoartifact.sel";
+  function saveSel(){ try{ localStorage.setItem(SEL_KEY, JSON.stringify({selId:selId, selVer:selVer, followNewest:followNewest})); }catch(_){} }
+  function loadSel(){ try{ var s=JSON.parse(localStorage.getItem(SEL_KEY)||"null");
+    if(s&&typeof s==="object"){ selId=s.selId||null; selVer=(s.selVer==null?null:s.selVer); followNewest=(s.followNewest!==false); } }catch(_){} }
+
   function selArt(){ for(var i=0;i<arts.length;i++) if(arts[i].id===selId) return arts[i]; return arts[0]||null; }
   function verIdx(a){ // selVer clamped to a's range; null/out-of-range → latest (auto-follow)
     if(!a) return 0; var n=a.versions.length;
@@ -1045,14 +1027,31 @@ _SHELL_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
     if(key!==lastRendered){ lastRendered=key; renderingId=a.id; renderingVer=vi+1; $frame.srcdoc=srcdoc(a.kind, v.code); $frame.style.display="block"; }
   }
 
+  // Live re-theme (#1872): base() bakes the theme tokens into the srcdoc as literal
+  // colors, so an app-theme switch after render left the artifact in the stale
+  // palette. The DS plugin-kit re-themes THIS page by rewriting the --pl-* tokens on
+  // the root element; observe that and push the fresh tokens into the frame (the
+  // SHIM applies them in place — no re-srcdoc, so interactive artifact state survives).
+  function pushTheme(){
+    if(!$frame || !$frame.contentWindow || $frame.style.display==="none") return;
+    var cs=getComputedStyle(document.documentElement);
+    function tok(n,d){ return (cs.getPropertyValue(n)||d).trim(); }
+    var tokens={"--pl-color-bg":tok("--pl-color-bg","#0a0a0c"),"--pl-color-fg":tok("--pl-color-fg","#ededed"),
+                "--pl-color-accent":tok("--pl-color-accent","#9b87f2"),"--pl-color-border":tok("--pl-color-border","rgba(255,255,255,.08)")};
+    try{ $frame.contentWindow.postMessage({type:"protoArtifact:theme",tokens:tokens},"*"); }catch(_){}
+  }
+  new MutationObserver(pushTheme).observe(document.documentElement,{attributes:true,attributeFilter:["style","class","data-theme"]});
+  // A theme switch can race a render — re-push once the fresh srcdoc has loaded.
+  $frame.addEventListener("load", pushTheme);
+
   $art.addEventListener("change", function(e){
     selId=e.target.value; selVer=null; followNewest=(selId===(curId||(arts[0]&&arts[0].id)));
-    render();
+    saveSel(); render();
   });
   $vprev.addEventListener("click", function(){ var a=selArt(); if(!a)return; var vi=verIdx(a);
-    if(vi>0){ selVer=vi-1; followNewest=false; render(); } });
+    if(vi>0){ selVer=vi-1; followNewest=false; saveSel(); render(); } });
   $vnext.addEventListener("click", function(){ var a=selArt(); if(!a)return; var vi=verIdx(a);
-    if(vi<a.versions.length-1){ selVer=vi+1; if(selVer===a.versions.length-1) selVer=null; render(); } });
+    if(vi<a.versions.length-1){ selVer=vi+1; if(selVer===a.versions.length-1) selVer=null; saveSel(); render(); } });
 
   $dl.addEventListener("click", function(){
     var a=selArt(); if(!a)return; var vi=verIdx(a), v=a.versions[vi];
@@ -1069,7 +1068,7 @@ _SHELL_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
       clearTimeout(delT); delT=setTimeout(function(){ if(delArm===a.id){delArm=null;$del.textContent="Delete";} },3000); return; }
     clearTimeout(delT); delArm=null; $del.textContent="Delete";
     try{ await kit.apiFetch("/api/plugins/artifact/artifact/"+encodeURIComponent(a.id),{method:"DELETE"}); }catch(e){}
-    selId=null; selVer=null; followNewest=true; poll();
+    selId=null; selVer=null; followNewest=true; saveSel(); poll();
   });
 
   // In-panel code editor — edit the SELECTED version's source and save it as a NEW
@@ -1097,7 +1096,7 @@ _SHELL_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
       var r=await kit.apiFetch("/api/plugins/artifact/artifact/"+encodeURIComponent(a.id),
         {method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({code:$code.value})});
       if(!r.ok) throw 0;
-      followNewest=true; await poll(); exitEdit();   // show the just-saved new version
+      followNewest=true; saveSel(); await poll(); exitEdit();   // show the just-saved new version
     }catch(e){ $estat.textContent="Save failed"; }
     $run.disabled=false;
   });
@@ -1131,6 +1130,11 @@ _SHELL_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
       var r = await kit.apiFetch("/api/plugins/artifact/history");
       var d = await r.json(); arts = (d && d.artifacts) || []; curId = (d && d.current) || null;
       if (followNewest) { selId = curId || (arts[0] && arts[0].id) || null; selVer = null; }
+      // A pinned selection whose artifact was deleted (not in arts) would strand the panel on a
+      // dead id — fall back to auto-follow + newest and re-persist so it doesn't linger.
+      else if (selId && !arts.some(function(a){ return a.id===selId; })) {
+        followNewest = true; selId = curId || (arts[0] && arts[0].id) || null; selVer = null; saveSel();
+      }
       rebuildArtSelect(); render();
     } catch (e) { /* transient */ }
   }
@@ -1138,7 +1142,7 @@ _SHELL_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
   // protoagent:init, so the gated history poll authenticates) or a short timer
   // for the no-handshake case (standalone page / older host).
   var booted = false;
-  function boot(){ if (booted) return; booted = true; poll(); setInterval(poll, 1500); }
+  function boot(){ if (booted) return; booted = true; loadSel(); poll(); setInterval(poll, 1500); }
   kit.initPluginView(boot);
   setTimeout(boot, 800);
   document.addEventListener("visibilitychange", function(){ if(!document.hidden && booted) poll(); }); // refresh on return

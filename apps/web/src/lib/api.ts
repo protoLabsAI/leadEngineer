@@ -3,7 +3,9 @@ import type {
   ActivityHistory,
   AgentConfig,
   Archetype,
+  ArchetypePreview,
   BackgroundJobDTO,
+  FsProject,
   Task,
   ChatMessage,
   ComponentSpec,
@@ -15,6 +17,7 @@ import type {
   DiscoveredAgent,
   FleetAgent,
   FleetStatus,
+  FlagsPayload,
   GoalState,
   HitlPayload,
   InboxItem,
@@ -24,11 +27,19 @@ import type {
   PluginInstallSummary,
   PluginUpdate,
   KnowledgeChunk,
+  MemoryHotChunk,
+  MemoryInjectionDetail,
+  MemoryInjectionRow,
+  MemorySessionDigest,
+  NodeRuntimePayload,
   RuntimeStatus,
   ScheduledJob,
+  SecretsStatus,
+  SecretsTestResult,
   SetupStatus,
   SettingsGroup,
   SlashCommand,
+  SoulVersion,
   Playbook,
   Subagent,
   ToolInfo,
@@ -58,9 +69,13 @@ type A2APart = {
   data?: unknown;
   metadata?: { mimeType?: string };
 };
+// A Message / Artifact carries an optional `metadata` map — since protolabs-a2a 0.3.0
+// that's where the SDK extensions (cost-v1, tool-call-v1) ride, keyed by extension URI.
+type A2AMessage = { parts?: A2APart[]; metadata?: Record<string, unknown> };
+type A2AArtifact = { parts?: A2APart[]; metadata?: Record<string, unknown> };
 type A2AStatus = {
   state?: string;
-  message?: { parts?: A2APart[] };
+  message?: A2AMessage;
 };
 type A2AFrame = {
   jsonrpc?: string;
@@ -82,7 +97,7 @@ type A2AFrame = {
     artifactUpdate?: {
       taskId?: string;
       contextId?: string;
-      artifact?: { parts?: A2APart[] };
+      artifact?: A2AArtifact;
       append?: boolean;
       lastChunk?: boolean;
     };
@@ -92,8 +107,8 @@ type A2AFrame = {
     taskId?: string;
     contextId?: string;
     status?: A2AStatus;
-    artifact?: { parts?: A2APart[] };
-    artifacts?: Array<{ parts?: A2APart[] }>;
+    artifact?: A2AArtifact;
+    artifacts?: A2AArtifact[];
     append?: boolean;
     lastChunk?: boolean;
     final?: boolean;
@@ -215,9 +230,15 @@ function isAgentPath(path: string) {
   // view must proxy to it. Custom-prefix plugins serve their view at /api/plugins/<id>/… (already
   // covered by the /api/ clause). Without /plugins/ here, a member's default-prefix view iframe
   // hits the hub origin instead of the member → 404 (the agent_browser/project_board panels).
+  //
+  // `/media/` is the core media store (#1929 `registry.save_media` → `GET /media/<file>?sig=…`)
+  // — a media file a member's tool generated lives on the MEMBER, so its console view must
+  // proxy there too (#1946). The hub-side proxy is a catch-all (fleet_routes.py
+  // `/agents/{slug}/{path:path}`), so no server change is needed.
   return (
     (path.startsWith("/api/") && !isHubPath(path)) ||
     path.startsWith("/plugins/") ||
+    path.startsWith("/media/") ||
     path.startsWith("/a2a") ||
     path.startsWith("/v1")
   );
@@ -312,10 +333,36 @@ export function isColdStart(error: unknown): boolean {
   return true; // no HTTP response at all ⇒ not reachable yet (desktop sidecar booting)
 }
 
+/** The fleet proxy's "agent isn't running/registered" signal (ADR 0042): a 409 from a
+ *  slug-routed call. Distinct from `isColdStart` (which also rides 502/no-response) — this
+ *  is specifically "the focused fleet agent is down", used to offer a return-to-host recovery
+ *  once it persists past a normal spawn window instead of the generic "isn't responding" gate. */
+export function isAgentNotRunning(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 409;
+}
+
 /** True for a 401 from request() — retrying can't help until the operator supplies
  *  a token (#873); the AuthGate owns recovery. */
 export function is401(error: unknown): boolean {
   return error instanceof ApiError && error.status === 401;
+}
+
+/** The fleet proxy's "can't reach the member" signal (ADR 0042 §I): a 502 from a
+ *  slug-routed call. A REMOTE member never 409s (it isn't a local process the hub can find
+ *  "not running") — it 502s when its box is offline or its URL is wrong. Distinct from
+ *  `isAgentNotRunning` (409) so the boot gate can offer the same return-to-host recovery for a
+ *  dead remote that it does for a down local peer. */
+export function isAgentUnreachable(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 502;
+}
+
+/** A request is MEMBER-scoped when it's slug-routed to the focused agent (not the hub). A 401
+ *  from one is that member's credential problem — a wrong/missing stored token for a REMOTE —
+ *  NOT the hub's, so it must not trip the global AuthGate (which prompts for, and would
+ *  overwrite, the HUB token). `host:true` and the host window are always hub-scoped. Exported
+ *  for unit testing (it gates whether a 401 reaches `notifyAuthRequired`). */
+export function isMemberScoped(path: string, host?: boolean): boolean {
+  return !host && currentSlug() !== "host" && isAgentPath(path);
 }
 
 async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
@@ -346,7 +393,9 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
     }
     // Wrong/expired/missing bearer on a token-gated deployment — surface the
     // token prompt (#873) instead of leaving per-panel 401 cards as the only signal.
-    if (response.status === 401) notifyAuthRequired();
+    // But a MEMBER-scoped 401 is the focused remote's bad token, not the hub's — don't
+    // hijack the hub AuthGate; the boot gate / fleet panel own that recovery.
+    if (response.status === 401 && !isMemberScoped(path, host)) notifyAuthRequired();
     throw new ApiError(response.status, detail || "request failed");
   }
 
@@ -374,7 +423,7 @@ async function requestForm<T>(path: string, form: FormData, opts: { host?: boole
     } catch {
       detail = raw || detail;
     }
-    if (response.status === 401) notifyAuthRequired();
+    if (response.status === 401 && !isMemberScoped(path, opts.host)) notifyAuthRequired();
     throw new ApiError(response.status, detail || "request failed");
   }
   return (await response.json()) as T;
@@ -387,12 +436,31 @@ export function textFromParts(parts?: Array<{ kind?: string; text?: string }>) {
     .join("");
 }
 
-const TOOL_CALL_MIME = "application/vnd.protolabs.tool-call-v1+json";
+/** Does this artifact-update frame APPEND to the artifact (vs REPLACE it)?
+ *
+ *  The A2A `append` bool has NO wire presence at its default: the SDK serializes
+ *  frames with proto3 semantics, so `append=false` is OMITTED from the JSON —
+ *  the key is simply absent on every replace frame, including the terminal
+ *  last-chunk frame that re-sends the full canonical answer (#1709). Per the
+ *  A2A spec an absent/false `append` means REPLACE, so only an explicit `true`
+ *  may be read as append — `append !== false` treated the terminal replace as
+ *  an append and rendered every streamed answer twice. */
+export function artifactAppends(update: { append?: boolean; [key: string]: unknown }): boolean {
+  return update.append === true;
+}
+
 const HITL_MIME = "application/vnd.protolabs.hitl-v1+json";
 const COMPONENT_MIME = "application/vnd.protolabs.component-v1+json";
 const REASONING_MIME = "application/vnd.protolabs.reasoning-v1+json";
-const COST_MIME = "application/vnd.protolabs.cost-v1+json";
 const CONTEXT_MIME = "application/vnd.protolabs.context-v1+json";
+
+// The two protolabs-a2a SDK extensions we consume ride the message/artifact METADATA
+// map keyed by their extension URI (protolabs-a2a 0.3.0) — they are no longer MIME-typed
+// DataParts in `parts[]`, so a generic A2A client stops rendering telemetry as content.
+// The template-local extensions (hitl / component / reasoning / context) are unaffected
+// and stay DataParts.
+const TOOL_CALL_EXT_URI = "https://proto-labs.ai/a2a/ext/tool-call-v1";
+const COST_EXT_URI = "https://proto-labs.ai/a2a/ext/cost-v1";
 
 type RawPart = {
   kind?: string;
@@ -400,6 +468,15 @@ type RawPart = {
   content?: { $case?: string; value?: unknown };
   metadata?: { mimeType?: string };
 };
+
+/** A metadata map as it arrives on a Message or Artifact — extension payloads keyed by URI. */
+type ExtMetadata = Record<string, unknown> | undefined;
+
+/** Read an extension payload out of a metadata map by its extension URI. */
+function extByUri(metadata: ExtMetadata, uri: string): unknown {
+  const value = metadata?.[uri];
+  return value && typeof value === "object" ? value : null;
+}
 
 /** Read a custom DataPart's payload iff its `metadata.mimeType` matches `mime`.
  *
@@ -425,8 +502,8 @@ function dataByMime(parts: RawPart[] | undefined, mime: string): unknown {
  * With `id` undefined, `onToolCall`'s `findIndex(c => c.id === evt.id)` matched
  * the FIRST card on every event, so all of a turn's tool calls collapsed into a
  * single ever-overwriting card — the "only one tool at a time" symptom. */
-function toolEventFromParts(parts?: RawPart[]): ToolEvent | null {
-  const d = dataByMime(parts, TOOL_CALL_MIME) as
+function toolEventFromMeta(metadata: ExtMetadata): ToolEvent | null {
+  const d = extByUri(metadata, TOOL_CALL_EXT_URI) as
     | {
         toolCallId?: string;
         name?: string;
@@ -471,12 +548,13 @@ function reasoningFromParts(parts?: RawPart[]): string | null {
   return d?.text || null;
 }
 
-/** Decode the terminal cost-v1 DataPart (A2A ext) → this turn's token usage + cost, or null.
- * Wire shape: `{ usage: {input_tokens, output_tokens, cache_read_input_tokens,
+/** Decode the terminal cost-v1 extension (A2A ext) → this turn's token usage + cost, or null.
+ * Read off the artifact's METADATA keyed by the cost-v1 extension URI (protolabs-a2a 0.3.0),
+ * not a DataPart. Wire shape: `{ usage: {input_tokens, output_tokens, cache_read_input_tokens,
  * cache_creation_input_tokens}, costUsd?, durationMs? }`. The snake_case `usage` fields are
  * mapped to the camelCase `TurnUsage` the console renders; totalTokens is derived. */
-export function costFromParts(parts?: RawPart[]): TurnUsage | null {
-  const d = dataByMime(parts, COST_MIME) as
+export function costFromMeta(metadata: ExtMetadata): TurnUsage | null {
+  const d = extByUri(metadata, COST_EXT_URI) as
     | {
         usage?: {
           input_tokens?: number;
@@ -623,18 +701,72 @@ async function consumeSse(
   }
 }
 
+export type PairHost = { host: string; kind: "tailnet" | "lan"; url: string; qr: string | null };
+export type PairAddress = { host: string; kind: "tailnet" | "lan" };
+export type PairingStart =
+  | { ok: true; code: string; expires_at: number; ttl: number; hosts: PairHost[] }
+  /** Nothing reachable — `available` is what the server COULD bind to (ADR 0087 D6).
+   *  `authConfigured` is THIS SERVER's answer to "do I have a token", which a client cannot
+   *  infer: localStorage holding one says nothing about what the server accepts. */
+  | { ok: false; error: string; available: PairAddress[]; bind: string; authConfigured: boolean };
+
 export const api = {
   runtimeStatus() {
     return request<RuntimeStatus>("/api/runtime/status");
   },
 
+  // ── Device pairing (ADR 0087) ──
+  // The CLAIM half deliberately lives outside this object (lib/pairing.ts): `request`
+  // attaches the operator bearer, and claiming runs precisely when there isn't one.
+  devices() {
+    return request<{ devices: { id: string; name: string; created_at: number; last_seen_at: number | null }[] }>(
+      "/api/devices",
+    );
+  },
+  /** Start pairing.
+   *
+   * Read directly rather than through `request` because the 409 body is MEANINGFUL: a
+   * loopback-bound instance reports the addresses it *could* be reached on so the panel can
+   * offer to bind there. `request` collapses every non-2xx into a thrown string, which would
+   * throw that payload away — and the alternative (returning 200 with ok:false) would weaken
+   * a correct status code for client convenience. */
+  async pairingStart(): Promise<PairingStart> {
+    const res = await fetch(apiUrl("/api/pairing/start"), {
+      method: "POST",
+      headers: applyAuth(new Headers()),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok) return { ok: true, ...data } as PairingStart;
+    return {
+      ok: false,
+      error: String(data?.error || `${res.status} ${res.statusText}`),
+      available: Array.isArray(data?.available) ? data.available : [],
+      bind: String(data?.bind || ""),
+      // Absent (an older server) is treated as NOT configured, so the flow mints rather than
+      // assuming — minting a second token is recoverable; writing a bind with no token is not.
+      authConfigured: data?.auth_configured === true,
+    };
+  },
+  pairingCancel() {
+    return request<{ ok: boolean }>("/api/pairing/cancel", { method: "POST" });
+  },
+  revokeDevice(id: string) {
+    return request<{ ok: boolean }>(`/api/devices/${encodeURIComponent(id)}`, { method: "DELETE" });
+  },
+
   // Short-lived HMAC token for the SSE EventSource, which can't send an
   // Authorization header. Bearer-gated; in open mode the server returns "" and
   // accepts a tokenless /api/events. events.ts fetches this before each
-  // (re)connect. Same slug routing as /api/events so the token is signed by
-  // whichever server actually terminates the stream (host or a proxied member).
+  // (re)connect.
+  //
+  // Signed by the HUB (host:true), NOT slug-routed. The proxied `/api/events`
+  // is validated at the HUB's auth middleware FIRST (before it forwards to the
+  // member), so the token must carry the hub's signature or the stream 401s at
+  // the hub for every non-host member on a bearer-gated hub. The hub then
+  // forwards with the member's own credential attached, so the member accepts it
+  // downstream (its SSE branch falls through to the bearer check).
   sseToken() {
-    return request<{ token: string }>("/api/sse-token");
+    return request<{ token: string }>("/api/sse-token", { host: true });
   },
 
   // Gracefully restart the server process (POST /api/restart) — the server drains and
@@ -642,6 +774,19 @@ export const api = {
   // process you're connected to), never a slug-routed agent.
   restart() {
     return request<{ ok: boolean; restarting: boolean }>("/api/restart", { method: "POST", host: true });
+  },
+
+  // Managed Node runtime (ADR 0085) — status + one-click provisioning of node/npx for
+  // the npx-based ACP agents + MCP servers. HOST-targeted (the box-shared runtime lives
+  // on the server process, not a slug-routed agent), like restart().
+  nodeRuntime() {
+    return request<NodeRuntimePayload>("/api/runtime/node", { host: true });
+  },
+  installNodeRuntime(force = false) {
+    return request<{ ok: boolean } & NodeRuntimePayload>(
+      `/api/runtime/node/install${force ? "?force=true" : ""}`,
+      { method: "POST", host: true },
+    );
   },
 
   // The HUB's runtime status — NEVER slug-routed. The TenantGuard keys on the hub's
@@ -657,6 +802,13 @@ export const api = {
   // `background.{started,completed}` bus events.
   background() {
     return request<{ enabled: boolean; jobs: BackgroundJobDTO[] }>("/api/background");
+  },
+
+  // One background job's full row by id (ADR 0070 D4). This is the ONLY place the
+  // FULL result text is fetchable — the `background.completed` bus event and the
+  // drained <task-notification> both carry truncated previews.
+  backgroundJob(jobId: string) {
+    return request<BackgroundJobDTO>(`/api/background/${encodeURIComponent(jobId)}`);
   },
 
   // Stop a running background job (ADR 0051) — cancels its detached A2A turn.
@@ -712,6 +864,15 @@ export const api = {
     }>(`/api/knowledge/search?q=${encodeURIComponent(q)}`);
   },
 
+  // #1701 Slice 2: redeem a plugin composer-form — POST the field values back to the
+  // plugin's on_submit. Returns a reply note, or the next form for a multi-step wizard.
+  submitChatCommandForm(body: { callback_id: string; session_id: string; answers: Record<string, unknown> }) {
+    return request<{ reply?: string | null; form?: HitlPayload; callback_id?: string }>(
+      "/api/chat/commands/submit",
+      { method: "POST", body },
+    );
+  },
+
   // Knowledge chunk CRUD — operator curation of the store (add a fact, fix a
   // stale one, drop a wrong one). Edit replaces the chunk (new id): the server
   // adds the revision first, then deletes the old row, so it works on every
@@ -749,6 +910,22 @@ export const api = {
       { method: "POST" },
     );
   },
+  // Bulk delete-by-source (#1770) — remove a whole ingest (all chunks sharing one
+  // `source`) in one call. It's a reversible SOFT delete: the chunks leave recall
+  // immediately but survive a grace window, so `restoreKnowledgeBySource` (the Undo
+  // toast) can bring them back. `deleted` is the count invalidated.
+  deleteKnowledgeBySource(source: string) {
+    return request<{ enabled: boolean; deleted: number; error?: string }>(
+      "/api/knowledge/delete-by-source",
+      { method: "POST", body: { source } },
+    );
+  },
+  restoreKnowledgeBySource(source: string) {
+    return request<{ enabled: boolean; restored: number; error?: string }>(
+      "/api/knowledge/restore-by-source",
+      { method: "POST", body: { source } },
+    );
+  },
   // Document ingestion engine — extract a file/URL/YouTube into the KB (chunked,
   // enriched, embedded). FormData carries `file` OR `url` OR `text`, plus `domain`.
   ingestKnowledge(form: FormData) {
@@ -760,6 +937,70 @@ export const api = {
       source_type: string;
       chars: number;
     }>("/api/knowledge/ingest", form);
+  },
+
+  // Dry-run an ingest (#1801) — extract + count chunks for a file/URL/text WITHOUT
+  // persisting anything, so the upload dialog can show what's about to be ingested
+  // (chunk count, token estimate, a text snippet) and gate it behind a Confirm.
+  // Same FormData shape as `ingestKnowledge` minus `domain` (chosen at confirm time).
+  previewKnowledgeIngest(form: FormData) {
+    return requestForm<{
+      enabled: boolean;
+      chunks: number;
+      chars: number;
+      approx_tokens: number;
+      title: string | null;
+      source_type: string;
+      source: string;
+      snippet: string;
+      truncated: boolean;
+    }>("/api/knowledge/ingest/preview", form);
+  },
+
+  // --- Memory inspector (ADR 0069 D7) — the delivery-layer audit surface -----
+  // Session summaries: the files behind the <prior_sessions> digest.
+  memorySessions() {
+    return request<{ sessions: MemorySessionDigest[] }>("/api/memory/sessions");
+  },
+  memorySession(sessionId: string) {
+    return request<{ session: MemorySessionDigest }>(
+      `/api/memory/sessions/${encodeURIComponent(sessionId)}`,
+    );
+  },
+  deleteMemorySession(sessionId: string) {
+    return request<{ deleted: boolean; session_id: string }>(
+      `/api/memory/sessions/${encodeURIComponent(sessionId)}`,
+      { method: "DELETE" },
+    );
+  },
+  // Hot memory: the domain="hot" chunks; the newest slice under the budget
+  // injects every turn (rows carry `injecting` when the backend can tell).
+  memoryHot() {
+    return request<{ enabled: boolean; chunks: MemoryHotChunk[] }>("/api/memory/hot");
+  },
+  updateMemoryHot(chunkId: number, body: { content: string; heading?: string }) {
+    return request<{ enabled: boolean; id: number | null; replaced: boolean }>(
+      `/api/memory/hot/${chunkId}`,
+      { method: "PUT", body },
+    );
+  },
+  deleteMemoryHot(chunkId: number) {
+    return request<{ enabled: boolean; deleted: boolean }>(`/api/memory/hot/${chunkId}`, {
+      method: "DELETE",
+    });
+  },
+  // Injection record (ADR 0069 D6): which memory entered which turn.
+  memoryInjections(sessionId = "", limit = 50) {
+    const q = new URLSearchParams();
+    if (sessionId) q.set("session_id", sessionId);
+    q.set("limit", String(limit));
+    return request<{ injections: MemoryInjectionRow[] }>(`/api/memory/injections?${q}`);
+  },
+  // One record's ids RESOLVED to their content, grouped for the detail dialog
+  // (past conversations · memories · docs). Chunks that no longer resolve come
+  // back marked `unavailable`.
+  memoryInjectionDetail(id: number) {
+    return request<MemoryInjectionDetail>(`/api/memory/injections/${id}`);
   },
 
   // Chat attachment — extract + TIER a dropped file (FormData: `file` + `session_id`).
@@ -852,6 +1093,20 @@ export const api = {
     return request<{ name: string; content: string }>(`/api/config/presets/${encodeURIComponent(name)}`);
   },
 
+  // SOUL.md version history (#1691): every persona save archives the outgoing text.
+  soulHistory() {
+    return request<{ versions: SoulVersion[] }>("/api/config/soul/history");
+  },
+  soulVersion(id: string) {
+    return request<{ id: string; content: string }>(`/api/config/soul/history/${encodeURIComponent(id)}`);
+  },
+  restoreSoulVersion(id: string) {
+    return request<{ ok: boolean; messages: string[]; restored: string }>(
+      `/api/config/soul/history/${encodeURIComponent(id)}/restore`,
+      { method: "POST" },
+    );
+  },
+
   models(apiBase: string, apiKey: string) {
     return request<{ models: string[]; error: string }>("/api/config/models", {
       method: "POST",
@@ -887,6 +1142,18 @@ export const api = {
     });
   },
 
+  // External secrets manager (ADR 0080) — status / force-a-refresh / connection test.
+  // Test runs against the SAVED config (unsaved form edits don't ride along yet).
+  secretsStatus() {
+    return request<SecretsStatus>("/api/secrets/status");
+  },
+  secretsSync() {
+    return request<SecretsStatus>("/api/secrets/sync", { method: "POST", body: {} });
+  },
+  secretsTest() {
+    return request<SecretsTestResult>("/api/secrets/test", { method: "POST", body: {} });
+  },
+
 
   finishSetup(config: Partial<AgentConfig>, soul: string) {
     return request<{ ok: boolean; message: string }>("/api/config/setup", {
@@ -910,7 +1177,9 @@ export const api = {
   },
 
   tools() {
-    return request<{ tools: ToolInfo[]; count: number }>("/api/tools");
+    // `count` = wired (enabled) tools; `disabled` = the RAW tools.disabled denylist —
+    // the base a row toggle edits, so stale names (no live tool) survive a save.
+    return request<{ tools: ToolInfo[]; count: number; disabled: string[] }>("/api/tools");
   },
 
   runSubagent(body: {
@@ -978,7 +1247,18 @@ export const api = {
   // the ADR 0066 path ceiling, so this accepts ANY verifier type (unlike the plugin-only SDK
   // path). A rejected verifier / disabled goal mode comes back as HTTP 400 (request() throws,
   // so the caller's onError surfaces the reason); the happy path returns {ok:true, message}.
-  setGoal(body: { session_id: string; condition: string; verifier: unknown }) {
+  // Optional completion-contract fields (ADR 0073) shape the drive-loop continuation
+  // prompt each turn — the verifier still decides DONE. All optional and backward-compatible.
+  setGoal(body: {
+    session_id: string;
+    condition: string;
+    verifier: unknown;
+    outcome?: string;
+    constraints?: string[];
+    boundaries?: string[];
+    stop_when?: string;
+    max_iterations?: number;
+  }) {
     return request<{ ok: boolean; message?: string; error?: string }>("/api/goals", {
       method: "POST",
       body,
@@ -1070,13 +1350,26 @@ export const api = {
   fleet() {
     return request<FleetStatus>("/api/fleet");
   },
+  flags() {
+    return request<FlagsPayload>("/api/flags");
+  },
   discoverAgents() {
     return request<{ discovered: DiscoveredAgent[] }>("/api/fleet/discover");
   },
   archetypes() {
     return request<{ archetypes: Archetype[] }>("/api/archetypes");
   },
-  createAgent(body: { name: string; bundle?: string | null; port?: number; start?: boolean; shared_skills?: boolean }) {
+  archetypePreview(id: string) {
+    return request<ArchetypePreview>(`/api/archetypes/${encodeURIComponent(id)}/preview`);
+  },
+  createAgent(body: {
+    name: string;
+    bundle?: string | null;
+    soul?: string;
+    port?: number;
+    start?: boolean;
+    shared_skills?: boolean;
+  }) {
     return request<{ ok: boolean; agent: FleetAgent; installed: string[] }>("/api/fleet", {
       method: "POST",
       body,
@@ -1094,11 +1387,23 @@ export const api = {
   },
   addRemoteAgent(body: { name: string; url: string; token?: string }) {
     // Register a remote protoAgent as a SWITCHABLE fleet member (ADR 0042 §I) —
-    // it gets a slug window; the hub reverse-proxies its console + A2A.
-    return request<{ ok: boolean; agent: FleetAgent }>("/api/fleet/remotes", {
+    // it gets a slug window; the hub reverse-proxies its console + A2A. The server
+    // probes it at register time and returns `reachable`/`version` so the caller can
+    // warn up front (registration is NOT rejected for an unreachable peer — deferred
+    // registration is intentional; a peer can come online later).
+    return request<{ ok: boolean; agent: FleetAgent; reachable?: boolean; version?: string }>("/api/fleet/remotes", {
       method: "POST",
       body,
     });
+  },
+  updateRemoteAgent(ident: string, body: { name?: string; url?: string; token?: string }) {
+    // Edit a remote member in place (ADR 0042 §I) — omitted fields keep their value;
+    // token:"" clears the stored bearer. The id/slug is unchanged, so open windows survive.
+    // The server re-probes and returns fresh {reachable, version}.
+    return request<{ ok: boolean; agent: FleetAgent; reachable?: boolean; version?: string }>(
+      `/api/fleet/remotes/${encodeURIComponent(ident)}`,
+      { method: "PATCH", body },
+    );
   },
   removeRemoteAgent(ident: string) {
     return request<{ ok: boolean; id: string; name: string }>(`/api/fleet/remotes/${encodeURIComponent(ident)}`, {
@@ -1158,6 +1463,45 @@ export const api = {
     );
   },
 
+  // Compact a chat session server-side (#1527): archive the raw history into
+  // searchable memory, summarize it, and rewrite the LangGraph checkpoint to
+  // [summary, recent tail] so the agent keeps context at lower token cost. The
+  // checkpoint is the agent's REAL context, so this must be server-side — a
+  // client-only trim would leave the agent's context untouched. `refused` (never
+  // lossy: nothing could be archived) means the server left the thread intact.
+  compactChatSession(sessionId: string) {
+    return request<{
+      summary: string;
+      archived_chunks: number;
+      kept: number;
+      removed: number;
+      archived: boolean;
+      refused: boolean;
+      reason: string;
+      message: string;
+    }>(`/api/chat/sessions/${encodeURIComponent(sessionId)}/compact`, { method: "POST", body: {} });
+  },
+
+  // Rewind a chat session server-side (#1535): discard every message AFTER the
+  // target and rewrite the LangGraph checkpoint in place, rolling the agent's live
+  // context back to that point. The checkpoint is the agent's REAL context, so this
+  // must be server-side — a client-only truncate would leave the agent's memory
+  // intact. Intentionally DESTRUCTIVE (no archive) but never corrupting. `content`
+  // is the visible bubble's text: the console's client-side message ids never appear
+  // in the checkpoint, so the server locates the message by its rendered content.
+  rewindChatSession(sessionId: string, messageId: string, content?: string, occurrence?: number) {
+    return request<{
+      found: boolean;
+      kept: number;
+      removed: number;
+      reason: string;
+      message: string;
+    }>(`/api/chat/sessions/${encodeURIComponent(sessionId)}/rewind`, {
+      method: "POST",
+      body: { message_id: messageId, content, occurrence },
+    });
+  },
+
   async streamChat(
     message: string,
     sessionId: string,
@@ -1186,6 +1530,15 @@ export const api = {
       model?: string;
       reasoningEffort?: string;
       bypassPermissions?: boolean;
+      // Incognito thread (ADR 0069 D3b): the flag is PER MESSAGE server-side, so the
+      // console stamps it on EVERY send while the thread's toggle is on — a mixed
+      // thread would leak earlier incognito content into a later turn's summary.
+      incognito?: boolean;
+      // This message ANSWERS a pending HITL form/question/approval (#1560): the server
+      // resumes the parked interrupt with it (Command(resume=…)) instead of running a
+      // fresh turn. Unmarked messages sent while a form is pending are held server-side
+      // until the form resolves.
+      hitlResume?: boolean;
     } = {},
   ) {
     // One A2A SendStreamingMessage body + one frame dispatcher, shared by the desktop
@@ -1205,13 +1558,16 @@ export const api = {
           messageId: rpcId,
           contextId: sessionId,
           // Per-turn overrides ride the A2A message metadata (server/chat.py reads them):
-          // the tab's chosen model + the /effort reasoning level.
-          ...((opts.model || opts.reasoningEffort || opts.bypassPermissions)
+          // the tab's chosen model + the /effort reasoning level + incognito (ADR 0069 D3b —
+          // per-message server-side, stamped on every send while the thread toggle is on).
+          ...((opts.model || opts.reasoningEffort || opts.bypassPermissions || opts.incognito || opts.hitlResume)
             ? {
                 metadata: {
                   ...(opts.model ? { model: opts.model } : {}),
                   ...(opts.reasoningEffort ? { reasoning_effort: opts.reasoningEffort } : {}),
                   ...(opts.bypassPermissions ? { bypass_permissions: true } : {}),
+                  ...(opts.incognito ? { incognito: true } : {}),
+                  ...(opts.hitlResume ? { hitl_resume: true } : {}),
                 },
               }
             : {}),
@@ -1242,7 +1598,8 @@ export const api = {
         // A reasoning-only frame carries no status text; don't let it clobber the
         // transient status line with the bare working state.
         if (!reasoning) handlers.onStatus?.(messageText || state);
-        const toolEvent = toolEventFromParts(parts);
+        // tool-call-v1 rides the status MESSAGE's metadata (URI-keyed), not its parts.
+        const toolEvent = toolEventFromMeta(statusUpdate.status?.message?.metadata);
         if (toolEvent) handlers.onToolCall?.(toolEvent);
         const component = componentFromParts(parts);
         if (component) handlers.onComponent?.(component);
@@ -1256,10 +1613,11 @@ export const api = {
       if (artifactUpdate) {
         const aParts = artifactUpdate.artifact?.parts;
         const text = textFromParts(aParts);
-        if (text) handlers.onText?.(text, artifactUpdate.append !== false);
-        // The terminal answer artifact also carries the cost-v1 + context-v1 DataParts
-        // (a2a_impl executor) — surface this turn's spend and its context-window fill.
-        const usage = costFromParts(aParts);
+        if (text) handlers.onText?.(text, artifactAppends(artifactUpdate));
+        // The terminal answer artifact carries cost-v1 in its URI-keyed METADATA and
+        // context-v1 as a DataPart (a2a_impl executor) — surface this turn's spend and
+        // its context-window fill.
+        const usage = costFromMeta(artifactUpdate.artifact?.metadata);
         if (usage) handlers.onCost?.(usage);
         const ctx = contextFromParts(aParts);
         if (ctx) handlers.onContext?.(ctx);
@@ -1298,7 +1656,17 @@ export const api = {
           method: "POST",
           headers: applyAuth(new Headers({ "Content-Type": "application/json" })),
           signal: handlers.signal,
-          body: JSON.stringify({ message, session_id: sessionId, ...(opts.model ? { model: opts.model } : {}) }),
+          body: JSON.stringify({
+            message,
+            session_id: sessionId,
+            ...(opts.model ? { model: opts.model } : {}),
+            // The non-streaming fallback must carry incognito too — dropping it here
+            // would silently persist a thread the operator marked private.
+            ...(opts.incognito ? { incognito: true } : {}),
+            // …and hitl_resume (#1560) — dropping it would make the server HOLD the
+            // operator's own form answer behind the form it answers (deadlock).
+            ...(opts.hitlResume ? { hitl_resume: true } : {}),
+          }),
         });
         if (!res.ok) {
           let detail = `${res.status} ${res.statusText}`;
@@ -1334,7 +1702,9 @@ export const api = {
     });
 
     if (!response.ok) {
-      if (response.status === 401) notifyAuthRequired(); // token-gated chat turn (#873)
+      // token-gated chat turn (#873) — but a member-scoped 401 is the focused remote's bad
+      // token, not the hub's, so don't hijack the hub AuthGate (the boot gate owns that).
+      if (response.status === 401 && !isMemberScoped("/a2a")) notifyAuthRequired();
       throw new Error(`${response.status} ${response.statusText}`);
     }
 
@@ -1545,6 +1915,23 @@ export const api = {
   uninstallPlugin(id: string) {
     return request<{ ok: boolean }>(`/api/plugins/${encodeURIComponent(id)}`, { method: "DELETE" });
   },
+  // Pip-install a plugin's declared requires_pip (the code-exec step `install`
+  // deliberately skips) — previously CLI-only.
+  installPluginDeps(id: string) {
+    return request<{ ok: boolean; installed: string[] }>("/api/plugins/install-deps", {
+      method: "POST",
+      body: { id },
+    });
+  },
+  fsProjects() {
+    return request<{ enabled: boolean; projects: FsProject[] }>("/api/settings/filesystem-projects");
+  },
+  setFsProjects(projects: FsProject[]) {
+    return request<{ ok: boolean; projects: FsProject[] }>("/api/settings/filesystem-projects", {
+      method: "POST",
+      body: { projects },
+    });
+  },
   // Per-plugin freshness (ADR 0027). The backend TTL-caches the ls-remote probe,
   // so polling is cheap; each row carries behind/pinned/error.
   pluginUpdates() {
@@ -1630,3 +2017,24 @@ export const api = {
     return request<DelegateProbe>("/api/delegates/test", { method: "POST", body: entry });
   },
 };
+
+/** Full report body for the chat report card → document viewer (ADR 0070 D4).
+ *
+ *  Fetches the job by id (`GET /api/background/{id}` — the only route that carries the
+ *  untruncated result). Falls back to the legacy list-and-filter ONLY on a 404: a
+ *  pre-ADR-0070 server has no by-id route (its router answers 404), and on a current
+ *  server a 404 means the job row was deleted — which the list fallback resolves to the
+ *  same "no longer available" placeholder. Any other failure (401/500/network) is real
+ *  and propagates so the viewer shows its error state instead of a misleading placeholder. */
+export async function loadBackgroundReport(jobId: string): Promise<string> {
+  const gone =
+    "_The full report is no longer available — it may have been cleared from the Background agents panel._";
+  try {
+    return (await api.backgroundJob(jobId)).result || gone;
+  } catch (err) {
+    if (!(err instanceof ApiError) || err.status !== 404) throw err;
+    // Old server (no by-id route) or deleted row — the list answers both.
+    const listed = await api.background().catch(() => null);
+    return listed?.jobs.find((j) => j.id === jobId)?.result || gone;
+  }
+}

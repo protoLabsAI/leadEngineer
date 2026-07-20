@@ -14,7 +14,7 @@ import hashlib
 import logging
 import os
 
-from graph.goals.verifiers import VERIFIERS, VerifyContext, run_verifier
+from graph.goals.verifiers import VERIFIERS, VerifierInvoker, VerifyContext, run_verifier
 from graph.watches.store import WatchStore
 from graph.watches.types import Watch
 
@@ -156,8 +156,20 @@ class WatchController:
         watch = self._store.get(watch_id)
         if watch is None or not watch.active:
             return None
+        # Effective cadence: the per-watch override, else the config default the
+        # server's _watch_loop ticks at (mirrors its getattr fallback).
+        interval_s = watch.interval_s
+        if interval_s is None:
+            interval_s = float(getattr(self._config, "watch_interval", 30) or 30)
         ctx = VerifyContext(
-            config=self._config, condition=watch.condition, last_text="", tool_summary="", cwd=os.getcwd()
+            config=self._config,
+            condition=watch.condition,
+            last_text="",
+            tool_summary="",
+            cwd=os.getcwd(),
+            invoker=VerifierInvoker(
+                kind="watch", id=watch.id, session_id=watch.run_session or "", interval_s=interval_s
+            ),
         )
         result = await run_verifier(watch.verifier, ctx)
         from time import time
@@ -190,10 +202,23 @@ class WatchController:
         return await self.evaluate(watch_id)
 
     async def tick_all(self) -> int:
-        """Evaluate every active watch out-of-band (verifier-only, no agent turn). The server
-        runs this on a cadence. Returns how many reached a terminal state this tick."""
+        """Evaluate the DUE active watches out-of-band (verifier-only, no agent turn).
+
+        The server runs this on the global ``watch_interval`` cadence, but a watch's own
+        ``interval_s`` is a FLOOR: a watch is skipped on ticks where it isn't due yet, so a
+        slow watch (e.g. ``interval_s=1800``) isn't collapsed to the global tick. That keeps
+        ``stall_after``'s wall-clock meaning (``stall_after × interval_s``) intact instead of
+        firing it every few minutes (#1753). Watches with no explicit ``interval_s`` evaluate
+        every tick, as before. The event-driven ``evaluate``/``evaluate_now`` fast path a plugin
+        calls on state change bypasses this gate by design. Returns how many reached a terminal
+        state this tick."""
+        from time import time
+
+        now = time()
         finished = 0
         for watch in self.active_watches():
+            if not self._due(watch, now):
+                continue
             try:
                 status = await self.evaluate(watch.id)
             except Exception:  # noqa: BLE001 — one bad watch must not stop the tick
@@ -202,6 +227,20 @@ class WatchController:
             if status is not None:
                 finished += 1
         return finished
+
+    @staticmethod
+    def _due(watch: Watch, now: float) -> bool:
+        """Whether a watch is due for a CADENCE evaluation at ``now``. A watch with no explicit
+        ``interval_s`` (or a non-positive one) is always due — the global loop cadence is its
+        interval, unchanged behavior. An explicit ``interval_s`` is a floor since
+        ``last_checked``: skip until it elapses, so the per-watch cadence (and ``stall_after``'s
+        wall-clock span) is honored (#1753). A never-checked watch is due immediately."""
+        interval_s = watch.interval_s
+        if interval_s is None or interval_s <= 0:
+            return True
+        if watch.last_checked is None:
+            return True
+        return (now - watch.last_checked) >= interval_s
 
     async def _finish(self, watch: Watch, status: str, reason: str, evidence: str = "") -> str:
         from time import time
@@ -222,7 +261,14 @@ class WatchController:
             try:
                 from graph.sdk import run_in_session
 
-                run_in_session(watch.run_session, watch.run_prompt, job_id=f"watch-{watch.id}")
+                # Carry WHAT tripped into the reaction (ADR 0079): prefix the creator's run_prompt
+                # with the watch condition + the verifier's evidence so the agent orients on wake
+                # instead of receiving a bare instruction with no context.
+                context = f"Watch `{watch.id}` tripped: {watch.condition}."
+                if (watch.last_evidence or "").strip():
+                    context += f"\nEvidence: {watch.last_evidence.strip()}"
+                reaction_prompt = f"{context}\n\n{watch.run_prompt}"
+                run_in_session(watch.run_session, reaction_prompt, job_id=f"watch-{watch.id}")
             except Exception:  # noqa: BLE001 — a reaction failure must not break the tick
                 log.exception("[watch] run_in_session reaction failed for %s", watch.id)
 

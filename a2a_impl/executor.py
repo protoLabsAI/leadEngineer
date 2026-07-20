@@ -287,7 +287,33 @@ class ProtoAgentExecutor(AgentExecutor):
         answer_aid = f"{context.task_id or 'turn'}-answer"
         _text_buf = ""
         _answer_started = False  # first chunk creates the artifact (append=False); rest append
-        _FLUSH_CHARS = 24
+        # Batched by a char threshold: small enough that the live bubble still fills
+        # smoothly, large enough that a long answer doesn't emit hundreds of frames.
+        # The frame count directly scales the SSE backpressure + teardown-cancel
+        # window (a2a_impl/registry.py grants the producer a 0.5s grace then cancels)
+        # that can strand the terminal REPLACE + COMPLETED frames on a slow/large
+        # stream — an 11KB answer at 24 chars was ~480 frames; at 240 it's ~48.
+        # Governs both the answer text (below) and reasoning batching (#1710).
+        _FLUSH_CHARS = 240
+        # Reasoning ("thinking") deltas arrive one token at a time. Batch them
+        # like the answer text so the live thinking bubble still fills word by
+        # word without a WORKING status frame per token — unbatched, one turn
+        # produced ~700 single-word frames, and each one becomes a durable
+        # history Message row downstream (#1710; the durable store additionally
+        # coalesces whole contiguous reasoning runs — a2a_impl.stores).
+        _reasoning_buf = ""
+
+        async def _flush_reasoning() -> None:
+            nonlocal _reasoning_buf
+            if not _reasoning_buf:
+                return
+            payload_text, _reasoning_buf = _reasoning_buf, ""
+            await updater.update_status(
+                TaskState.TASK_STATE_WORKING,
+                message=updater.new_agent_message(
+                    [_data_part_proto({"text": payload_text}, REASONING_MIME)]
+                ),
+            )
 
         async def _flush_text() -> None:
             nonlocal _text_buf, _answer_started
@@ -303,20 +329,25 @@ class ProtoAgentExecutor(AgentExecutor):
             _text_buf = ""
 
         async def _finalize(final_text: str) -> None:
-            """Close the answer artifact + emit the cost/context DataParts. If
-            the text was streamed (delta frames), append ONLY the meta parts so
-            concat-based consumers don't double the answer; otherwise emit the full
-            text once (the non-streaming path: workflow/subagent short-circuits)."""
-            # If text streamed but the canonical final_text DIVERGES from what
-            # streamed (a goal-outcome note appended, a kicker / multi-iteration retry,
-            # or extract_output reshaping it), REPLACE the artifact (append=False) with
-            # the full final_text so the durable task + any tasks/get re-fetch carry the
-            # real answer, not the raw streamed deltas. When it matches (the common case)
-            # append meta-only so concat-based consumers don't double the answer.
-            diverged = _answer_started and (final_text or "").strip() != accumulated.strip()
-            replace = (not _answer_started) or diverged
-            # body="" yields a dataparts-only list (the text part is conditional).
-            body = final_text if replace else ""
+            """Close the answer artifact + emit the cost/context DataParts.
+
+            AUTHORITATIVE (#1709): the terminal frame always carries the full
+            canonical ``final_text`` with ``append=False`` — a REPLACE — so the
+            durable task (and any tasks/get re-fetch) holds the answer exactly
+            once even when mid-stream append frames were lost downstream of this
+            process. The old heuristic (append meta-only when the streamed text
+            matched ``final_text``) compared against the IN-PROCESS accumulation,
+            so a downstream loss looked like "nothing diverged" and permanently
+            sealed a truncated artifact into the store. Frame consumers must
+            honor the A2A ``append`` flag — and beware its WIRE SHAPE: proto3
+            gives ``append`` no presence, so ``append=False`` serializes as an
+            ABSENT key. Absent/false ⇒ replace; only an explicit ``true`` is an
+            append (the SDK task store, evals/client.py and the console's
+            ``artifactAppends`` all read it that way — the console's previous
+            ``append !== false`` mapping would have doubled every streamed
+            answer). Naive concat consumers would otherwise see the answer
+            twice."""
+            body = final_text
             # Compaction context (#1372): the live prompt size + the configured trigger /
             # token threshold, merged into one context-v1 DataPart. Provider failures
             # degrade to "size only" — never break the turn's finalization.
@@ -329,7 +360,7 @@ class ProtoAgentExecutor(AgentExecutor):
                     except Exception:  # noqa: BLE001 — telemetry must never break a turn
                         meta = {}
                 context_meta = {"contextTokens": context_tokens, **meta}
-            parts = _terminal_parts(
+            parts, ext_meta = _terminal_parts(
                 body,
                 deltas,
                 usage if had_usage else None,
@@ -339,11 +370,15 @@ class ProtoAgentExecutor(AgentExecutor):
                 duration_ms=int((time.monotonic() - started) * 1000),
             )
             parts = await self._append_structured(parts, context, final_text)
-            if parts:
+            # Guard on EITHER: cost/worldstate now ride metadata, so a turn with telemetry
+            # but no text/context part must still emit the artifact (it would previously
+            # have had a cost DataPart keeping `parts` non-empty).
+            if parts or ext_meta:
                 await updater.add_artifact(
                     parts,
                     artifact_id=answer_aid,
-                    append=not replace,
+                    metadata=ext_meta or None,
+                    append=False,
                     last_chunk=True,
                 )
 
@@ -374,6 +409,12 @@ class ProtoAgentExecutor(AgentExecutor):
                 request_metadata=_md,
                 images=images,
             ):
+                # A contiguous reasoning run ends at the first non-reasoning event:
+                # flush the buffered tail first so frames reach the consumer in
+                # stream order (thinking before the text/tool frame it preceded).
+                if event_type != "reasoning":
+                    await _flush_reasoning()
+
                 if event_type == "text":
                     accumulated += payload
                     _text_buf += payload
@@ -388,11 +429,13 @@ class ProtoAgentExecutor(AgentExecutor):
                     await _flush_text()
                     if event_type == "tool_start":
                         tool_calls += 1
-                    part = _tool_call_part(event_type, payload)
-                    if part is not None:
+                    part, tc_meta = _tool_call_frame(event_type, payload)
+                    if part is not None or tc_meta is not None:
                         await updater.update_status(
                             TaskState.TASK_STATE_WORKING,
-                            message=updater.new_agent_message([part]),
+                            message=updater.new_agent_message(
+                                [part] if part is not None else [], metadata=tc_meta
+                            ),
                         )
                     # Realtime tap (ADR 0051) — surface the tool frame to any host hook.
                     if isinstance(payload, dict):
@@ -411,13 +454,13 @@ class ProtoAgentExecutor(AgentExecutor):
                 elif event_type == "reasoning":
                     # Live "thinking" — a reasoning DataPart on a WORKING frame,
                     # separate from the answer artifact (plain consumers ignore it).
+                    # Batched to the same char threshold as the answer text so a
+                    # token-per-event reasoning stream doesn't become a frame per
+                    # word (#1710).
                     if payload:
-                        await updater.update_status(
-                            TaskState.TASK_STATE_WORKING,
-                            message=updater.new_agent_message(
-                                [_data_part_proto({"text": str(payload)}, REASONING_MIME)]
-                            ),
-                        )
+                        _reasoning_buf += str(payload)
+                        if len(_reasoning_buf) >= _FLUSH_CHARS:
+                            await _flush_reasoning()
 
                 elif event_type == "delta":
                     if isinstance(payload, dict):
@@ -463,6 +506,7 @@ class ProtoAgentExecutor(AgentExecutor):
 
             # Stream ended without an explicit terminal event — treat the
             # accumulated text as the answer.
+            await _flush_reasoning()
             await _flush_text()
             await _finalize(accumulated)
             await updater.complete()
@@ -559,12 +603,15 @@ def _extract_skill_hint(context: RequestContext) -> str:
     return hint if isinstance(hint, str) else ""
 
 
-def _tool_call_part(event_type: str, payload: Any) -> Part | None:
-    """Build a tool-call-v1 DataPart from a tool_start/tool_end event.
+def _tool_call_frame(event_type: str, payload: Any) -> tuple[Part | None, dict[str, Any] | None]:
+    """Build the tool-call-v1 frame for a tool_start/tool_end event.
 
-    Structured dict payloads ({id,name,input|output}) become a typed
-    tool-call-v1 part; a plain-string payload (legacy producers) becomes a
-    plain text status part so text-only consumers still see progress.
+    Returns ``(part, metadata)``. Structured dict payloads ({id,name,input|output})
+    become URI-keyed **metadata** on the status message (protolabs-a2a 0.3.0 — the
+    extension rides `metadata[TOOL_CALL_EXT_URI]`, not a DataPart in `parts[]`, so a
+    generic A2A client no longer renders telemetry as content). A plain-string payload
+    (legacy producers) still becomes a plain text status **part** so text-only consumers
+    see progress. Exactly one of the two is non-None.
     """
     if isinstance(payload, dict):
         errored = event_type == "tool_end" and bool(payload.get("error"))
@@ -578,21 +625,22 @@ def _tool_call_part(event_type: str, payload: Any) -> Part | None:
             kwargs["result"] = payload.get("output")
         if errored:
             kwargs["error"] = str(payload.get("output") or "tool failed")
-        emit = pa.emit_tool_call(
+        meta = pa.tool_call_metadata(
             str(payload.get("id", "")),
             str(payload.get("name", "")),
             phase,
             **kwargs,
         )
         # A subagent's tool frame carries its parent delegation's tool-call id so the
-        # console nests it under the `task` card by id (the contract dict has no field
-        # for it, so ride it as an extra payload key the console reads).
+        # console nests it under the `task` card by id (the payload has no field for it,
+        # so ride it as an extra key the console reads) — now set on the URI-keyed
+        # fragment rather than the old DataPart's content.value.
         if payload.get("parentId"):
-            emit["content"]["value"]["parentToolCallId"] = str(payload["parentId"])
-        return _ext_data_part(emit)
+            meta[pa.TOOL_CALL_EXT_URI]["parentToolCallId"] = str(payload["parentId"])
+        return None, meta
     if payload:
-        return _text_part(str(payload))
-    return None
+        return _text_part(str(payload)), None
+    return None, None
 
 
 _CONTEXT_MIME = "application/vnd.protolabs.context-v1+json"
@@ -607,31 +655,32 @@ def _terminal_parts(
     *,
     success: bool,
     duration_ms: int | None = None,
-) -> list[Part]:
-    """Assemble the terminal artifact's parts: text first, then the worldstate-delta /
-    cost / context extension DataParts that have content.
+) -> tuple[list[Part], dict[str, Any]]:
+    """Assemble the terminal artifact's ``(parts, extension_metadata)``.
 
-    Ordering (text → worldstate → cost → context) is stable so consumers reading parts
-    in order are unchanged; the context-v1 part trails as a pure append.
+    protolabs-a2a 0.3.0 moved the four telemetry extensions off DataParts: the
+    worldstate-delta and cost payloads now ride the artifact's **metadata map keyed by
+    extension URI**, so a generic A2A client no longer renders them as content. Parts
+    therefore carry only real content — the answer text, plus the context-v1 readout,
+    which is a template-local extension (no SDK helper) and stays a DataPart.
     """
     parts: list[Part] = []
+    fragments: list[dict[str, Any]] = []
     if text:
         parts.append(_text_part(text))
     if deltas:
-        parts.append(_ext_data_part(pa.emit_worldstate_delta(deltas)))
+        fragments.append(pa.worldstate_delta_metadata(deltas))
     if usage and (usage.get("input_tokens", 0) or usage.get("output_tokens", 0)):
-        parts.append(
-            _ext_data_part(
-                pa.emit_cost(
-                    usage,
-                    duration_ms=duration_ms,
-                    cost_usd=round(cost_usd, 6) if cost_usd > 0 else None,
-                    success=success,
-                )
+        fragments.append(
+            pa.cost_metadata(
+                usage,
+                duration_ms=duration_ms,
+                cost_usd=round(cost_usd, 6) if cost_usd > 0 else None,
+                success=success,
             )
         )
     # Compaction context-window readout (#1372) — a template extension (no SDK helper),
     # built with the generic DataPart packer. Only when we actually measured a prompt.
     if context and context.get("contextTokens"):
         parts.append(_ext_data_part(pa.data_part(context, _CONTEXT_MIME)))
-    return parts
+    return parts, pa.merge_extension_metadata(*fragments) if fragments else {}

@@ -2,10 +2,21 @@
 
 from __future__ import annotations
 
+import os
+import signal
+import socket
+import time
+
 import pytest
 
 from graph.workspaces import manager
 from graph.fleet import supervisor
+
+
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
 
 @pytest.fixture
@@ -15,12 +26,19 @@ def fleet(tmp_path, monkeypatch):
     monkeypatch.setattr(supervisor, "_alive", lambda pid: int(pid) in alive if pid else False)
 
     class FakeProc:
+        returncode = None
+
         def __init__(self, *a, **k):
             self.pid = 99001
             alive.add(99001)
 
+        def poll(self):  # boot watch: still running
+            return None
+
     monkeypatch.setattr(supervisor.subprocess, "Popen", FakeProc)
     monkeypatch.setattr(supervisor, "_is_our_agent", lambda pid: True)
+    # Fake spawns never bind a port — short-circuit the boot watch to "it's up".
+    monkeypatch.setattr(supervisor, "_port_listening", lambda port, timeout=0.25: True)
 
     def fake_kill(pid, sig):  # SIGTERM/SIGKILL "kills" the fake process
         alive.discard(int(pid))
@@ -65,13 +83,19 @@ def test_keep_n_warm_evicts_lru(tmp_path, monkeypatch):
     monkeypatch.setattr(supervisor, "_alive", lambda pid: int(pid) in alive if pid else False)
 
     class FakeProc:
+        returncode = None
+
         def __init__(self, *a, **k):
             seq["n"] += 1
             self.pid = seq["n"]
             alive.add(self.pid)
 
+        def poll(self):  # boot watch: still running
+            return None
+
     monkeypatch.setattr(supervisor.subprocess, "Popen", FakeProc)
     monkeypatch.setattr(supervisor, "_is_our_agent", lambda pid: True)
+    monkeypatch.setattr(supervisor, "_port_listening", lambda port, timeout=0.25: True)
     monkeypatch.setattr(supervisor.os, "kill", lambda pid, sig: alive.discard(int(pid)))
 
     ids = {}
@@ -129,6 +153,42 @@ def test_remote_name_collides_with_workspace(tmp_path, monkeypatch):
     manager.create("alpha")
     with pytest.raises(supervisor.FleetError):
         supervisor.add_remote("alpha", "http://h:1")
+
+
+def test_update_remote_edits_url_token_name_in_place(tmp_path, monkeypatch):
+    monkeypatch.setenv("PROTOAGENT_WORKSPACES_DIR", str(tmp_path / "ws"))
+    rec = supervisor.add_remote("ava", "http://100.64.0.9:7870", token="old")
+    rid = rec["id"]
+
+    # Only-provided-fields change; the id (slug + data scope) is stable.
+    out = supervisor.update_remote(rid, url="http://100.64.0.9:7999", token="new", name="ava2")
+    assert out["id"] == rid and out["name"] == "ava2" and out["url"] == "http://100.64.0.9:7999"
+    assert "token" not in out  # sanitized — the bearer never leaves via the API
+    stored = supervisor.remote_for_slug(rid)  # proxy-side lookup DOES carry it
+    assert stored["token"] == "new" and stored["url"] == "http://100.64.0.9:7999"
+
+    # token=None keeps the stored bearer; token="" clears it.
+    supervisor.update_remote(rid, url="http://100.64.0.9:8001")  # no token kwarg
+    assert supervisor.remote_for_slug(rid)["token"] == "new"
+    supervisor.update_remote(rid, token="")
+    assert supervisor.remote_for_slug(rid)["token"] == ""
+
+
+def test_update_remote_rejects_bad_url_collision_and_unknown(tmp_path, monkeypatch):
+    monkeypatch.setenv("PROTOAGENT_WORKSPACES_DIR", str(tmp_path / "ws"))
+    a = supervisor.add_remote("ava", "http://100.64.0.9:7870")
+    supervisor.add_remote("bo", "http://100.64.0.10:7870")
+
+    with pytest.raises(supervisor.FleetError):
+        supervisor.update_remote(a["id"], url="ftp://nope")  # not http(s)
+    with pytest.raises(supervisor.FleetError):
+        supervisor.update_remote(a["id"], url="http://169.254.169.254/")  # SSRF egress guard
+    with pytest.raises(supervisor.FleetError):
+        supervisor.update_remote(a["id"], url="http://100.64.0.10:7870")  # bo's url — collision
+    with pytest.raises(supervisor.FleetError):
+        supervisor.update_remote("ghost", token="x")  # no such remote
+    # Editing to its OWN current url is fine (the collision check excludes self).
+    assert supervisor.update_remote(a["id"], url="http://100.64.0.9:7870")["url"] == "http://100.64.0.9:7870"
 
 
 def test_refresh_remote_probes_ttl(tmp_path, monkeypatch):
@@ -308,13 +368,19 @@ def _multi_fleet(tmp_path, monkeypatch):
     monkeypatch.setattr(supervisor, "_alive", lambda pid: int(pid) in alive if pid else False)
 
     class FakeProc:
+        returncode = None
+
         def __init__(self, *a, **k):
             seq["n"] += 1
             self.pid = seq["n"]
             alive.add(self.pid)
 
+        def poll(self):  # boot watch: still running
+            return None
+
     monkeypatch.setattr(supervisor.subprocess, "Popen", FakeProc)
     monkeypatch.setattr(supervisor, "_is_our_agent", lambda pid: True)
+    monkeypatch.setattr(supervisor, "_port_listening", lambda port, timeout=0.25: True)
 
     def fake_kill(pid, sig):
         killed.append((int(pid), int(sig)))
@@ -364,13 +430,19 @@ def test_shutdown_all_sigkills_straggler(tmp_path, monkeypatch):
     monkeypatch.setattr(supervisor, "_alive", lambda pid: int(pid) in alive if pid else False)
 
     class FakeProc:
+        returncode = None
+
         def __init__(self, *a, **k):
             seq["n"] += 1
             self.pid = seq["n"]
             alive.add(self.pid)
 
+        def poll(self):  # boot watch: still running
+            return None
+
     monkeypatch.setattr(supervisor.subprocess, "Popen", FakeProc)
     monkeypatch.setattr(supervisor, "_is_our_agent", lambda pid: True)
+    monkeypatch.setattr(supervisor, "_port_listening", lambda port, timeout=0.25: True)
 
     def stubborn_kill(pid, sig):  # ignores SIGTERM; dies only on SIGKILL
         sigs.append(int(sig))
@@ -433,6 +505,75 @@ def test_version_skew_flags_prestamp_records_as_unknown(tmp_path, monkeypatch):
     assert warn and "version unknown" in warn
 
 
+# ── autostart roster (ADR 0072 slice) ────────────────────────────────────────
+# A container recreate / host restart kills the detached member processes; the hub
+# (re)starts every configured `fleet.autostart` member on boot so the declared crew
+# comes back up instead of staying down until re-activated by hand.
+
+
+class _Cfg:
+    def __init__(self, roster):
+        self.fleet_autostart = roster
+
+
+def test_autostart_members_reads_config_then_env(monkeypatch):
+    # Live config wins.
+    monkeypatch.setattr(supervisor, "_live_config", lambda: _Cfg(["cindi", "matt"]))
+    assert supervisor.autostart_members() == ["cindi", "matt"]
+
+    # A comma-separated string (hand-edited YAML) is normalised, blanks dropped.
+    monkeypatch.setattr(supervisor, "_live_config", lambda: _Cfg(" a , , b "))
+    assert supervisor.autostart_members() == ["a", "b"]
+
+    # No config → the PROTOAGENT_FLEET_AUTOSTART env fallback (comma-separated).
+    monkeypatch.setattr(supervisor, "_live_config", lambda: None)
+    monkeypatch.setenv("PROTOAGENT_FLEET_AUTOSTART", "x, y ,")
+    assert supervisor.autostart_members() == ["x", "y"]
+
+    # Nothing configured → empty (the common case; boot hook no-ops).
+    monkeypatch.delenv("PROTOAGENT_FLEET_AUTOSTART", raising=False)
+    assert supervisor.autostart_members() == []
+
+
+def test_start_autostart_members_starts_declared(fleet, monkeypatch):
+    manager.create("cindi", port=7891)
+    manager.create("matt", port=7892)
+    monkeypatch.setattr(supervisor, "autostart_members", lambda: ["cindi", "matt"])
+
+    started = supervisor.start_autostart_members()
+    assert set(started) == {"cindi", "matt"}
+    assert supervisor.is_running("cindi") and supervisor.is_running("matt")
+
+
+def test_start_autostart_skips_running_and_missing(fleet, monkeypatch):
+    manager.create("cindi", port=7891)
+    manager.create("matt", port=7892)
+    supervisor.start("cindi")  # already up → must be skipped, not double-spawned
+    # "ghost" has no workspace → skipped with a warning, never raises.
+    monkeypatch.setattr(supervisor, "autostart_members", lambda: ["cindi", "ghost", "matt"])
+
+    started = supervisor.start_autostart_members()
+    assert started == ["matt"]  # only the down, existing member is (re)started
+    assert supervisor.is_running("matt")
+
+
+def test_start_autostart_no_roster_is_noop(fleet, monkeypatch):
+    monkeypatch.setattr(supervisor, "autostart_members", lambda: [])
+    assert supervisor.start_autostart_members() == []
+
+
+def test_start_autostart_is_hub_only_even_with_inherited_env(fleet, monkeypatch):
+    # A member inherits the hub's PROTOAGENT_FLEET_AUTOSTART, so the roster is non-empty
+    # inside a member too. Acting on it would scan the member's own (empty) workspaces root
+    # and warn "no workspace <id> — skipping" for every id. It must bail before that.
+    manager.create("cindi", port=7891)
+    monkeypatch.setattr(supervisor, "autostart_members", lambda: ["cindi", "matt"])
+    monkeypatch.setattr(supervisor.manager, "is_workspace_member", lambda: True)
+
+    assert supervisor.start_autostart_members() == []
+    assert not supervisor.is_running("cindi")  # nothing spawned inside a member
+
+
 def test_reconcile_on_boot_stamps_and_returns_previous(tmp_path, monkeypatch):
     import infra.paths as paths_mod
 
@@ -445,3 +586,227 @@ def test_reconcile_on_boot_stamps_and_returns_previous(tmp_path, monkeypatch):
     monkeypatch.setattr(paths_mod, "package_version", lambda: "0.2.0")
     assert supervisor.reconcile_on_boot() == "0.1.0"  # the update is visible once…
     assert supervisor._version_stamp_path().read_text().strip() == "0.2.0"  # …then re-stamped
+
+
+# ── boot-failure feedback (#1565 fallout) ─────────────────────────────────────
+# A member that dies at boot used to report `running: true` (the pid existed for a
+# moment) and just show up dead on the next poll — the reason lived only in
+# agent.log, which nothing surfaced. start() now watches the fresh spawn and raises
+# with the log tail; these run REAL subprocesses (no FakeProc) to prove it.
+
+
+def _real_spawn_env(tmp_path, monkeypatch, argv):
+    monkeypatch.setenv("PROTOAGENT_WORKSPACES_DIR", str(tmp_path / "ws"))
+    monkeypatch.setattr(manager, "run_exec", lambda ident, passthrough: ({}, argv))
+
+
+def test_start_surfaces_boot_death(tmp_path, monkeypatch):
+    import sys
+
+    _real_spawn_env(
+        tmp_path,
+        monkeypatch,
+        [sys.executable, "-c", "import sys; sys.stderr.write('kaboom: unrecognized arguments'); sys.exit(3)"],
+    )
+    ws = manager.create("dies", port=_free_port())  # free port — nothing binds it; the child exits first
+    with pytest.raises(supervisor.FleetError) as exc:
+        supervisor.start("dies")
+    msg = str(exc.value)
+    assert "exit code 3" in msg and "kaboom" in msg  # the reason, not a generic failure
+    assert not supervisor.is_running("dies")  # the dead entry was reaped, not left as a zombie
+    assert (tmp_path / "ws" / ws["id"] / "agent.log").exists()
+
+
+def test_start_returns_once_port_binds(tmp_path, monkeypatch):
+    import sys
+
+    port = _free_port()  # a genuinely free port for the fake member to bind
+    child = (
+        "import socket,time\n"
+        f"s=socket.socket(); s.bind(('127.0.0.1',{port})); s.listen(1)\n"
+        "time.sleep(30)\n"
+    )
+    _real_spawn_env(tmp_path, monkeypatch, [sys.executable, "-c", child])
+    manager.create("binds", port=port)
+    t0 = time.monotonic()
+    try:
+        rec = supervisor.start("binds")
+        assert rec["running"] and not rec["already"]
+        assert time.monotonic() - t0 < supervisor._BOOT_WATCH_SECONDS  # early exit on bind, not the full watch
+    finally:
+        try:
+            os.kill(rec["pid"], signal.SIGKILL)
+        except (OSError, UnboundLocalError):
+            pass
+
+
+def test_up_reports_boot_death_and_continues(tmp_path, monkeypatch):
+    import sys
+
+    _real_spawn_env(tmp_path, monkeypatch, [sys.executable, "-c", "raise SystemExit(2)"])
+    manager.create("brokey", port=_free_port())
+    rows = supervisor.up(["brokey"])  # must not raise — the row carries the error
+    assert rows[0]["name"] == "brokey" and rows[0]["running"] is False
+    assert "exit code 2" in rows[0]["error"]
+
+
+# ── member self-report on the host entry (#1708) ──────────────────────────────
+def test_host_entry_member_flag(fleet, monkeypatch):
+    """A spawned workspace member self-reports ``member: True`` on its own /api/fleet
+    host entry (the console's signal to gate hub-only affordances); a hub/standalone
+    host entry doesn't carry the key at all — the payload shape is unchanged for them."""
+    host = next(a for a in supervisor.status() if a.get("host"))
+    assert "member" not in host  # hub/standalone: no new field
+
+    monkeypatch.setattr(manager, "is_workspace_member", lambda: True)
+    host = next(a for a in supervisor.status() if a.get("host"))
+    assert host["member"] is True
+
+
+def _env_capturing_fleet(tmp_path, monkeypatch):
+    """Like the ``fleet`` fixture but captures the env passed to Popen, so a test can
+    assert what the spawned child inherits."""
+    monkeypatch.setenv("PROTOAGENT_WORKSPACES_DIR", str(tmp_path / "ws"))
+    alive: set[int] = set()
+    captured: dict = {}
+    monkeypatch.setattr(supervisor, "_alive", lambda pid: int(pid) in alive if pid else False)
+
+    class FakeProc:
+        returncode = None
+
+        def __init__(self, *a, **k):
+            self.pid = 99001
+            alive.add(99001)
+            captured["env"] = k.get("env", {})
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(supervisor.subprocess, "Popen", FakeProc)
+    monkeypatch.setattr(supervisor, "_is_our_agent", lambda pid: True)
+    monkeypatch.setattr(supervisor, "_port_listening", lambda port, timeout=0.25: True)
+    return captured
+
+
+def test_spawned_member_runs_open_on_loopback(tmp_path, monkeypatch):
+    """A hub-spawned member must NOT inherit the hub's inbound A2A_AUTH_TOKEN — else it
+    would require a bearer that a token-free local dispatch (the portfolio PM) never sends,
+    making a spawned team unreachable by its own PM (the 401). It runs open on loopback."""
+    captured = _env_capturing_fleet(tmp_path, monkeypatch)
+    monkeypatch.setenv("A2A_AUTH_TOKEN", "hub-inbound-secret")
+    manager.create("beta", port=7891)
+
+    supervisor.start("beta")
+
+    assert "A2A_AUTH_TOKEN" not in captured["env"]  # stripped
+    assert captured["env"].get("PROTOAGENT_ALLOW_OPEN") == "1"
+
+
+def test_spawned_member_keeps_explicit_workspace_token(tmp_path, monkeypatch):
+    """If the workspace's OWN run_exec env sets A2A_AUTH_TOKEN, that's an explicit per-team
+    token and must be preserved (only the INHERITED hub token is stripped)."""
+    captured = _env_capturing_fleet(tmp_path, monkeypatch)
+    monkeypatch.setenv("A2A_AUTH_TOKEN", "hub-inbound-secret")
+    manager.create("gamma", port=7892)
+
+    real_run_exec = manager.run_exec
+
+    def run_exec_with_token(wid, extra):
+        env, argv = real_run_exec(wid, extra)
+        env["A2A_AUTH_TOKEN"] = "team-own-token"
+        return env, argv
+
+    monkeypatch.setattr(supervisor.manager, "run_exec", run_exec_with_token)
+    supervisor.start("gamma")
+
+    assert captured["env"].get("A2A_AUTH_TOKEN") == "team-own-token"  # explicit token wins
+
+
+def test_member_advertises_a2a_tenant_url(tmp_path, monkeypatch):
+    """A2A URL-based multi-tenancy: a hub-spawned member's A2A_PUBLIC_URL is the hub's
+    public URL + its ``/agents/<id>`` tenant sub-path — so its agent-card interface url
+    (``_a2a_card_url`` = ``{A2A_PUBLIC_URL}/a2a``) resolves to the member's own proxied
+    route, not the hub root that every member would otherwise collide on."""
+    captured = _env_capturing_fleet(tmp_path, monkeypatch)
+    monkeypatch.setenv("A2A_PUBLIC_URL", "http://ava:7871")
+    manager.create("delta", port=7893)
+
+    r = supervisor.start("delta")
+
+    assert captured["env"]["A2A_PUBLIC_URL"] == f"http://ava:7871/agents/{r['id']}"
+
+
+def test_member_tenant_url_strips_hub_trailing_slash(tmp_path, monkeypatch):
+    """A trailing slash on the hub's public URL doesn't double up in the tenant path."""
+    captured = _env_capturing_fleet(tmp_path, monkeypatch)
+    monkeypatch.setenv("A2A_PUBLIC_URL", "http://ava:7871/")
+    manager.create("eta", port=7896)
+
+    r = supervisor.start("eta")
+
+    assert captured["env"]["A2A_PUBLIC_URL"] == f"http://ava:7871/agents/{r['id']}"
+
+
+def test_member_tenant_url_noop_without_hub_public_url(tmp_path, monkeypatch):
+    """No hub A2A_PUBLIC_URL (local/desktop run) → nothing injected; the member falls back
+    to advertising its bound loopback port, which is already per-member."""
+    captured = _env_capturing_fleet(tmp_path, monkeypatch)
+    monkeypatch.delenv("A2A_PUBLIC_URL", raising=False)
+    manager.create("epsilon", port=7894)
+
+    supervisor.start("epsilon")
+
+    assert "A2A_PUBLIC_URL" not in captured["env"]
+
+
+def test_member_tenant_url_respects_explicit_workspace_override(tmp_path, monkeypatch):
+    """If the workspace's own run_exec env sets A2A_PUBLIC_URL, that explicit value is kept
+    (only the INHERITED hub root is rewritten to the tenant path)."""
+    captured = _env_capturing_fleet(tmp_path, monkeypatch)
+    monkeypatch.setenv("A2A_PUBLIC_URL", "http://ava:7871")
+    manager.create("zeta", port=7895)
+
+    real_run_exec = manager.run_exec
+
+    def run_exec_with_url(wid, extra):
+        env, argv = real_run_exec(wid, extra)
+        env["A2A_PUBLIC_URL"] = "http://custom:9999/base"
+        return env, argv
+
+    monkeypatch.setattr(supervisor.manager, "run_exec", run_exec_with_url)
+    supervisor.start("zeta")
+
+    assert captured["env"]["A2A_PUBLIC_URL"] == "http://custom:9999/base"  # explicit wins
+
+
+def test_spawned_member_gets_own_agent_name(tmp_path, monkeypatch):
+    """A hub-spawned member must NOT inherit the hub's AGENT_NAME — else it runs under the
+    hub's name in every AGENT_NAME-namespaced subsystem (metrics prefix, trace tags,
+    scheduler storage, ``<AGENT_NAME>_API_KEY`` lookups). It gets its own workspace name."""
+    captured = _env_capturing_fleet(tmp_path, monkeypatch)
+    monkeypatch.setenv("AGENT_NAME", "jon")
+    manager.create("theta", port=7897)
+
+    supervisor.start("theta")
+
+    assert captured["env"]["AGENT_NAME"] == "theta"
+
+
+def test_spawned_member_agent_name_respects_explicit_workspace_override(tmp_path, monkeypatch):
+    """If the workspace's own run_exec env sets AGENT_NAME, that explicit value is kept
+    (mirrors the A2A_AUTH_TOKEN / A2A_PUBLIC_URL override rule)."""
+    captured = _env_capturing_fleet(tmp_path, monkeypatch)
+    monkeypatch.setenv("AGENT_NAME", "jon")
+    manager.create("iota", port=7898)
+
+    real_run_exec = manager.run_exec
+
+    def run_exec_with_name(wid, extra):
+        env, argv = real_run_exec(wid, extra)
+        env["AGENT_NAME"] = "custom-name"
+        return env, argv
+
+    monkeypatch.setattr(supervisor.manager, "run_exec", run_exec_with_name)
+    supervisor.start("iota")
+
+    assert captured["env"]["AGENT_NAME"] == "custom-name"  # explicit wins

@@ -3,7 +3,14 @@
    The shared :root token bridge + resets moved to theme-base.css (loads first). */
 
 .app-shell {
-  height: 100vh;
+  height: 100vh; /* fallback for browsers without dvh */
+  height: 100dvh; /* the dynamic viewport — excludes the mobile URL bar so the bottom
+                     nav/composer never hide under browser chrome */
+  /* …and subtract the on-screen keyboard. `dvh` tracks browser chrome but NOT the
+     keyboard, which on iOS overlays the viewport instead of resizing it. `--kb-inset`
+     (lib/useKeyboardInset.ts) carries that height; it stays 0px everywhere else, so
+     this is inert on desktop and on engines that resize the layout viewport themselves. */
+  height: calc(100dvh - var(--kb-inset, 0px));
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -148,6 +155,7 @@
   flex-direction: column;
   min-height: 0;
   height: min(60vh, 560px);
+  height: min(60dvh, 560px);
 }
 
 /* Background subagents (ADR 0050 Phase 3) — UtilityBar pill + jobs dialog. */
@@ -175,6 +183,7 @@
   flex-direction: column;
   gap: 4px;
   max-height: min(60vh, 520px);
+  max-height: min(60dvh, 520px);
   overflow-y: auto;
 }
 .bg-jobs-row {
@@ -606,19 +615,6 @@ select:disabled {
   opacity: 0.55;
 }
 
-.error-strip {
-  min-height: 36px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 10px;
-  border: 1px solid color-mix(in srgb, var(--error) 30%, transparent);
-  border-radius: var(--radius);
-  background: color-mix(in srgb, var(--error) 14%, transparent);
-  color: var(--error);
-  padding: 8px 10px;
-}
-
 .message-list,
 .issue-list,
 .subagent-list,
@@ -688,6 +684,19 @@ select:disabled {
   padding: var(--pl-space-6, 24px);
 }
 
+/* Auth gate scrim (#1921) — the AuthGate is a BLOCKING modal (no onClose; see
+   AuthGate.tsx). While a 401 stands, everything behind it is dead, so the scrim must
+   fully obscure that dead UI rather than let it peek through. The shared DS
+   `--pl-color-overlay` is a light, translucent wash (~0.35 alpha in dark) that suits
+   normal dismissible dialogs — darkening it globally would harm those, so we scope a
+   near-opaque black to the auth dialog only. `className="auth-dialog"` lands on the
+   inner `.pl-dialog`; `:has()` selects the scrim that wraps it (the DS uses the same
+   `:has()` pattern for drawer alignment). Fully opaque near-black (not a high-alpha
+   wash) so even bright content behind it can't bleed through. */
+.pl-overlay:has(.auth-dialog) {
+  background: rgb(8, 8, 12);
+}
+
 /* Toast top-right anchoring now comes from the DS prop (`<ToastProvider position="top-right">`,
    @protolabsai/ui ≥ 0.49) — the `.pl-toast-stack` override that used to live here is retired. */
 
@@ -698,6 +707,7 @@ select:disabled {
    short and leaving dead space under it. The configure step keeps its content height. */
 .mcp-catalog-dialog--browse .pl-dialog {
   height: min(82vh, calc(100vh - 2 * var(--pl-space-4, 16px)));
+  height: min(82dvh, calc(100dvh - 2 * var(--pl-space-4, 16px)));
 }
 .mcp-catalog-dialog--browse .pl-dialog__body {
   display: flex;
@@ -844,6 +854,59 @@ select:disabled {
    (code/table action buttons, themed + re-pinned to the brand). The console's hand-rolled
    `.markdown` rules + the streamdown Tailwind scan are gone (protoContent#297/#298). The
    `.markdown` class still rides the same element as an e2e/selector alias. */
+
+/* ── Markdown chrome: console-side gaps the DS can't cover ─────────────────────
+   @protolabsai/ui 0.53.1 folded in the responsive tables + the code-block/table vertical
+   stack (protoContent#382), so those overrides are gone. What remains here patches
+   CONSOLE-specific behaviour the DS package can't see. */
+
+/* GFM task-list checkbox: the console's global `input,textarea,select { width: 100% }` (below)
+   blows the markdown checkbox to the full row width, shoving the label onto the next line. The
+   DS can't fix that (it has no such global rule). Pin it back to intrinsic size, and drop the
+   disc marker the DS still leaves on the item (it has a checkbox, not a bullet). */
+.pl-markdown [data-streamdown="list-item"].task-list-item {
+  list-style: none;
+}
+.pl-markdown [data-streamdown="list-item"].task-list-item input[type="checkbox"] {
+  width: auto;
+}
+
+/* Table "copy as" dropdown (Markdown/CSV/TSV): streamdown styles the menu with inert Tailwind
+   (min-w-[120px], px-3, w-full) and an inline left offset (its right-0/top-full are inert), so
+   it collapses to ~22px and drifts off the wrapper's right edge. Give it a readable surface,
+   anchor it under the button, and let it escape the DS's overflow:hidden (which clips it below a
+   short table). The table's own horizontal scroll lives on the inner overflow-x:auto child, so
+   opening the wrapper up doesn't leak a wide table. */
+.pl-markdown [data-streamdown="table-wrapper"] {
+  overflow: visible;
+}
+.pl-markdown [data-streamdown="table-wrapper"] .relative > div {
+  min-width: 150px;
+  white-space: nowrap;
+  padding: 4px;
+  background: var(--pl-color-bg-raised);
+  border: var(--pl-border-width) solid var(--pl-color-border);
+  border-radius: var(--pl-radius);
+  box-shadow: 0 6px 20px rgb(0 0 0 / 28%);
+  /* streamdown positions the menu with an inline left offset (its right-0/top-full Tailwind is
+     inert), which shoved the 150px menu off the wrapper's right edge and out of view. Anchor it
+     explicitly under the button, right-aligned, so it stays on-screen. !important beats the
+     inline style. */
+  top: 100% !important;
+  right: 0 !important;
+  left: auto !important;
+}
+.pl-markdown [data-streamdown="table-wrapper"] .relative > div button {
+  display: block;
+  width: 100%;
+  padding: 6px 10px;
+  text-align: left;
+  white-space: nowrap;
+  border-radius: var(--pl-radius);
+}
+.pl-markdown [data-streamdown="table-wrapper"] .relative > div button:hover {
+  background: var(--pl-color-bg-inset);
+}
 
 /* Chat composer + slash-command autocomplete — moved to src/chat/chat.css (#832). */
 /* HITL request card — moved to src/chat/hitl.css (#832). */
@@ -1116,6 +1179,19 @@ textarea {
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 13px;
+}
+
+/* What the subagent DOES (#1660) — plain prose (not the mono tools line), clamped:
+   the registry descriptions are written for the model and run several sentences. */
+.subagent-row span.subagent-desc {
+  color: var(--fg);
+  font-family: var(--font-sans);
+  font-size: 12px;
+  line-height: 1.4;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 
 .notes-editor {
@@ -1618,6 +1694,81 @@ textarea {
   line-height: 1.4;
 }
 
+/* Archetype "what's included" preview (setup wizard + fleet new-agent panel) */
+.archetype-preview-link {
+  margin-top: 8px;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--fg-secondary);
+  font-size: 12px;
+  cursor: pointer;
+  text-align: left;
+}
+.archetype-preview-link:hover {
+  color: var(--fg);
+  text-decoration: underline;
+}
+.archetype-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  max-height: min(70vh, 640px);
+  overflow-y: auto;
+}
+.archetype-preview-members {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.archetype-preview-member {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+}
+.archetype-preview-member-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.archetype-preview-desc {
+  margin: 4px 0 0;
+  color: var(--fg-secondary);
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+.archetype-preview-muted {
+  margin: 4px 0 0;
+  color: var(--fg-muted);
+  font-size: 12px;
+}
+.archetype-preview-skills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+.archetype-preview-chip {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 1px 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--fg-secondary);
+}
+.archetype-preview-soul {
+  margin: 6px 0 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--pl-color-bg-inset);
+  font-size: 11.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
 /* Runtime-kind + archetype pickers are now the DS <RadioCardGroup> (protoContent #254);
    the old .setup-choice / .archetype-card classes are retired. */
 
@@ -1632,89 +1783,42 @@ textarea {
 /* The app `.spin` keyframe is retired — busy spinners now come from the DS
    (`<Button loading>` and `<Spinner>`, @protolabsai/ui ≥ 0.50). */
 
-/* Below this width there isn't room for the rail + chat + side panel, so drop
-   to two columns and hide the panel (reachable again by widening / the toggle).
-   Kept under the desktop's 980px min window so the panel stays put there; this
-   mainly affects narrow browser windows. The two-column template here now
-   actually wins because .workspace no longer sets its columns inline. */
-@media (max-width: 900px) {
-  .workspace {
-    grid-template-columns: 64px minmax(0, 1fr);
-  }
+/* ── Mobile shell (≤767px — the DS AppShell single-pane breakpoint, ADR 0035) ────
+   Under 768px the DS collapses to ONE stage + a bottom quick-bar. Its
+   `.pl-appshell__mobile-stage` is a flex ITEM but lays its child out in normal
+   block flow, so a surface panel's `flex: 1 1 0` goes inert and the panel sizes to
+   content — stranding dead canvas below it (the chat composer ends up floating
+   mid-screen). Making the stage a flex column lets the active `.stage-panel` fill
+   it and scroll INTERNALLY, exactly like a desktop dock column.
 
-  .right-panel {
-    display: none;
-  }
-}
+   (The old hand-rolled `.workspace`/`.rail`/`.stage`/`.topbar`/`.right-panel` grid
+   and its `.stage-panel { height: calc(100vh - 260px) }` were removed here — those
+   classes no longer render, and that fixed height was the actual cause of the gap.
+   Kept below: only the content-grid rules whose classes are still live.)
 
-@media (max-width: 720px) {
-  .app-shell {
-    grid-template-rows: auto minmax(0, 1fr);
-  }
-
-  .topbar {
-    min-height: 56px;
-    align-items: flex-start;
+   Breakpoint note: keep this 767 in lockstep with `useIsMobile` (lib/useIsMobile.ts)
+   and the DS `mobileBreakpoint` (768 ⇒ its query is also ≤767). */
+@media (max-width: 767px) {
+  .pl-appshell__mobile-stage {
+    display: flex;
     flex-direction: column;
-    padding: 10px 12px;
   }
 
-  .topbar-status {
-    width: 100%;
-    overflow-x: auto;
-    padding-bottom: 2px;
-  }
+  /* (The `.pl-mobilenav` safe-area inset that lived here is gone twice over: the bottom
+     quick-bar itself was retired by the chat-first shell (ADR 0086 D1), and the DS now
+     ships that inset next to the component in ui@0.57 — it was always a consumer
+     patching a design-system gap.) */
 
-  .workspace {
-    grid-template-columns: 1fr;
-    grid-template-rows: auto minmax(0, 1fr);
-  }
-
-  .rail {
-    flex-direction: row;
-    border-right: 0;
-    border-bottom: 1px solid var(--border);
-  }
-
-  .rail button {
-    flex: 1 1 0;
-    min-height: 44px;
-  }
-
-  .stage {
-    border-right: 0;
-    padding: 8px;
-    overflow: auto;
-  }
-
-  .stage-panel {
-    height: calc(100vh - 260px);
-    min-height: 420px;
-  }
-
-  .composer,
+  /* Dense content grids collapse to a single column on phones. */
   .subagent-grid,
-  .batch-task-fields,
-  .issue-create,
-  .issue-create-meta,
-  .notes-meta,
   .setup-grid.two,
   .setup-grid.three,
   .setup-grid.model-row {
     grid-template-columns: 1fr;
   }
 
-  .composer textarea {
-    min-height: 76px;
-  }
-
   .metric-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .message {
-    grid-template-columns: 1fr;
-    gap: 4px;
   }
 
   .setup-overlay {
@@ -1726,6 +1830,15 @@ textarea {
     position: sticky;
     bottom: 0;
     background: var(--bg-panel);
+  }
+
+  /* Touch ergonomics: the DS icon button is 30px (26px in --sm) — below the ~44px
+     touch guideline, and there are ~90 of them on a dense surface (Memory row
+     edit/delete). Bump the hit area to 40px on phones; the 16px glyph stays centered,
+     so nothing looks bigger than it should, taps just land. */
+  .pl-btn--icon {
+    min-width: 40px;
+    min-height: 40px;
   }
 }
 
@@ -1811,6 +1924,29 @@ textarea {
 .knowledge-chunk-form-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .knowledge-chunk-form-row > :first-child { flex: 1; min-width: 180px; }
 .knowledge-chunk-actions { display: flex; gap: 2px; }
+/* Shift held → the delete button arms red (chat-tab quick-delete parity, #1582). */
+.knowledge-del-armed, .knowledge-del-armed svg { color: var(--pl-color-danger, #e5484d); }
+
+/* Collapsible source groups in the Knowledge Base (#1575). A group is a plain
+   list item holding a full-width header button + (when open) a nested card list. */
+.kb-group { list-style: none; display: flex; flex-direction: column; gap: 8px; }
+/* Toggle + a bulk delete-by-source button sit side by side (#1770); the toggle
+   flexes to fill, the trash button is a fixed sibling at the end. */
+.kb-group-header-row { display: flex; align-items: center; gap: 4px; }
+.kb-group-header {
+  flex: 1; min-width: 0;
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 8px 12px; border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--bg-raised); color: var(--fg); cursor: pointer; text-align: left;
+}
+.kb-group-header:hover { border-color: var(--border-strong); }
+.kb-group-delete { flex: none; }
+.kb-group-caret { flex: none; color: var(--fg-muted); transition: transform 0.12s ease; }
+.kb-group-title {
+  flex: 1; min-width: 0; font-size: 13px; font-weight: 600;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.kb-group-body { margin-left: 14px; }
 
 /* New/Edit skill dialog (PlaybooksSurface) — a little more space between fields than
    the knowledge inline form it grew out of. (Body padding is the app-wide
@@ -1844,6 +1980,24 @@ textarea {
 }
 .knowledge-ingest-note { color: var(--fg-muted); font-size: 12px; align-self: center; }
 
+/* Ingest preview (dry-run gate, #1801) — shown in place of the drop-zone once a
+   source is picked; Confirm ingests, Cancel returns to selection. */
+.knowledge-ingest-preview { display: flex; flex-direction: column; gap: 10px; }
+.knowledge-ingest-preview-meta { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.knowledge-ingest-preview-source {
+  font-size: 12px; color: var(--fg-muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%;
+}
+.knowledge-ingest-preview-snippet {
+  margin: 0; padding: 10px 12px;
+  border: 1px solid var(--pl-color-border);
+  border-radius: 8px;
+  background: var(--pl-color-bg-inset);
+  font-size: 12px; line-height: 1.5;
+  white-space: pre-wrap; word-break: break-word;
+  max-height: 220px; overflow-y: auto;
+}
+
 /* ── Delegates panel (ADR 0025) — moved to src/settings/delegates.css (#832). ── */
 
 /* Plugin-contributed console views (ADR 0026) — optional subnav above, iframe fills. */
@@ -1853,7 +2007,7 @@ textarea {
 .plugin-view-state { display: flex; align-items: center; gap: 8px; padding: 24px; color: var(--fg-muted); font-size: 13px; }
 /* A plugin view hosted in a utility-widget DIALOG (vs the stage): give it a fixed height
    so the iframe has room to fill (the stage normally supplies that via its flex column). */
-.plugin-widget-dialog { display: flex; flex-direction: column; height: 70vh; min-height: 0; }
+.plugin-widget-dialog { display: flex; flex-direction: column; height: 70vh; height: 70dvh; min-height: 0; }
 .plugin-widget-dialog > .plugin-view { flex: 1; min-height: 0; }
 
 /* Plugins panel (ADR 0027, .plugin-install-* / .plugin-list / .plugin-row-main / -title /
@@ -1881,103 +2035,6 @@ textarea {
   font-size: 0.78rem;
   color: var(--fg-muted);
   word-break: break-word;
-}
-
-/* Mobile shell (ADR 0035 S4) — single surface + bottom quick-bar + hamburger drawer. The
-   --pl-color-overlay / --pl-color-bg-hover tokens land in @protolabsai/design 0.4.0; fallbacks
-   keep it correct until then. */
-.workspace.mobile {
-  display: flex;
-  flex-direction: column;
-  grid-template-columns: none;
-}
-.workspace.mobile .stage {
-  flex: 1;
-  min-height: 0;
-  border-right: none;
-  padding-bottom: 60px; /* clear the fixed bottom bar */
-}
-.mobile-bar {
-  position: fixed;
-  bottom: 0;
-  left: 0;
-  right: 0;
-  display: flex;
-  border-top: 1px solid var(--border);
-  background: var(--bg-panel);
-  z-index: 40;
-}
-.mobile-tab {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 3px;
-  padding: 8px 4px;
-  background: transparent;
-  border: none;
-  color: var(--fg-muted);
-  font-family: var(--font-mono);
-  font-size: 10px;
-  cursor: pointer;
-}
-.mobile-tab.active {
-  color: var(--brand-violet-light);
-}
-.mobile-drawer-overlay {
-  position: fixed;
-  inset: 0;
-  background: var(--pl-color-overlay, rgba(0, 0, 0, 0.55));
-  z-index: 50;
-  display: flex;
-}
-.mobile-drawer {
-  width: 82%;
-  max-width: 320px;
-  height: 100%;
-  display: flex;
-  flex-direction: column;
-  background: var(--bg-panel);
-  border-right: 1px solid var(--border);
-}
-.mobile-drawer-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 12px 14px;
-  border-bottom: 1px solid var(--border);
-  font-size: 0.85rem;
-}
-.mobile-drawer-head button {
-  background: transparent;
-  border: none;
-  color: var(--fg-muted);
-  cursor: pointer;
-}
-.mobile-drawer-list {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  padding: 8px;
-  overflow: auto;
-}
-.mobile-drawer-list button {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 10px 12px;
-  background: transparent;
-  border: none;
-  border-radius: var(--radius);
-  color: var(--fg);
-  cursor: pointer;
-  text-align: left;
-  font-size: 0.85rem;
-}
-.mobile-drawer-list button.active,
-.mobile-drawer-list button:hover {
-  background: var(--pl-color-bg-hover, rgba(255, 255, 255, 0.06));
 }
 
 /* Fleet manager (Settings → Agents, ADR 0042) — the .fleet-list / .fleet-row* /
@@ -2019,6 +2076,7 @@ textarea {
 .fleet-switcher-trigger:hover {
   background: var(--bg-hover);
 }
+
 .fleet-switcher-name {
   display: inline-flex;
   align-items: center;
@@ -2028,6 +2086,15 @@ textarea {
 .fleet-switcher-check {
   flex: 0 0 auto;
   color: var(--accent);
+}
+
+/* Tooltip-wrapped menu row (#1708 — the disabled "Fleet settings" item on a fleet
+   member). The DS Tooltip's trigger span is inline-flex, which would shrink the
+   wrapped .pl-menu__item to its content width; make it block so the row spans the
+   menu like its siblings. (DS gap — a disabled-menu-item-with-tooltip pattern
+   belongs in @protolabsai/ui's Menu; drop this once protoContent ships one.) */
+.pl-menu .pl-tip-wrap {
+  display: block;
 }
 
 /* .fleet-host-tag retired (#832) — the "this instance" / "remote" tags in the
@@ -2123,4 +2190,34 @@ textarea {
   margin-top: 8px;
   font-size: 12px;
   color: #e5484d;
+}
+
+/* Setup wizard — post-install dependency report (finish step) */
+.setup-postinstall {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.setup-postinstall-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+}
+.setup-postinstall-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.setup-postinstall-info > span {
+  color: var(--fg-muted);
+  font-size: 12px;
+  font-family: var(--font-mono);
+}
+.setup-postinstall-error {
+  color: var(--error);
+  font-size: 12px;
 }

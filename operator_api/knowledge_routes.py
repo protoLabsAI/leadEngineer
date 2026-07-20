@@ -23,6 +23,14 @@ from runtime.state import STATE
 
 log = logging.getLogger("protoagent.server")
 
+# Recovery window for the reversible bulk delete-by-source (#1770). A bulk delete
+# only SOFT-deletes (invalidates) the chunks; they survive this long so the Undo
+# toast / restore-by-source can bring them back. There's no scheduler hook for
+# knowledge here, so the sweep runs OPPORTUNISTICALLY at the top of the next bulk
+# delete — anything invalidated longer ago than this is then hard-purged. 24h is a
+# generous recovery period for an operator who deleted the wrong ingest.
+_INVALIDATED_GRACE_SECONDS = 24 * 3600
+
 
 # ── Playbooks (skills) helpers ────────────────────────────────────────────────
 # Operator-authored skills are persisted as real SKILL.md files under the writable
@@ -99,6 +107,51 @@ def _knowledge_row(d: dict) -> dict:
         # store; null otherwise. Backs the console's tier badges + promote/unshare.
         "tier": d.get("tier"),
     }
+
+
+# Chars of extracted text shown in the ingest preview snippet (#1801) — enough to
+# eyeball that the right document extracted correctly, without shipping a whole PDF.
+_PREVIEW_SNIPPET_CHARS = 1500
+
+
+# Extraction + store live in ``ops.knowledge`` now (ADR 0075 D2) — the same op the agent's
+# ``knowledge_ingest`` tool calls, ending the double-glue. These helpers are the REST adapter:
+# multipart form → an ``IngestSource``, and the op's typed ``IngestError`` → an HTTP status.
+_INGEST_STATUS = {
+    "missing_dependency": 501,
+    "unsupported": 415,
+    "no_source": 400,
+    "not_found": 400,
+    "extraction": 400,
+    "empty": 400,
+}
+
+
+async def _source_from_form(file, url: str, text: str, title: str):
+    """A (file | url | pasted text) multipart form → an ``ops.knowledge.IngestSource``, or
+    ``None`` when no source was given. Inputs are assumed already stripped by the caller."""
+    from ops.knowledge import IngestSource
+
+    if file is not None:
+        return IngestSource.from_upload(await file.read(), file.filename or "upload", file.content_type)
+    if url:
+        return IngestSource.from_url(url)
+    if text:
+        return IngestSource.from_text(text, title=title or None, label="console")
+    return None
+
+
+def _ingest_error_response(exc):
+    """Map an ``ops.knowledge.IngestError`` to the console's ``{detail}`` + status."""
+    if exc.kind == "extraction":
+        detail = f"extraction failed: {exc.detail}"
+    elif exc.kind == "empty":
+        detail = "nothing ingested (no text after extraction)"
+    elif exc.kind == "no_source":
+        detail = "provide a file, url, or text"
+    else:
+        detail = exc.detail
+    return JSONResponse({"detail": detail}, status_code=_INGEST_STATUS.get(exc.kind, 400))
 
 
 def register_knowledge_routes(app) -> None:
@@ -444,72 +497,74 @@ def register_knowledge_routes(app) -> None:
         contextually enriches + embeds it (ADR 0021) — so a whole PDF, article, or
         recording becomes per-passage recall, not one diluted chunk. Multipart so
         a file upload and the URL/text fields share one endpoint. Extraction +
-        embedding run off the event loop. Returns the created chunk ids."""
+        store run in ``ops.knowledge.ingest`` (the same op the agent tool calls).
+        Returns the created chunk ids."""
         if STATE.knowledge_store is None:
             return {"enabled": False, "ids": []}
-        from ingestion import (
-            ExtractResult,
-            MissingDependency,
-            UnsupportedSource,
-            extract_bytes,
-            extract_url,
-        )
-        from knowledge import add_document
+        from ops import OpContext
+        from ops.knowledge import IngestError, ingest
 
-        # Gateway STT for audio/video (None if no transcribe_model configured →
-        # audio/video raise a clean "not configured" error, text/pdf unaffected).
-        transcribe = None
+        source = await _source_from_form(file, url.strip(), text.strip(), title.strip())
+        if source is None:
+            return JSONResponse({"detail": "provide a file, url, or text"}, status_code=400)
         try:
-            from graph.llm import create_transcribe_fn
-
-            transcribe = create_transcribe_fn(STATE.graph_config) if STATE.graph_config else None
-        except Exception as exc:  # noqa: BLE001 — transcription stays optional
-            log.warning("[knowledge] transcribe fn unavailable: %s", exc)
-
-        url, text, title = url.strip(), text.strip(), title.strip()
-        source = "console"
-        try:
-            if file is not None:
-                data = await file.read()
-                result = await asyncio.to_thread(
-                    extract_bytes, file.filename or "upload", data, file.content_type, transcribe=transcribe
-                )
-                source = file.filename or "upload"
-            elif url:
-                result = await asyncio.to_thread(extract_url, url, transcribe=transcribe)
-                source = url
-            elif text:
-                result = ExtractResult(text=text, title=title or None, source_type="text")
-            else:
-                return JSONResponse({"detail": "provide a file, url, or text"}, status_code=400)
-        except MissingDependency as exc:
-            return JSONResponse({"detail": str(exc)}, status_code=501)
-        except UnsupportedSource as exc:
-            return JSONResponse({"detail": str(exc)}, status_code=415)
-        except Exception as exc:  # noqa: BLE001 — surface extraction failure, never 500
-            log.warning("[knowledge] ingest extraction failed: %s", exc)
-            return JSONResponse({"detail": f"extraction failed: {exc}"}, status_code=400)
-
-        heading = title or result.title or None
-        ids = await asyncio.to_thread(
-            lambda: add_document(
-                STATE.knowledge_store,
-                result.text,
-                domain=(domain.strip() or "general"),
-                heading=heading,
-                source=source,
-                source_type=result.source_type,
+            result = await ingest(
+                source, domain=(domain.strip() or "general"), title=(title.strip() or None), ctx=OpContext.from_state()
             )
-        )
-        if not ids:
-            return JSONResponse({"detail": "nothing ingested (no text after extraction)"}, status_code=400)
+        except IngestError as exc:
+            return _ingest_error_response(exc)
         return {
             "enabled": True,
-            "ids": ids,
-            "chunks": len(ids),
-            "title": heading,
+            "ids": result.ids,
+            "chunks": result.chunks,
+            "title": result.title,
             "source_type": result.source_type,
-            "chars": len(result.text),
+            "chars": result.chars,
+        }
+
+    @app.post("/api/knowledge/ingest/preview")
+    async def _api_knowledge_ingest_preview(
+        file: UploadFile | None = File(default=None),
+        url: str = Form(default=""),
+        text: str = Form(default=""),
+        title: str = Form(default=""),
+    ):
+        """Dry-run an ingest: extract + count chunks for a source WITHOUT persisting
+        anything (#1801).
+
+        Backs the pre-ingest preview dialog — filename/type/size, how many chunks
+        the file will split into, an approximate token count, and a text snippet —
+        so the operator can verify the right content (and that extraction worked)
+        lands in the right bucket before committing. Runs the *same* extraction as
+        ``/ingest`` (via ``ops.knowledge.ingest_preview``) but stops before
+        ``add_document``: it writes zero rows and skips embedding + LLM enrichment
+        entirely. Chunk count uses the live store's chunk knobs, so the preview
+        matches what ingestion will actually produce. Confirm re-POSTs to
+        ``/ingest`` (extraction reruns there, preserving real provenance)."""
+        if STATE.knowledge_store is None:
+            return {"enabled": False}
+        from ops import OpContext
+        from ops.knowledge import IngestError, ingest_preview
+
+        source = await _source_from_form(file, url.strip(), text.strip(), title.strip())
+        if source is None:
+            return JSONResponse({"detail": "provide a file, url, or text"}, status_code=400)
+        try:
+            preview = await ingest_preview(
+                source, title=(title.strip() or None), ctx=OpContext.from_state(), snippet_chars=_PREVIEW_SNIPPET_CHARS
+            )
+        except IngestError as exc:
+            return _ingest_error_response(exc)
+        return {
+            "enabled": True,
+            "chunks": preview.chunks,
+            "chars": preview.chars,
+            "approx_tokens": preview.approx_tokens,
+            "title": preview.title,
+            "source_type": preview.source_type,
+            "source": preview.source,
+            "snippet": preview.snippet,
+            "truncated": preview.truncated,
         }
 
     @app.post("/api/knowledge/attach")
@@ -637,3 +692,62 @@ def register_knowledge_routes(app) -> None:
             return {"enabled": False, "deleted": False}
         deleted = await asyncio.to_thread(STATE.knowledge_store.delete_by_id, chunk_id)
         return {"enabled": True, "deleted": bool(deleted)}
+
+    # --- Bulk delete-by-source (reversible soft delete, #1770) ---------------
+    # Removing a whole ingest (an article / transcript / doc = dozens of chunks,
+    # all sharing one ``source``) one chunk at a time is impractical. These two
+    # routes bulk-delete/restore a source. The delete is SOFT — it invalidates the
+    # rows (they leave recall immediately) but keeps them for a grace window, so the
+    # console's Undo toast (restore-by-source) can bring them back. Past the window
+    # they're hard-swept by ``purge_invalidated``. Both methods are optional store
+    # capabilities (getattr-guarded): a plugin backend without them degrades to a
+    # 0-count no-op instead of 500ing. On a layered store the lifecycle delegates to
+    # the PRIVATE tier (the commons is curated via forget only), same as purge_domain.
+
+    @app.post("/api/knowledge/delete-by-source")
+    async def _api_knowledge_delete_by_source(body: dict | None = None):
+        store = STATE.knowledge_store
+        if store is None:
+            return {"enabled": False, "deleted": 0}
+        source = str((body or {}).get("source", "")).strip()
+        if not source:
+            return JSONResponse({"detail": "source is required"}, status_code=400)
+        invalidate = getattr(store, "invalidate_by_source", None)
+        if invalidate is None:
+            return {"enabled": True, "deleted": 0, "error": "this knowledge backend can't bulk-delete by source"}
+        # Opportunistic grace sweep: no scheduler owns knowledge here, so each bulk
+        # delete first hard-purges anything invalidated past the recovery window —
+        # that's what makes the "permanent removal" of AC4 real. Best-effort; a
+        # sweep failure must never block the delete the operator actually asked for.
+        purge = getattr(store, "purge_invalidated", None)
+        if purge is not None:
+            try:
+                swept = await asyncio.to_thread(purge, _INVALIDATED_GRACE_SECONDS)
+                if swept:
+                    log.info("[knowledge] swept %d past-grace invalidated chunk(s)", swept)
+            except Exception:  # noqa: BLE001 — the sweep is opportunistic, never fatal
+                log.exception("[knowledge] purge_invalidated sweep failed")
+        try:
+            deleted = await asyncio.to_thread(invalidate, source)
+        except Exception as exc:  # noqa: BLE001 — never 500 the console
+            log.exception("[knowledge] delete-by-source failed")
+            return {"enabled": True, "deleted": 0, "error": str(exc)}
+        return {"enabled": True, "deleted": int(deleted)}
+
+    @app.post("/api/knowledge/restore-by-source")
+    async def _api_knowledge_restore_by_source(body: dict | None = None):
+        store = STATE.knowledge_store
+        if store is None:
+            return {"enabled": False, "restored": 0}
+        source = str((body or {}).get("source", "")).strip()
+        if not source:
+            return JSONResponse({"detail": "source is required"}, status_code=400)
+        restore = getattr(store, "restore_by_source", None)
+        if restore is None:
+            return {"enabled": True, "restored": 0, "error": "this knowledge backend can't restore by source"}
+        try:
+            restored = await asyncio.to_thread(restore, source)
+        except Exception as exc:  # noqa: BLE001 — never 500 the console
+            log.exception("[knowledge] restore-by-source failed")
+            return {"enabled": True, "restored": 0, "error": str(exc)}
+        return {"enabled": True, "restored": int(restored)}

@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+from fastapi import HTTPException
 from pydantic import BaseModel
 
 from runtime.state import STATE
@@ -104,6 +105,41 @@ def register_config_routes(app) -> None:
         ok, messages = await asyncio.to_thread(_apply_settings_changes, config=req.config, soul=req.soul)
         return {"ok": ok, "messages": messages}
 
+    # --- SOUL.md version history (#1691) -----------------------------------
+    # Every persona save archives the outgoing SOUL.md (config_io.write_soul); the console
+    # lists these and can roll back to one. Restore re-saves through the same apply path, so
+    # it snapshots the CURRENT persona first — rolling back is itself reversible.
+    @app.get("/api/config/soul/history")
+    async def _api_soul_history():
+        from graph.config_io import list_soul_versions
+
+        return {"versions": list_soul_versions()}
+
+    @app.get("/api/config/soul/history/{version_id}")
+    async def _api_soul_history_one(version_id: str):
+        from graph.config_io import read_soul_version
+
+        content = read_soul_version(version_id)
+        if content is None:
+            raise HTTPException(status_code=404, detail=f"no SOUL version {version_id!r}")
+        return {"id": version_id, "content": content}
+
+    @app.post("/api/config/soul/history/{version_id}/restore")
+    async def _api_soul_history_restore(version_id: str):
+        from graph.config_io import read_soul, read_soul_version
+
+        content = read_soul_version(version_id)
+        if content is None:
+            raise HTTPException(status_code=404, detail=f"no SOUL version {version_id!r}")
+        # Restoring the version that's already live is a no-op — skip the (expensive) graph
+        # recompile a "restore" button on the current row would otherwise trigger.
+        if content == read_soul():
+            return {"ok": True, "messages": ["already the current persona"], "restored": version_id}
+        # Reuse the tested save+reload path: it snapshots the CURRENT persona before overwriting
+        # (so restore is reversible) and recompiles the graph off the event loop (#497).
+        ok, messages = await asyncio.to_thread(_apply_settings_changes, soul=content)
+        return {"ok": ok, "messages": messages, "restored": version_id}
+
     @app.post("/api/config/models")
     async def _api_list_models(req: ModelsProbeRequest | None = None):
         """Fetch the gateway's model list.
@@ -189,13 +225,63 @@ def register_config_routes(app) -> None:
 
         return {"name": name, "content": read_soul_preset(name)}
 
+    @app.get("/api/settings/filesystem-projects")
+    async def _api_fs_projects():
+        """The fenced fs roots (ADR 0007): the explicit ``filesystem.projects`` list
+        plus whether filesystem tools are enabled. Backs the Tools-panel folder
+        editor — previously this collection had no UI or API at all (YAML-only)."""
+        cfg = STATE.graph_config
+        return {
+            "enabled": bool(getattr(cfg, "filesystem_enabled", False)),
+            "projects": list(getattr(cfg, "filesystem_projects", []) or []),
+        }
+
+    @app.post("/api/settings/filesystem-projects")
+    async def _api_fs_projects_set(body: dict | None = None):
+        """Replace ``filesystem.projects`` (same replace-list pattern as
+        POST /api/mcp/servers): each entry ``{name?, path, write?}`` — name defaults
+        from the folder basename, paths are ~-expanded, blanks and duplicate names
+        are rejected. An empty list clears explicit roots (fs falls back to the
+        workspace default when enabled)."""
+        from pathlib import Path
+
+        raw = (body or {}).get("projects")
+        if not isinstance(raw, list):
+            raise HTTPException(status_code=400, detail="projects must be a list")
+        projects: list[dict] = []
+        seen: set[str] = set()
+        for entry in raw:
+            if not isinstance(entry, dict):
+                raise HTTPException(status_code=400, detail="each project must be an object")
+            path = str(entry.get("path", "")).strip()
+            if not path:
+                raise HTTPException(status_code=400, detail="each project needs a path")
+            expanded = Path(path).expanduser()
+            name = str(entry.get("name", "")).strip() or expanded.name or "folder"
+            if name in seen:
+                raise HTTPException(status_code=400, detail=f"duplicate project name: {name}")
+            seen.add(name)
+            projects.append({"name": name, "path": str(expanded), "write": bool(entry.get("write", False))})
+
+        from server.agent_init import _apply_settings_changes
+
+        updates: dict = {"filesystem": {"projects": projects}}
+        if projects and (body or {}).get("enable", True):
+            updates["filesystem"]["enabled"] = True
+        ok, messages = _apply_settings_changes(config=updates)
+        if not ok:
+            raise HTTPException(status_code=500, detail="; ".join(messages) or "reload failed")
+        return {"ok": True, "projects": projects}
+
     @app.get("/api/acp-agents")
     async def _api_acp_agents():
         """The canonical ACP coding-agent catalog (id, label, command, args) — one source
-        for the Delegates picker, the setup wizard, and the agent_runtime options."""
+        for the Delegates picker, the setup wizard, and the agent_runtime options. Includes
+        any user-registered ``acp.agents.<id>`` (custom agents / launch-spec overrides)."""
         from runtime.acp_agents import acp_agent_catalog
 
-        return {"agents": acp_agent_catalog()}
+        extra = getattr(STATE.graph_config, "acp_agents", None) if STATE.graph_config else None
+        return {"agents": acp_agent_catalog(extra)}
 
     # --- Generic settings (schema-driven UI) --------------------------------
     @app.get("/api/settings/schema")
@@ -236,11 +322,18 @@ def register_config_routes(app) -> None:
         ok, err = validate_flat(req.updates)
         if not ok:
             return {"ok": False, "messages": [f"validation: {err}"], "restart_required": []}
-        # Offload off the event loop (#497) — a model change recompiles the graph.
-        ok, messages = await asyncio.to_thread(
-            _apply_settings_changes, config=nest_updates(req.updates), layer=req.layer
+        # Validation + restart-key reporting are this surface's; the apply itself goes through
+        # the shared config.set op (ADR 0075 D2). The op offloads the graph recompile off the
+        # event loop (#497); the live applier is the same _apply_settings_changes as before.
+        from ops import OpContext
+        from ops.config import set_config
+
+        result = await set_config(
+            nest_updates(req.updates),
+            ctx=OpContext.from_state(),
+            apply_settings=lambda u: _apply_settings_changes(config=u, layer=req.layer),
         )
-        return {"ok": ok, "messages": messages, "restart_required": restart_keys(req.updates)}
+        return {"ok": result.ok, "messages": result.messages, "restart_required": restart_keys(req.updates)}
 
     @app.post("/api/settings/reset")
     async def _api_reset_settings(req: SettingsResetRequest):

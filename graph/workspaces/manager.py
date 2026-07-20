@@ -97,6 +97,20 @@ def _read_record(ws: Path) -> dict | None:
         return None
 
 
+def is_workspace_member() -> bool:
+    """True when THIS process runs as a fleet workspace member (ADR 0042): the hub's
+    supervisor spawns members with ``PROTOAGENT_HOME=<ws>``, so a member's instance
+    root IS a workspace dir — and every workspace dir carries its registry record
+    (``workspace.yaml``, written by ``create()``). A hub or standalone instance root
+    never has one, so the record doubles as the read-only "this instance is managed
+    by a host" signal (#1708) with no new state or endpoint. Remote members (ADR
+    0042 §I) are out of scope by design: registration is one-sided on the hub, and a
+    remote is a full independent instance that may legitimately run its own fleet."""
+    from infra.paths import instance_paths
+
+    return _read_record(instance_paths().instance_root) is not None
+
+
 def list_workspaces() -> list[dict]:
     """Every workspace under the root (each dir with a ``workspace.yaml``)."""
     root = workspaces_root()
@@ -218,6 +232,7 @@ def create(
     bundle: str | None = None,
     port: int | None = None,
     shared_skills: bool = False,
+    soul: str | None = None,
 ) -> dict:
     """Scaffold a workspace: its config dir, ``workspace.yaml``, and (with ``bundle``)
     an installed plugin bundle. Does not start it.
@@ -228,6 +243,10 @@ def create(
         secrets popped over (the gateway), so it boots ready-to-chat WITHOUT inheriting its
         plugins/skills. This is the fleet's default "new agent" (a blank agent, model carried).
       * neither — the plain blank template.
+
+    ``soul`` (the picked archetype's base SOUL.md, ADR 0042) is written into the workspace's
+    ``config/SOUL.md`` — the member's live persona — so an agent created from an archetype
+    arrives with its persona, not just its tools. Blank leaves the agent on the default SOUL.
     """
     name = _safe(name)
     if name.lower() in _RESERVED_NAMES:
@@ -265,6 +284,12 @@ def create(
         if shared_skills:
             _stamp_identity(cfg, name, True, instance_id=wid)
 
+    # The archetype persona (ADR 0042) — the member reads its SOUL at <ws>/config/SOUL.md
+    # (instance_root=<ws>), so scaffold it there. Only when non-empty: a blank archetype
+    # (or none) leaves the agent on the default SOUL rather than writing an empty persona.
+    if soul and soul.strip():
+        (cfg_dir / "SOUL.md").write_text(soul, encoding="utf-8")
+
     import yaml
 
     assigned = _pick_port(port)
@@ -292,6 +317,10 @@ def create(
             # per-plugin config defaults (#1350) — a fresh workspace, so nothing to clobber.
             _enable_installed_in_config(cfg, ws / "plugins.lock")
             _apply_bundle_config_defaults(cfg, ws / "plugins.lock")
+            # Seed the bundle's MCP servers (ADR 0083 D5, #2011). Separate from the config
+            # defaults above because `mcp.servers` is a LIST — the dict-leaf overlay can't
+            # merge it — and because its `${input}` placeholders resolve from the env here.
+            _apply_bundle_mcp_servers(cfg, ws / "plugins.lock")
     except Exception:
         shutil.rmtree(ws, ignore_errors=True)
         raise
@@ -377,6 +406,63 @@ def _apply_bundle_config_defaults(cfg: Path, lock: Path) -> dict:
     return overlay
 
 
+def _apply_bundle_mcp_servers(cfg: Path, lock: Path) -> list[str]:
+    """Seed a freshly-installed bundle's ``mcp:`` servers into the workspace config
+    (ADR 0083 D5, #2011). A bundle can carry catalog-shaped MCP templates
+    (``{template, inputs}``); each is resolved against the seed-time environment (an
+    ``${input}`` whose ``env`` var / ``default`` is set is filled in), normalized, and
+    unioned BY NAME into ``mcp.servers`` — a name the config already has always wins, so an
+    operator/template value is never clobbered — with ``mcp.enabled`` flipped on. An entry
+    whose *required* inputs can't be resolved at seed time lands ``enabled: false``: visible
+    in the console MCP panel but inert, so the operator supplies the secret there instead of
+    the agent booting a half-templated server. Best-effort — a malformed lock/config is a
+    no-op. Returns the server names added."""
+    import json
+    import os
+
+    from graph.config_io import load_yaml_doc, save_yaml_doc
+    from graph.mcp_config import resolve_bundle_mcp_item
+
+    try:
+        data = json.loads(lock.read_text()) if lock.exists() else {}
+    except (json.JSONDecodeError, OSError):
+        return []
+    items: list = []
+    for b in data.get("bundles") or []:
+        items += list(b.get("mcp") or [])
+    if not items:
+        return []
+
+    doc = load_yaml_doc(cfg)
+    if not isinstance(doc, dict):
+        return []
+    mcp = doc.setdefault("mcp", {})
+    if not isinstance(mcp, dict):
+        return []
+    servers = mcp.get("servers")
+    servers = list(servers) if isinstance(servers, list) else []
+    have = {s.get("name") for s in servers if isinstance(s, dict)}
+    added: list[str] = []
+    for item in items:
+        try:
+            entry, unresolved = resolve_bundle_mcp_item(item, os.environ)
+        except ValueError:
+            continue  # a malformed template is skipped, never fails the whole create()
+        if entry["name"] in have:
+            continue  # a name already in the config wins — never clobber
+        if unresolved:
+            entry["enabled"] = False  # visible-but-inert until the operator fills the secret
+        servers.append(entry)
+        have.add(entry["name"])
+        added.append(entry["name"])
+    if not added:
+        return []
+    mcp["servers"] = servers
+    mcp["enabled"] = True  # a bundle that ships servers wants MCP on (matches the add route)
+    save_yaml_doc(doc, cfg)
+    return added
+
+
 def _overlay_model(cfg: Path, ws: Path, src: str) -> None:
     """Pop only the ``model:`` section + secrets from another agent's config into this blank one
     — the gateway (provider/api_base/key) carries over so the agent boots ready-to-chat, but its
@@ -416,6 +502,16 @@ def _stamp_identity(cfg: Path, name: str, shared_skills: bool, *, instance_id: s
     save_yaml_doc(doc, cfg)
 
 
+def _server_argv() -> list[str]:
+    """Argv prefix that re-invokes THIS server binary. A source checkout launches
+    ``python -m server``; in the frozen desktop sidecar ``sys.executable`` *is* the
+    server entrypoint, and passing ``-m server`` to it dies at argparse with
+    "unrecognized arguments" — the fleet's created-agents never booted there."""
+    if getattr(sys, "frozen", False):  # PyInstaller sidecar — entrypoint is already `-m server`
+        return [sys.executable]
+    return [sys.executable, "-m", "server"]
+
+
 def _install_bundle_into(ws: Path, bundle: str) -> list[str]:
     """Install a bundle (or plugin) into the workspace via a scoped subprocess —
     ``PROTOAGENT_HOME=<ws>`` makes the workspace the installer's instance root, so
@@ -425,7 +521,7 @@ def _install_bundle_into(ws: Path, bundle: str) -> list[str]:
         "PROTOAGENT_HOME": str(ws),
     }
     proc = subprocess.run(
-        [sys.executable, "-m", "server", "plugin", "install", bundle],
+        [*_server_argv(), "plugin", "install", bundle],
         env=env,
         capture_output=True,
         text=True,
@@ -460,7 +556,7 @@ def run_exec(ident: str, passthrough: list[str]) -> tuple[dict, list[str]]:
         "PROTOAGENT_HOME": str(ws),
         "PROTOAGENT_INSTANCE": str(rec.get("id", ident)),
     }
-    argv = [sys.executable, "-m", "server", "--port", str(rec.get("port", PORT_BASE + 1)), *passthrough]
+    argv = [*_server_argv(), "--port", str(rec.get("port", PORT_BASE + 1)), *passthrough]
     return env, argv
 
 

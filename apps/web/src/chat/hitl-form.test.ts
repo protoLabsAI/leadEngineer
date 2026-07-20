@@ -6,9 +6,12 @@ import {
   fieldsOf,
   hasValue,
   isCardChoice,
+  isFieldVisible,
   isMultiChoice,
   missingInStep,
   optionsOf,
+  seedDefaults,
+  visibleFieldsOf,
 } from "./hitl-form";
 
 const step = (schema: Record<string, unknown>): HitlFormStep => ({ schema });
@@ -109,5 +112,104 @@ describe("missingInStep / anyStepMissing", () => {
   it("gates the final submit until every step is satisfied", () => {
     expect(anyStepMissing([s1, s2], { env: "prod" })).toBe(true); // region still missing
     expect(anyStepMissing([s1, s2], { env: "prod", region: ["eu"] })).toBe(false);
+  });
+
+  it("a `showWhen`-HIDDEN required field never gates (it isn't asked)", () => {
+    const conditional = step({
+      properties: {
+        mode: { type: "string" },
+        detail: { type: "string", showWhen: { field: "mode", equals: "custom" } },
+      },
+      required: ["detail"],
+    });
+    // mode≠custom → `detail` is hidden → not missing, so Submit isn't blocked.
+    expect(missingInStep(conditional, { mode: "auto" })).toEqual([]);
+    // mode=custom → `detail` shows → now required-and-empty blocks.
+    expect(missingInStep(conditional, { mode: "custom" })).toEqual(["detail"]);
+    expect(missingInStep(conditional, { mode: "custom", detail: "x" })).toEqual([]);
+  });
+});
+
+describe("seedDefaults — schema defaults prefill the answers (#1978)", () => {
+  it("seeds every field carrying a default, across ALL steps up front", () => {
+    const s1 = step({
+      properties: {
+        env: { type: "string", default: "staging" },
+        note: { type: "string" }, // no default — stays unanswered
+      },
+    });
+    const s2 = step({ properties: { strategy: { type: "string", default: "rolling" } } });
+    expect(seedDefaults([s1, s2])).toEqual({ env: "staging", strategy: "rolling" });
+  });
+
+  it("keeps falsy defaults (false / 0 / \"\") — only an absent default is skipped", () => {
+    const s = step({
+      properties: {
+        dry_run: { type: "boolean", default: false },
+        retries: { type: "number", default: 0 },
+        prefix: { type: "string", default: "" },
+      },
+    });
+    expect(seedDefaults([s])).toEqual({ dry_run: false, retries: 0, prefix: "" });
+  });
+
+  it("is empty for no steps or steps without defaults", () => {
+    expect(seedDefaults([])).toEqual({});
+    expect(seedDefaults([step({ properties: { env: { type: "string" } } })])).toEqual({});
+  });
+
+  it("a required field's default satisfies the gate — Submit is live untouched", () => {
+    const s = step({
+      properties: { model: { type: "string", default: "protolabs/fast", oneOf: [{ const: "protolabs/fast" }] } },
+      required: ["model"],
+    });
+    const seeded = seedDefaults([s]);
+    expect(missingInStep(s, seeded)).toEqual([]);
+    expect(anyStepMissing([s], seeded)).toBe(false);
+  });
+
+  it("a required field WITHOUT a default still gates as before", () => {
+    const s = step({
+      properties: { env: { type: "string" }, mode: { type: "string", default: "auto" } },
+      required: ["env", "mode"],
+    });
+    expect(missingInStep(s, seedDefaults([s]))).toEqual(["env"]);
+  });
+});
+
+describe("isFieldVisible / visibleFieldsOf — conditional fields (showWhen)", () => {
+  it("no showWhen ⇒ always visible", () => {
+    expect(isFieldVisible({ type: "string" }, {})).toBe(true);
+  });
+
+  it("`equals` shows only on a strict match", () => {
+    const f = { type: "string", showWhen: { field: "kind", equals: "ci" } };
+    expect(isFieldVisible(f, { kind: "ci" })).toBe(true);
+    expect(isFieldVisible(f, { kind: "command" })).toBe(false);
+    expect(isFieldVisible(f, {})).toBe(false);
+  });
+
+  it("`in` shows on membership", () => {
+    const f = { type: "string", showWhen: { field: "kind", in: ["command", "test"] } };
+    expect(isFieldVisible(f, { kind: "test" })).toBe(true);
+    expect(isFieldVisible(f, { kind: "data" })).toBe(false);
+  });
+
+  it("showWhen without equals/in ⇒ sibling must be truthy", () => {
+    const f = { type: "string", showWhen: { field: "on" } };
+    expect(isFieldVisible(f, { on: true })).toBe(true);
+    expect(isFieldVisible(f, { on: "" })).toBe(false);
+  });
+
+  it("visibleFieldsOf drops the hidden fields for the current answers", () => {
+    const s = step({
+      properties: {
+        kind: { type: "string" },
+        cmd: { type: "string", showWhen: { field: "kind", equals: "command" } },
+        pr: { type: "string", showWhen: { field: "kind", equals: "ci" } },
+      },
+    });
+    expect(visibleFieldsOf(s, { kind: "command" }).map(([k]) => k)).toEqual(["kind", "cmd"]);
+    expect(visibleFieldsOf(s, { kind: "ci" }).map(([k]) => k)).toEqual(["kind", "pr"]);
   });
 });

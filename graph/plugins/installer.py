@@ -29,7 +29,7 @@ from pathlib import Path
 
 from infra.paths import instance_paths
 
-from graph.plugins.manifest import PluginManifest, load_manifest
+from graph.plugins.manifest import MANIFEST_FILENAME, PluginManifest, load_manifest
 
 log = logging.getLogger(__name__)
 
@@ -40,10 +40,24 @@ def bundled_plugins_dir() -> Path:
     return instance_paths().app_root / "plugins"
 
 
+def _is_builtin(plugin_id: str) -> bool:
+    """True iff ``plugins/<id>`` is a REAL bundled plugin or bundle — i.e. it holds
+    a manifest (``protoagent.plugin.yaml``) or bundle file (``protoagent.bundle.yaml``),
+    mirroring how the loader (:func:`load_manifest`) decides a directory is a plugin.
+
+    A bare directory is NOT a built-in: a ``__pycache__``-only leftover from a
+    core→standalone extraction (git doesn't track it, so it survives on every
+    machine that ever imported the old plugin) must not block installing or
+    uninstalling the standalone successor of the same id (#1731)."""
+    d = bundled_plugins_dir() / plugin_id
+    return (d / MANIFEST_FILENAME).exists() or (d / BUNDLE_FILENAME).exists()
+
+
 def lock_path() -> Path:
     """The ``plugins.lock`` for THIS instance — ``instance_paths().plugins_lock``
     (honors ``PROTOAGENT_PLUGINS_LOCK``)."""
     return instance_paths().plugins_lock
+
 
 _SHA_RE = re.compile(r"^[0-9a-f]{7,40}$", re.IGNORECASE)
 # A git ref we'll accept from a caller — branch/tag/sha shapes only. Keeps a ref
@@ -75,10 +89,11 @@ def live_plugins_dir() -> Path:
     return instance_paths().plugins_dir
 
 
-def _git(*args: str, cwd: Path | None = None, timeout: float | None = None) -> str:
+def _git(*args: str, cwd: Path | None = None, timeout: float | None = None, env: dict | None = None) -> str:
     proc = subprocess.run(
         ["git", *args],
         cwd=str(cwd) if cwd else None,
+        env=env,  # None ⇒ inherit os.environ (default); a dict carries scoped auth (see _git_auth_env)
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -177,6 +192,7 @@ def _summary(m: PluginManifest, *, source: str, ref: str, sha: str) -> dict:
         "capabilities": m.capabilities,
         "requires_env": m.requires_env,
         "requires_pip": m.requires_pip,
+        "optional_pip": m.optional_pip,
         "min_protoagent_version": m.min_protoagent_version,
         # what it contributes — surfaced in the install review (ADR 0027 D3)
         "contributes": {
@@ -188,18 +204,70 @@ def _summary(m: PluginManifest, *, source: str, ref: str, sha: str) -> dict:
     }
 
 
+def _git_auth_env(url: str) -> dict[str, str]:
+    """Env that hands ``git`` a GitHub auth header for an ``https://github.com/`` URL when a
+    ``GITHUB_TOKEN`` / ``GH_TOKEN`` is set — so a runtime ``plugin install`` of a **private**
+    repo works on the DEFAULT git path (the "git handles private auth" design intent), not only
+    the archive path. Without it a plain ``git clone`` of a private HTTPS repo in a container
+    (no ssh key, no credential helper — just the token env) fails with
+    ``could not read Username for 'https://github.com'``.
+
+    Delivered via ``GIT_CONFIG_*`` env, deliberately:
+    - **not argv** → the token never shows up in ``ps`` (unlike ``-c http.extraheader=…``),
+    - **not the clone's ``.git/config``** → env-config is per-command, so the token never lands
+      on disk in the cloned repo,
+    - **scoped** to ``http.https://github.com/.extraheader`` → the header never rides a redirect
+      to a non-github host.
+
+    SSH / ``git@`` / non-github / no-token → ``{}`` (git's own auth — ssh keys, credential
+    helpers — applies unchanged)."""
+    token = (os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or "").strip()
+    if not token or not url.startswith("https://github.com/"):
+        return {}
+    import base64
+
+    # GitHub accepts Basic ``x-access-token:<token>`` for git-over-HTTPS (the pattern
+    # actions/checkout uses); the archive path uses a Bearer header for the API/codeload.
+    basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+    return {
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader",
+        "GIT_CONFIG_VALUE_0": f"Authorization: Basic {basic}",
+    }
+
+
 def _clone(url: str, ref: str | None, dest: Path) -> str:
-    """Clone ``url`` at ``ref`` into ``dest``; return the resolved commit SHA."""
+    """Clone ``url`` at ``ref`` into ``dest``; return the resolved commit SHA.
+
+    A plain LOCAL path is rewritten to a ``file://`` URL first. Without it git
+    uses its "local transport" — a readdir+copy of the source's ``.git/objects``
+    — which silently ignores ``--depth`` and races anything concurrently writing
+    the source repo: ``git commit`` spawns a DETACHED ``git maintenance run
+    --auto``, and on CI that background maintenance renamed a ``tmp_rev_*`` pack
+    file mid-copy → ``fatal: failed to copy file … No such file or directory``
+    (#1600). ``file://`` forces the regular pack transport (upload-pack streams a
+    fresh pack; nothing enumerates the source's raw object files), which is
+    immune to that race — exactly what git's own warning recommends.
+    ``--no-hardlinks`` stays as the belt for any local-transport clone that
+    slips through (it avoids the older ``hardlink different from source`` race);
+    it's a no-op for the file:// and remote cases."""
+    if url.startswith("/"):
+        url = Path(url).resolve().as_uri()
+    # Authenticate a private github HTTPS clone with the token env (scoped, off-argv, off-disk).
+    # ``None`` for local/ssh/non-github/no-token ⇒ git inherits os.environ unchanged. Only the
+    # network op (clone) needs it; checkout/rev-parse are local.
+    auth = _git_auth_env(url)
+    clone_env = {**os.environ, **auth} if auth else None
     if ref and _SHA_RE.match(ref):
         # A specific commit: full clone (shallow can't reliably check out an
         # arbitrary SHA), then check it out.
-        _git("clone", "--no-recurse-submodules", url, str(dest), timeout=_CLONE_TIMEOUT_S)
+        _git("clone", "--no-hardlinks", "--no-recurse-submodules", url, str(dest), timeout=_CLONE_TIMEOUT_S, env=clone_env)
         _git("checkout", ref, cwd=dest)
     elif ref:
         # A tag or branch: shallow clone of just that ref.
-        _git("clone", "--depth", "1", "--no-recurse-submodules", "--branch", ref, url, str(dest), timeout=_CLONE_TIMEOUT_S)
+        _git("clone", "--depth", "1", "--no-hardlinks", "--no-recurse-submodules", "--branch", ref, url, str(dest), timeout=_CLONE_TIMEOUT_S, env=clone_env)
     else:
-        _git("clone", "--depth", "1", "--no-recurse-submodules", url, str(dest), timeout=_CLONE_TIMEOUT_S)
+        _git("clone", "--depth", "1", "--no-hardlinks", "--no-recurse-submodules", url, str(dest), timeout=_CLONE_TIMEOUT_S, env=clone_env)
     return _git("rev-parse", "HEAD", cwd=dest)
 
 
@@ -208,8 +276,9 @@ def _clone(url: str, ref: str | None, dest: Path) -> str:
 # already discovers + importlib-loads plugins from the live root in frozen mode.
 # So the only gap is *fetching* the code: download a GitHub archive tarball over
 # HTTPS (the bundled httpx) and extract it — an on-disk result identical to a
-# shallow clone. `git` stays the path on a dev/server box (history, ssh, private
-# auth); the archive path is preferred when git is absent or we're frozen.
+# shallow clone. `git` stays the path on a dev/server box (history, ssh, and
+# private auth — over ssh keys / credential helpers, or a github HTTPS token via
+# `_git_auth_env`); the archive path is preferred when git is absent or we're frozen.
 
 _GH_RE = re.compile(r"github\.com[/:]([^/]+)/([^/]+?)(?:\.git)?/?$")
 
@@ -388,25 +457,55 @@ def install(
             )
         pid = manifest.id
 
-        # No silent shadowing of a built-in (repo) plugin.
-        if (bundled_plugins_dir() / pid).exists():
+        # No silent shadowing of a built-in (repo) plugin. A manifest-less ghost
+        # dir (e.g. a __pycache__ leftover) is not a built-in and must not block.
+        if _is_builtin(pid):
             raise InstallError(f"plugin id {pid!r} is a built-in — cannot install over it.")
 
         # Frozen runtime (desktop): no pip — a plugin can only run if its declared
         # deps are already importable in the bundle. Refuse early with a clear
         # message instead of a cryptic enable-time ImportError (ADR 0058 D2).
-        if _frozen_like() and manifest.requires_pip:
-            ok, missing = _deps_satisfied(manifest.requires_pip)
-            if not ok:
-                raise InstallError(
-                    f"{pid!r} needs {', '.join(missing)} which isn't in the desktop runtime — "
-                    f"install it on a server/Docker build instead."
-                )
+        # OPTIONAL deps (#1953) don't gate: the plugin degrades gracefully without
+        # them, so a missing one warns (in the summary + log) and install proceeds.
+        warnings: list[str] = []
+        if _frozen_like():
+            if manifest.requires_pip:
+                ok, missing = _deps_satisfied(manifest.requires_pip)
+                if not ok:
+                    raise InstallError(
+                        f"{pid!r} needs {', '.join(missing)} which isn't in the desktop runtime — "
+                        f"install it on a server/Docker build instead."
+                    )
+            if manifest.optional_pip:
+                _, soft_missing = _deps_satisfied(manifest.optional_pip)
+                if soft_missing:
+                    warn = (
+                        f"optional dep(s) {', '.join(soft_missing)} aren't in the desktop runtime — "
+                        f"installed anyway; the features of {pid!r} that need them degrade until they're available."
+                    )
+                    warnings.append(warn)
+                    log.warning("[plugins] %s: %s", pid, warn)
 
         target = target_root / pid
         if target.exists():
-            if not force:
-                raise InstallError(f"plugin {pid!r} already installed — use --force to replace.")
+            # Re-install from the plugin's OWN recorded origin is a CONVERGE, not a
+            # conflict: same commit → no-op, moved pin/ref → update — so re-running a
+            # bundle install never dies on its own already-installed members. --force
+            # stays the lever for the real conflicts: an id-colliding install from a
+            # DIFFERENT source, or a dir the lock doesn't know (a working-tree /
+            # hand-copied plugin that a git install must not silently clobber).
+            prior = next((e for e in _read_lock().get("plugins") or [] if e.get("id") == pid), None)
+            same_source = prior is not None and prior.get("source_url") == url
+            if not force and not same_source:
+                origin = f"from {prior.get('source_url')!r}" if prior else "untracked (no plugins.lock entry)"
+                raise InstallError(f"plugin {pid!r} already installed — {origin}; use --force to replace.")
+            if not force and same_source and prior.get("resolved_sha") == sha:
+                log.info("[plugins] %s already at %s from %s — up to date", pid, sha[:10], url)
+                summary = _summary(manifest, source=url, ref=ref or "", sha=sha)
+                summary["up_to_date"] = True
+                if warnings:
+                    summary["warnings"] = warnings
+                return summary
             shutil.rmtree(target)
 
         shutil.rmtree(staging / ".git", ignore_errors=True)  # drop git metadata; lock holds provenance
@@ -414,6 +513,8 @@ def install(
         manifest = load_manifest(target) or manifest  # re-read from final path
 
     summary = _summary(manifest, source=url, ref=ref or "", sha=sha)
+    if warnings:
+        summary["warnings"] = warnings
     lock = _read_lock()
     lock["plugins"] = [e for e in lock["plugins"] if e.get("id") != pid]
     lock["plugins"].append(
@@ -514,6 +615,11 @@ def _install_bundle(
             # Cached for the same lock-only consumer; applied as DEFAULTS (operator values
             # win, present keys are never clobbered — see `bundle_config_overlay`).
             "config": dict(bundle.get("config") or {}),
+            # The bundle's MCP servers to seed (ADR 0083 D5, #2011): catalog-shaped
+            # {template, inputs} items. Cached for the lock-only create path, which seeds
+            # them into the workspace's `mcp.servers` via `_apply_bundle_mcp_servers` —
+            # `config:`'s dict-leaf overlay can't merge the `mcp.servers` list.
+            "mcp": list(bundle.get("mcp") or []),
             # Archetype metadata (ADR 0042) cached here so the new-agent picker can offer
             # this bundle as a starter type without re-reading its manifest.
             "archetype": bundle.get("archetype") or {},
@@ -591,14 +697,14 @@ def uninstall(plugin_id: str, *, purge: bool = False) -> dict:
     With ``purge=True`` ALSO removes the plugin's config section + its secrets.
     Built-ins are refused; pip deps are NEVER auto-removed (shared venv) — they're
     returned for the operator to remove. Returns a report dict."""
-    if (bundled_plugins_dir() / plugin_id).exists():
+    if _is_builtin(plugin_id):
         raise InstallError(f"{plugin_id!r} is a built-in plugin — not removable via uninstall.")
     target = live_plugins_dir() / plugin_id
     # Read the manifest BEFORE deleting — purge needs the config section + we report
     # the declared deps.
     manifest = load_manifest(target) if (target / "protoagent.plugin.yaml").exists() else None
     section = (manifest.config_section if manifest else "") or plugin_id
-    deps_left = list(manifest.requires_pip) if manifest else []
+    deps_left = [*manifest.requires_pip, *manifest.optional_pip] if manifest else []
 
     removed: list[str] = []
     if target.exists():
@@ -617,9 +723,30 @@ def uninstall(plugin_id: str, *, purge: bool = False) -> dict:
 
     if not removed:
         raise InstallError(f"plugin {plugin_id!r} is not installed.")
+
+    # Plugin-owned scheduler jobs (#1642): cancel `plugin:<id>:*` so an uninstalled
+    # plugin's recurring cadence can't keep firing prompts about a plugin that's gone.
+    # The loader's disable-sweep can't cover this case — the manifest is gone from
+    # disk. Best-effort: in a CLI process there's no live scheduler (STATE.scheduler
+    # is None → 0); the console uninstall route runs in the live server where it works.
+    try:
+        from graph.sdk import cancel_plugin_jobs
+
+        jobs_cancelled = cancel_plugin_jobs(plugin_id)
+    except Exception:  # noqa: BLE001 — job hygiene must never fail the uninstall
+        jobs_cancelled = 0
+    if jobs_cancelled:
+        removed.append("jobs")
+
     _audit("uninstall", {"id": plugin_id, "purge": purge}, f"uninstalled {plugin_id} ({', '.join(removed)})")
     log.info("[plugins] uninstalled %s (%s)", plugin_id, ", ".join(removed))
-    return {"id": plugin_id, "removed": removed, "deps_left": deps_left, "purged": purge}
+    return {
+        "id": plugin_id,
+        "removed": removed,
+        "deps_left": deps_left,
+        "purged": purge,
+        "jobs_cancelled": jobs_cancelled,
+    }
 
 
 def _validate_pip_specs(plugin_id: str, deps: list[str]) -> None:
@@ -647,7 +774,9 @@ def _validate_pip_specs(plugin_id: str, deps: list[str]) -> None:
 
 def install_deps(plugin_id: str) -> list[str]:
     """Pip-install a plugin's declared ``requires_pip`` — the explicit code-exec
-    step that ``install`` deliberately skips (ADR 0027 D4). Returns the deps."""
+    step that ``install`` deliberately skips (ADR 0027 D4). Optional deps (#1953)
+    ride along best-effort: a failed optional install warns instead of failing
+    the command. Returns the deps actually installed/satisfied."""
     manifest = None
     for base in (live_plugins_dir(), bundled_plugins_dir()):
         if (base / plugin_id / "protoagent.plugin.yaml").exists():
@@ -656,11 +785,13 @@ def install_deps(plugin_id: str) -> list[str]:
     if manifest is None:
         raise InstallError(f"plugin {plugin_id!r} is not installed.")
     deps = list(manifest.requires_pip)
-    if not deps:
+    optional = list(manifest.optional_pip)
+    if not deps and not optional:
         return []
-    _validate_pip_specs(plugin_id, deps)
-    # Frozen runtime (desktop): no pip. The deps must already be bundled — confirm
-    # (nothing to install) or refuse with a clear message (ADR 0058 D2).
+    _validate_pip_specs(plugin_id, [*deps, *optional])
+    # Frozen runtime (desktop): no pip. The HARD deps must already be bundled —
+    # confirm (nothing to install) or refuse with a clear message (ADR 0058 D2).
+    # A missing OPTIONAL dep only warns: the plugin degrades without it (#1953).
     if _frozen_like():
         ok, missing = _deps_satisfied(deps)
         if not ok:
@@ -668,19 +799,48 @@ def install_deps(plugin_id: str) -> list[str]:
                 f"{plugin_id!r} needs {', '.join(missing)} which isn't in the desktop runtime — "
                 f"install it on a server/Docker build instead."
             )
+        _, soft_missing = _deps_satisfied(optional)
+        if soft_missing:
+            log.warning(
+                "[plugins] %s: optional dep(s) %s aren't in the desktop runtime — the plugin degrades without them",
+                plugin_id,
+                ", ".join(soft_missing),
+            )
         log.info("[plugins] %s deps already in the runtime — nothing to install", plugin_id)
-        return deps
-    proc = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--", *deps],
-        capture_output=True,
-        text=True,
-    )
-    if proc.returncode != 0:
-        _audit("install_deps", {"id": plugin_id, "deps": deps}, "pip install failed", success=False)
-        raise InstallError(f"pip install failed: {(proc.stderr or proc.stdout).strip()[-400:]}")
-    _audit("install_deps", {"id": plugin_id, "deps": deps}, f"installed {len(deps)} dep(s)")
-    log.info("[plugins] installed %d dep(s) for %s", len(deps), plugin_id)
-    return deps
+        return deps + [d for d in optional if _dep_pkg_name(d) not in soft_missing]
+    installed: list[str] = []
+    if deps:
+        proc = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--", *deps],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            _audit("install_deps", {"id": plugin_id, "deps": deps}, "pip install failed", success=False)
+            raise InstallError(f"pip install failed: {(proc.stderr or proc.stdout).strip()[-400:]}")
+        installed += deps
+    if optional:
+        # Best-effort (#1953): the plugin runs without these, so a failure is
+        # audited + warned, never fatal — the hard deps above already landed.
+        proc = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--", *optional],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            _audit(
+                "install_deps", {"id": plugin_id, "optional": optional}, "optional pip install failed", success=False
+            )
+            log.warning(
+                "[plugins] %s: optional dep install failed (continuing without): %s",
+                plugin_id,
+                (proc.stderr or proc.stdout).strip()[-400:],
+            )
+        else:
+            installed += optional
+    _audit("install_deps", {"id": plugin_id, "deps": installed}, f"installed {len(installed)} dep(s)")
+    log.info("[plugins] installed %d dep(s) for %s", len(installed), plugin_id)
+    return installed
 
 
 def list_installed() -> list[dict]:
@@ -760,7 +920,11 @@ def _ls_remote_sha(source_url: str, ref: str) -> str:
     # `<ref>^{}` too and prefer it; branches/HEAD/lightweight tags simply don't
     # match the peeled refspec and fall back to the bare line.
     refspecs = [ref, ref + "^{}"] if ref else ["HEAD"]
-    out = _git("ls-remote", source_url, *refspecs, timeout=_LSREMOTE_TIMEOUT_S)
+    # Authenticate the update-check for a PRIVATE github repo (#1805 parity — that fix covered
+    # the clone/install path; a plain `git ls-remote` of a private repo still failed auth here,
+    # surfacing as "check failed" in the plugins panel). Scoped/off-argv/off-disk via GIT_CONFIG_*.
+    _auth = _git_auth_env(source_url)
+    out = _git("ls-remote", source_url, *refspecs, timeout=_LSREMOTE_TIMEOUT_S, env={**os.environ, **_auth} if _auth else None)
     sha = peeled = ""
     for line in out.splitlines():
         parts = line.split("\t")
@@ -775,12 +939,65 @@ def _ls_remote_sha(source_url: str, ref: str) -> str:
     return sha
 
 
+# A release tag per the ADR 0049 pin lifecycle — `v1.2.3` / `1.2.3`. Prereleases and
+# anything fancier deliberately don't match (they fall back to the moving-ref compare).
+_SEMVER_TAG_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
+
+
+def _semver_key(tag: str) -> tuple[int, int, int] | None:
+    """``(major, minor, patch)`` for a release tag, or ``None`` if not one."""
+    m = _SEMVER_TAG_RE.match((tag or "").strip())
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
+
+
+def is_release_tag(ref: str) -> bool:
+    """True when ``ref`` is a semver release tag (``v1.2.3`` / ``1.2.3``) — the pin
+    shape whose update moves tag → NEWER tag instead of re-fetching the same ref."""
+    return _semver_key(ref) is not None
+
+
+# `git ls-remote --tags` cache — same TTL/timeout regime as _lsremote_cache, its own
+# dict because the value is a {tag: sha} map, not a single sha.
+_lstags_cache: dict[str, tuple[float, dict[str, str]]] = {}
+
+
+def _ls_remote_tags(source_url: str) -> dict[str, str]:
+    """``{tag: commit_sha}`` for every tag at ``source_url`` (TTL-cached, one
+    timeout-bounded ``ls-remote --tags``). An annotated tag lists twice — the bare
+    ref (tag-object SHA) and the peeled ``<ref>^{}`` (commit SHA); the peeled one
+    wins, mirroring _ls_remote_sha's compare semantics (ADR 0049)."""
+    now = time.monotonic()
+    hit = _lstags_cache.get(source_url)
+    if hit is not None and (now - hit[0]) < _LSREMOTE_TTL_S:
+        return hit[1]
+    _auth = _git_auth_env(source_url)  # authenticate the update-check for a private github repo (#1805 parity)
+    out = _git("ls-remote", "--tags", source_url, timeout=_LSREMOTE_TIMEOUT_S, env={**os.environ, **_auth} if _auth else None)
+    tags: dict[str, str] = {}
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 2 or not parts[0].strip():
+            continue
+        sha, ref = parts[0].strip(), parts[1].strip()
+        if not ref.startswith("refs/tags/"):
+            continue
+        name = ref[len("refs/tags/") :]
+        if name.endswith("^{}"):
+            tags[name[:-3]] = sha  # peeled commit — overwrite the tag-object sha
+        else:
+            tags.setdefault(name, sha)
+    _lstags_cache[source_url] = (now, tags)
+    return tags
+
+
 def check_plugin_update(entry: dict) -> dict:
     """Update status for one ``plugins.lock`` entry. A *pinned* plugin (its
     ``requested_ref`` is a full/abbrev commit SHA per ``_SHA_RE``) never
-    auto-updates — we skip the network call entirely. Otherwise compare the
-    stored ``resolved_sha`` against the latest remote SHA for its ref. Any
-    network/timeout/lookup failure is reported in ``error`` (non-fatal)."""
+    auto-updates — we skip the network call entirely. A RELEASE-TAG ref
+    (``vX.Y.Z``) is immutable, so "behind" there means a NEWER semver tag exists
+    on the remote (reported as ``latest_ref`` — the pin-lifecycle signal, ADR
+    0049) — with a moved-tag compare as the fallback. Any other ref compares the
+    stored ``resolved_sha`` against the latest remote SHA. Any network/timeout/
+    lookup failure is reported in ``error`` (non-fatal)."""
     pid = entry.get("id", "")
     source_url = entry.get("source_url", "")
     requested_ref = entry.get("requested_ref", "") or ""
@@ -793,6 +1010,7 @@ def check_plugin_update(entry: dict) -> dict:
         "requested_ref": requested_ref,
         "current_sha": current_sha,
         "latest_sha": None,
+        "latest_ref": None,
         "behind": False,
         "pinned": pinned,
         "error": None,
@@ -802,8 +1020,24 @@ def check_plugin_update(entry: dict) -> dict:
             result["error"] = "no source_url recorded — cannot check for updates"
         return result
 
+    tag_key = _semver_key(requested_ref)
     try:
-        latest = _ls_remote_sha(source_url, requested_ref)
+        if tag_key is not None:
+            tags = _ls_remote_tags(source_url)
+            newest_key, newest = tag_key, None
+            for name, sha in tags.items():
+                k = _semver_key(name)
+                if k is not None and k > newest_key:
+                    newest_key, newest = k, (name, sha)
+            if newest is not None:
+                result["latest_ref"], result["latest_sha"] = newest
+                result["behind"] = True
+                return result
+            # No newer release — fall through to the moved-tag compare: the SAME
+            # tag re-pointed at a different commit still counts as behind.
+            latest = tags.get(requested_ref, "")
+        else:
+            latest = _ls_remote_sha(source_url, requested_ref)
     except subprocess.TimeoutExpired:
         result["error"] = f"ls-remote timed out after {_LSREMOTE_TIMEOUT_S:.0f}s"
         return result

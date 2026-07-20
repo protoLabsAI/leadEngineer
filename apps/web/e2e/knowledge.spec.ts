@@ -51,3 +51,89 @@ test("layered knowledge shows tier badges and shares / unshares the commons", as
   await dialog.getByRole("button", { name: "Unshare", exact: true }).click();
   await expect(surface.getByLabel("unshare entry 11", { exact: true })).toHaveCount(0);
 });
+
+test("Shift+click deletes a chunk immediately, plain click still confirms (#1582)", async ({ page }) => {
+  await page.goto("/app/", { waitUntil: "load" });
+  await page.getByRole("button", { name: "Knowledge" }).click();
+  const surface = page.getByTestId("knowledge-store");
+  await expect(surface).toBeVisible();
+
+  const del12 = surface.getByLabel("delete entry 12", { exact: true });
+  await expect(del12).toBeVisible();
+
+  // Plain click → the confirmation dialog (safe path preserved). Back out; chunk stays.
+  await del12.click();
+  const confirm = page.getByRole("dialog", { name: "Delete this knowledge entry?" });
+  await expect(confirm).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(confirm).toHaveCount(0);
+  await expect(del12).toBeVisible();
+
+  // Shift+click → no dialog, chunk removed immediately (chat-tab quick-delete parity).
+  await del12.click({ modifiers: ["Shift"] });
+  await expect(page.getByRole("dialog", { name: "Delete this knowledge entry?" })).toHaveCount(0);
+  await expect(surface.getByLabel("delete entry 12", { exact: true })).toHaveCount(0);
+});
+
+test("groups a multi-chunk source into a collapsible section (#1575)", async ({ page }) => {
+  await page.goto("/app/", { waitUntil: "load" });
+  await page.getByRole("button", { name: "Knowledge" }).click();
+  const surface = page.getByTestId("knowledge-store");
+  await expect(surface).toBeVisible();
+
+  // The 3-chunk YouTube source collapses under one header (title + count), closed by default.
+  // Anchor to the start so the group's toggle (name begins with the source) is picked, not the
+  // sibling bulk-delete button (name begins "delete all chunks from …", #1770).
+  const header = surface.getByRole("button", { name: /^Hiking with Kevin/ });
+  await expect(header).toBeVisible();
+  await expect(header).toContainText("3 chunks");
+  await expect(header).toHaveAttribute("aria-expanded", "false");
+  await expect(surface.getByText("Switchbacks keep the grade walkable.")).toHaveCount(0); // hidden while collapsed
+
+  // Loose chunks (single/no source) still render flat — no regression.
+  await expect(surface.getByText("Releases are cut manually via workflow_dispatch.")).toBeVisible();
+
+  // Clicking the header expands it → the chunks render; clicking again collapses.
+  await header.click();
+  await expect(header).toHaveAttribute("aria-expanded", "true");
+  await expect(surface.getByText("Switchbacks keep the grade walkable.")).toBeVisible();
+  await expect(surface.getByText("The summit view pays off the climb.")).toBeVisible();
+  await header.click();
+  await expect(surface.getByText("Switchbacks keep the grade walkable.")).toHaveCount(0);
+});
+
+test("bulk-deletes a whole source with a counted confirm, and Undo restores it (#1770)", async ({ page }) => {
+  await page.goto("/app/", { waitUntil: "load" });
+  await page.getByRole("button", { name: "Knowledge" }).click();
+  const surface = page.getByTestId("knowledge-store");
+  await expect(surface).toBeVisible();
+
+  // The 3-chunk YouTube source renders as one group with a bulk-delete button.
+  // Anchor to the start so this matches the toggle, not the "delete all chunks from …" button.
+  const groupHeader = () => surface.getByRole("button", { name: /^Hiking with Kevin/ });
+  await expect(groupHeader()).toContainText("3 chunks");
+  const bulkDel = surface.getByLabel("delete all chunks from Hiking with Kevin — Christina Mariani", {
+    exact: true,
+  });
+  await expect(bulkDel).toBeVisible();
+  await bulkDel.click();
+
+  // AC3: a confirmation dialog warns with the count of chunks to be deleted.
+  const dialog = page.getByRole("dialog", { name: "Delete all chunks from this source?" });
+  await expect(dialog).toBeVisible();
+  await expect(dialog).toContainText("Delete all 3 chunks");
+  await dialog.getByRole("button", { name: "Delete chunks", exact: true }).click();
+
+  // The whole group leaves the list in one operation (AC1/AC2).
+  await expect(groupHeader()).toHaveCount(0);
+
+  // AC4: deletion is reversible — Undo from the toast restores every chunk.
+  const toast = page.locator(".pl-toast").filter({ hasText: "Deleted 3 chunks" });
+  await expect(toast).toBeVisible();
+  await toast.getByRole("button", { name: "Undo", exact: true }).click();
+  await expect(groupHeader()).toBeVisible();
+  await expect(groupHeader()).toContainText("3 chunks");
+
+  // AC5: single-chunk delete is untouched — the loose chunk still has its own control.
+  await expect(surface.getByLabel("delete entry 12", { exact: true })).toBeVisible();
+});

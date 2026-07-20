@@ -112,6 +112,106 @@ def test_chunk_crud_disabled_without_store(monkeypatch):
     assert c.delete("/api/knowledge/chunks/1").json() == {"enabled": False, "deleted": False}
 
 
+# ── bulk delete/restore by source (reversible soft delete, #1770) ─────────────
+class _SourceKS:
+    """Backend double for the bulk delete-by-source lifecycle: soft
+    invalidate/restore by source + the opportunistic grace sweep."""
+
+    def __init__(self, *, invalidated=3, restored=3):
+        self.invalidated = invalidated
+        self.restored = restored
+        self.invalidate_calls: list[str] = []
+        self.restore_calls: list[str] = []
+        self.purge_calls: list[int] = []
+        self.purge_returns = 0
+
+    def invalidate_by_source(self, source):
+        self.invalidate_calls.append(source)
+        return self.invalidated
+
+    def restore_by_source(self, source):
+        self.restore_calls.append(source)
+        return self.restored
+
+    def purge_invalidated(self, older_than_seconds=0):
+        self.purge_calls.append(older_than_seconds)
+        return self.purge_returns
+
+
+def test_delete_by_source_soft_deletes_and_sweeps(monkeypatch):
+    ks = _SourceKS(invalidated=3)
+    c = _client(monkeypatch, knowledge=ks)
+    body = c.post("/api/knowledge/delete-by-source", json={"source": "Hiking with Kevin"}).json()
+    assert body == {"enabled": True, "deleted": 3}
+    assert ks.invalidate_calls == ["Hiking with Kevin"]
+    # The opportunistic grace sweep ran with a positive recovery window before the
+    # invalidate (AC4 — past-grace rows become permanent).
+    assert ks.purge_calls and ks.purge_calls[0] > 0
+
+
+def test_restore_by_source(monkeypatch):
+    ks = _SourceKS(restored=3)
+    c = _client(monkeypatch, knowledge=ks)
+    body = c.post("/api/knowledge/restore-by-source", json={"source": "Hiking with Kevin"}).json()
+    assert body == {"enabled": True, "restored": 3}
+    assert ks.restore_calls == ["Hiking with Kevin"]
+
+
+def test_delete_by_source_requires_source(monkeypatch):
+    c = _client(monkeypatch, knowledge=_SourceKS())
+    assert c.post("/api/knowledge/delete-by-source", json={"source": "   "}).status_code == 400
+    assert c.post("/api/knowledge/restore-by-source", json={}).status_code == 400
+
+
+def test_delete_by_source_disabled_without_store(monkeypatch):
+    c = _client(monkeypatch)
+    assert c.post("/api/knowledge/delete-by-source", json={"source": "x"}).json() == {
+        "enabled": False,
+        "deleted": 0,
+    }
+    assert c.post("/api/knowledge/restore-by-source", json={"source": "x"}).json() == {
+        "enabled": False,
+        "restored": 0,
+    }
+
+
+def test_delete_by_source_backend_without_capability_no_ops(monkeypatch):
+    """A plugin backend that never implemented the lifecycle degrades to a 0-count
+    hint instead of 500ing (getattr guard, mirrors purge_domain)."""
+    c = _client(monkeypatch, knowledge=_CrudKS())  # only add/delete_by_id
+    d = c.post("/api/knowledge/delete-by-source", json={"source": "x"}).json()
+    assert d["enabled"] is True and d["deleted"] == 0 and "error" in d
+    r = c.post("/api/knowledge/restore-by-source", json={"source": "x"}).json()
+    assert r["enabled"] is True and r["restored"] == 0 and "error" in r
+
+
+def test_delete_by_source_end_to_end_on_real_store(monkeypatch, tmp_path):
+    """The real KnowledgeStore: a bulk delete hides the whole source from browse,
+    and restore brings every chunk back — the console's optimistic-remove + Undo."""
+    from knowledge.store import KnowledgeStore
+
+    store = KnowledgeStore(str(tmp_path / "k.db"))
+    for i in range(3):
+        store.add_chunk(f"hiking tip {i}", domain="media", source="Hiking with Kevin")
+    store.add_chunk("unrelated fact", domain="general", source="daily-log")
+    c = _client(monkeypatch, knowledge=store)
+
+    assert c.post("/api/knowledge/delete-by-source", json={"source": "Hiking with Kevin"}).json() == {
+        "enabled": True,
+        "deleted": 3,
+    }
+    rows = c.get("/api/knowledge/search?q=").json()["results"]
+    sources = [r["source"] for r in rows]
+    assert "Hiking with Kevin" not in sources and "daily-log" in sources  # only the group left recall
+
+    assert c.post("/api/knowledge/restore-by-source", json={"source": "Hiking with Kevin"}).json() == {
+        "enabled": True,
+        "restored": 3,
+    }
+    rows = c.get("/api/knowledge/search?q=").json()["results"]
+    assert sum(1 for r in rows if r["source"] == "Hiking with Kevin") == 3  # all back
+
+
 def test_playbooks_sorted_pinned_first(monkeypatch):
     class _SK:
         def all_skills(self):
@@ -275,6 +375,77 @@ def test_ingest_audio_without_transcribe_model_returns_501(monkeypatch):
     c = _client(monkeypatch, knowledge=_IngestKS())
     files = {"file": ("clip.mp3", b"\x00\x01audio", "audio/mpeg")}
     assert c.post("/api/knowledge/ingest", files=files).status_code == 501
+
+
+# ── ingest preview (/api/knowledge/ingest/preview) — dry-run, persists nothing ─
+def test_ingest_preview_text_persists_nothing(monkeypatch):
+    ks = _IngestKS()
+    c = _client(monkeypatch, knowledge=ks)
+    body = c.post(
+        "/api/knowledge/ingest/preview", data={"text": "a pasted note body", "title": "My Note"}
+    ).json()
+    assert body["enabled"] is True
+    assert body["chunks"] == 1 and body["chars"] == len("a pasted note body")
+    assert body["approx_tokens"] >= 1
+    assert body["source_type"] == "text" and body["title"] == "My Note"
+    assert body["snippet"] == "a pasted note body" and body["truncated"] is False
+    # The whole point: preview writes nothing to the store.
+    assert ks.docs == []
+
+
+def test_ingest_preview_file_upload_no_persist(monkeypatch):
+    ks = _IngestKS()
+    c = _client(monkeypatch, knowledge=ks)
+    files = {"file": ("notes.md", b"# Heading\n\nsome body text", "text/markdown")}
+    body = c.post("/api/knowledge/ingest/preview", files=files).json()
+    assert body["enabled"] is True and body["source_type"] == "markdown"
+    assert body["source"] == "notes.md" and "some body text" in body["snippet"]
+    assert ks.docs == []
+
+
+def test_ingest_preview_url_no_persist(monkeypatch):
+    import ingestion
+    from ingestion import ExtractResult
+
+    monkeypatch.setattr(
+        ingestion,
+        "extract_url",
+        lambda u, **kw: ExtractResult(text="fetched article body", title="Article", source_type="html"),
+    )
+    ks = _IngestKS()
+    c = _client(monkeypatch, knowledge=ks)
+    body = c.post("/api/knowledge/ingest/preview", data={"url": "https://example.com/post"}).json()
+    assert body["enabled"] is True and body["source_type"] == "html"
+    assert body["source"] == "https://example.com/post" and body["title"] == "Article"
+    assert ks.docs == []
+
+
+def test_ingest_preview_counts_multiple_chunks(monkeypatch):
+    """A long document previews the same multi-chunk count ingestion would produce
+    (chunker defaults when the store double exposes no knobs)."""
+    ks = _IngestKS()
+    c = _client(monkeypatch, knowledge=ks)
+    long_text = " ".join(f"word{i}" for i in range(1200))  # well over the 1200-char default
+    body = c.post("/api/knowledge/ingest/preview", data={"text": long_text}).json()
+    assert body["chunks"] > 1
+    assert body["truncated"] is True and len(body["snippet"]) == 1500
+    assert ks.docs == []
+
+
+def test_ingest_preview_requires_a_source(monkeypatch):
+    c = _client(monkeypatch, knowledge=_IngestKS())
+    assert c.post("/api/knowledge/ingest/preview", data={}).status_code == 400
+
+
+def test_ingest_preview_unsupported_type_returns_415(monkeypatch):
+    c = _client(monkeypatch, knowledge=_IngestKS())
+    files = {"file": ("blob.bin", b"\x00\x01\x02\x03", "application/octet-stream")}
+    assert c.post("/api/knowledge/ingest/preview", files=files).status_code == 415
+
+
+def test_ingest_preview_disabled_when_store_off(monkeypatch):
+    c = _client(monkeypatch)  # no knowledge store
+    assert c.post("/api/knowledge/ingest/preview", data={"text": "x"}).json() == {"enabled": False}
 
 
 # ── chat attachments (/api/knowledge/attach) — tiered, session-scoped ─────────

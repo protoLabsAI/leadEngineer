@@ -82,13 +82,15 @@ def test_create_embed_fn_sends_raw_strings(monkeypatch):
     assert captured.get("check_embedding_ctx_length") is False
 
 
-def test_store_is_hybrid_by_default(tmp_path):
-    # knowledge.embeddings defaults on (ADR 0021); the config helper here mirrors it.
+def test_store_is_keyword_only_by_default(tmp_path):
+    # knowledge.embeddings ships OFF (#1681): out of the box the app must not
+    # depend on an optional gateway route — a dead embedding model froze every
+    # turn's recall. Semantic recall is the operator's opt-in.
     cfg = LangGraphConfig()
     cfg.knowledge_db_path = str(tmp_path / "kb.db")
     cfg.api_base, cfg.api_key = "http://gateway.test/v1", "k"
-    assert cfg.knowledge_embeddings is True
-    assert type(server._build_knowledge_store(cfg)).__name__ == "HybridKnowledgeStore"
+    assert cfg.knowledge_embeddings is False
+    assert type(server._build_knowledge_store(cfg)).__name__ == "KnowledgeStore"
 
 
 def test_store_is_keyword_when_embeddings_off(tmp_path):
@@ -161,39 +163,36 @@ def test_create_transcribe_fn_none_without_model():
     assert create_transcribe_fn(cfg) is None
 
 
-def test_create_transcribe_fn_posts_audio_to_gateway(monkeypatch):
+def test_create_transcribe_fn_posts_audio_via_the_shared_gateway_client(monkeypatch):
+    # Transcription rides the shared gateway client (#1931) — same base_url/bearer/
+    # allowlisted-UA wiring any plugin gets, with the transcribe-specific timeout.
     import httpx
+
+    from graph import llm
 
     captured = {}
 
-    class _Resp:
-        def raise_for_status(self):
-            pass
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["ua"] = request.headers.get("user-agent")
+        captured["auth"] = request.headers.get("authorization")
+        captured["body"] = request.read()
+        return httpx.Response(200, json={"text": "  hello from whisper  "})
 
-        def json(self):
-            return {"text": "  hello from whisper  "}
+    real = llm.gateway_sync_client
 
-    class _Client:
-        def __init__(self, **kw):
-            pass
+    def spy(config, **kw):
+        captured["timeout"] = kw.get("timeout")
+        return real(config, transport=httpx.MockTransport(handler), **kw)
 
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-        def post(self, url, headers=None, data=None, files=None):
-            captured.update(url=url, headers=headers, data=data, files=files)
-            return _Resp()
-
-    monkeypatch.setattr(httpx, "Client", _Client)
+    monkeypatch.setattr(llm, "gateway_sync_client", spy)
     cfg = LangGraphConfig()
     cfg.api_base, cfg.api_key, cfg.transcribe_model = "http://gw.test/v1", "k", "whisper-1"
     fn = create_transcribe_fn(cfg)
     out = fn(b"audio-bytes", "clip.mp3")
     assert out == "hello from whisper"  # stripped
     assert captured["url"] == "http://gw.test/v1/audio/transcriptions"
-    assert captured["data"] == {"model": "whisper-1"}
-    assert captured["files"]["file"][0] == "clip.mp3"
-    assert captured["headers"]["Authorization"] == "Bearer k"
+    assert captured["ua"] == llm._GATEWAY_UA  # the WAF-allowlisted UA, from the client
+    assert captured["auth"] == "Bearer k"
+    assert captured["timeout"] == llm._TRANSCRIBE_TIMEOUT_S
+    assert b"whisper-1" in captured["body"] and b"clip.mp3" in captured["body"]  # multipart form

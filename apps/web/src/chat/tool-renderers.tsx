@@ -1,7 +1,10 @@
-import { AlertTriangle, ExternalLink } from "lucide-react";
+import { AlertTriangle, ExternalLink, Hourglass, Image as ImageIcon } from "lucide-react";
 import type { ReactNode } from "react";
 
 import { Badge } from "@protolabsai/ui/primitives";
+
+import { parseMultimodalEnvelope, type MultimodalEnvelope } from "./multimodalEnvelope";
+import { humanizeSeconds, parseWaitInput, summarizeThen, type WaitInfo } from "./waitInfo";
 
 // Renders a tool's input/output as real components instead of a raw JSON blob.
 //
@@ -36,16 +39,40 @@ export function ToolValue({
   raw,
   role,
   tool,
+  input,
 }: {
   raw: string;
   role: "input" | "output";
   tool: string;
+  /** The call's input-args preview, for output renderers that need BOTH sides (the `wait`
+   *  waiting state derives duration/resume-plan from the args, #1914). Optional so the
+   *  input-role call sites and older callers are untouched. */
+  input?: string;
 }) {
   const text = raw ?? "";
 
-  // Tool errors render uniformly regardless of which tool produced them.
+  // Multimodal envelope (#1947): a sentinel-prefixed JSON whose images[] carry base64.
+  // Checked FIRST for outputs — the choke point — so no error/per-tool/JSON renderer ever
+  // sees the sentinel; the expander shows the text part + an image-count note, never the
+  // raw envelope.
+  if (role === "output") {
+    const mm = parseMultimodalEnvelope(text);
+    if (mm) return <MultimodalBlock env={mm} />;
+  }
+  // Tool errors render uniformly regardless of which tool produced them. (This also keeps a
+  // FAILED `wait` — "Error: couldn't schedule the wake-up" — on the error path, not the
+  // waiting block below.)
   if (role === "output" && /^error\b/i.test(text.trim())) {
     return <ErrorBlock text={text} />;
+  }
+  // `wait` (#1914): the agent yielded ON PURPOSE and scheduled its own resume — say so,
+  // instead of a generic success string the user can't act on. Derived from the INPUT args
+  // (`{seconds, then}`), the structured side of the call; the output string stays untouched
+  // server-side. An unparseable args preview (800-char truncation, mid-stream) falls through
+  // to the plain render.
+  if (role === "output" && tool === "wait") {
+    const info = parseWaitInput(input);
+    if (info) return <WaitBlock info={info} />;
   }
   // Tool-specific output renderers (known starter-tool formats).
   if (role === "output") {
@@ -130,6 +157,57 @@ function linkify(text: string): ReactNode[] {
 
 function TextBlock({ text }: { text: string }) {
   return <div className="tool-text">{linkify(text)}</div>;
+}
+
+/** Multimodal tool result (#1947): the envelope's text + an image-count note. When the
+ *  server's 800-char preview cut the envelope, the count is unknowable (null) and — if even
+ *  the text was cut — the note alone stands in as a generic label. */
+function MultimodalBlock({ env }: { env: MultimodalEnvelope }) {
+  const note =
+    env.imageCount === null
+      ? env.text
+        ? "images attached (preview truncated)"
+        : "multimodal tool result (preview truncated)"
+      : env.imageCount > 0
+        ? `${env.imageCount} image${env.imageCount === 1 ? "" : "s"} attached`
+        : null;
+  return (
+    <div className="tool-multimodal">
+      {env.text ? <TextBlock text={env.text} /> : null}
+      {note ? (
+        <span className="tool-multimodal-note">
+          <ImageIcon size={12} />
+          {note}
+        </span>
+      ) : null}
+    </div>
+  );
+}
+
+/** Waiting state for a successful `wait` (#1914): the agent ended its turn deliberately and
+ *  will resume itself. Distinct hourglass presentation (not the generic success check), the
+ *  humanized duration, a one-line summary of the resume plan, and the reassurance that the
+ *  chat stays usable. Static by design — no ticking countdown (that would need new state
+ *  plumbing for a card that is usually collapsed anyway). */
+function WaitBlock({ info }: { info: WaitInfo }) {
+  return (
+    <div className="tool-wait">
+      <div className="tool-wait-head">
+        <Hourglass size={13} />
+        <span>
+          Waiting ~{humanizeSeconds(info.seconds)} — the agent yielded and will resume itself
+        </span>
+      </div>
+      {info.then ? (
+        <div className="tool-wait-then">
+          Resumes with: <span className="tool-wait-plan">{summarizeThen(info.then)}</span>
+        </div>
+      ) : null}
+      <div className="tool-wait-hint">
+        You can keep chatting — the agent picks this up automatically.
+      </div>
+    </div>
+  );
 }
 
 function ErrorBlock({ text }: { text: string }) {

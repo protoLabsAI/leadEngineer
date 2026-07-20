@@ -57,6 +57,242 @@ def test_manifest_parse(tmp_path) -> None:
     assert load_manifest(tmp_path / "bad") is None  # missing id
 
 
+# --- Optional dep tier (#1953) — `requires_pip:` entries may be {pkg, optional} ---
+
+
+def test_requires_pip_plain_list_unchanged(tmp_path) -> None:
+    # Today's names-only form keeps working verbatim — all hard, no optional tier.
+    _make_plugin(tmp_path, "rp0", manifest_extra='requires_pip: ["httpx>=0.27", "rich"]\n')
+    m = load_manifest(tmp_path / "rp0")
+    assert m.requires_pip == ["httpx>=0.27", "rich"]
+    assert m.optional_pip == []
+
+
+def test_requires_pip_optional_entries(tmp_path) -> None:
+    # Dict entries route on the `optional` flag; a dict without it (or with
+    # optional: false) is just a hard dep spelled long-form.
+    _make_plugin(
+        tmp_path, "rp1",
+        manifest_extra=(
+            "requires_pip:\n"
+            '  - "httpx>=0.27"\n'
+            '  - { pkg: "pillow>=10", optional: true }\n'
+            '  - { pkg: "rich", optional: false }\n'
+            '  - { pkg: "numpy" }\n'
+        ),
+    )
+    m = load_manifest(tmp_path / "rp1")
+    assert m.requires_pip == ["httpx>=0.27", "rich", "numpy"]
+    assert m.optional_pip == ["pillow>=10"]
+
+
+def test_requires_pip_malformed_entries_warn_not_fail(tmp_path, caplog) -> None:
+    # A dict without a usable pkg is skipped with a warning; the load never fails.
+    import logging as _logging
+
+    _make_plugin(
+        tmp_path, "rp2",
+        manifest_extra=(
+            "requires_pip:\n"
+            "  - { optional: true }\n"          # no pkg → skipped
+            '  - { pkg: "", optional: true }\n'  # empty pkg → skipped
+            '  - "httpx>=0.27"\n'
+        ),
+    )
+    with caplog.at_level(_logging.WARNING, logger="protoagent.plugins"):
+        m = load_manifest(tmp_path / "rp2")
+    assert m is not None
+    assert m.requires_pip == ["httpx>=0.27"]
+    assert m.optional_pip == []
+    assert "has no 'pkg'" in caplog.text
+
+
+# --- Typed event contracts (#1636) — `emits:` entries may carry a payload schema ---
+
+
+def test_emits_bare_strings_unchanged(tmp_path) -> None:
+    # Today's names-only form keeps working verbatim — no contract map.
+    _make_plugin(tmp_path, "ev0", enabled=True, manifest_extra='emits: ["ev0.created", "ev0.closed"]\n')
+    m = load_manifest(tmp_path / "ev0")
+    assert m.emits == ["ev0.created", "ev0.closed"]
+    assert m.emits_schemas == {}
+
+
+def test_emits_inline_schema(tmp_path) -> None:
+    # A dict entry contributes its topic to the names list AND its declared
+    # summary/schema to the contract map; bare siblings stay names-only.
+    _make_plugin(
+        tmp_path, "ev1", enabled=True,
+        manifest_extra=(
+            "emits:\n"
+            "  - ev1.plain\n"
+            "  - topic: ev1.trade_executed\n"
+            "    summary: A hauler completed a buy-sell leg\n"
+            "    schema:\n"
+            "      type: object\n"
+            "      required: [route, profit]\n"
+            "      properties:\n"
+            "        route: {type: string}\n"
+            "        profit: {type: integer}\n"
+        ),
+    )
+    m = load_manifest(tmp_path / "ev1")
+    assert m.emits == ["ev1.plain", "ev1.trade_executed"]
+    contract = m.emits_schemas["ev1.trade_executed"]
+    assert contract["summary"] == "A hauler completed a buy-sell leg"
+    assert contract["schema"]["required"] == ["route", "profit"]
+    assert contract["schema"]["properties"]["profit"] == {"type": "integer"}
+    assert "ev1.plain" not in m.emits_schemas
+
+
+def test_emits_schema_ref_file(tmp_path) -> None:
+    # `schema: {$ref: <path>}` (and the bare-string shorthand) reads a JSON/YAML
+    # schema file from INSIDE the plugin dir at manifest-load time.
+    d = _make_plugin(
+        tmp_path, "ev2", enabled=True,
+        manifest_extra=(
+            "emits:\n"
+            "  - topic: ev2.ship_purchased\n"
+            "    schema: {$ref: events/ship.json}\n"
+            "  - topic: ev2.window_closed\n"
+            "    schema: events/ship.json\n"
+        ),
+    )
+    (d / "events").mkdir()
+    (d / "events" / "ship.json").write_text(
+        '{"type": "object", "properties": {"ship": {"type": "string"}}}', encoding="utf-8"
+    )
+    m = load_manifest(d)
+    assert m.emits == ["ev2.ship_purchased", "ev2.window_closed"]
+    assert m.emits_schemas["ev2.ship_purchased"]["schema"]["type"] == "object"
+    assert m.emits_schemas["ev2.window_closed"]["schema"]["properties"]["ship"] == {"type": "string"}
+
+
+def test_emits_invalid_ref_warns_not_fails(tmp_path, caplog) -> None:
+    # Every bad-schema mode degrades to names-only for THAT entry with a warning
+    # — a broken contract must never fail the plugin load (issue #1636).
+    import logging as _logging
+
+    d = _make_plugin(
+        tmp_path, "ev3", enabled=True,
+        manifest_extra=(
+            "emits:\n"
+            "  - topic: ev3.missing\n"
+            "    summary: still has a summary\n"
+            "    schema: {$ref: events/nope.json}\n"   # file doesn't exist
+            "  - topic: ev3.escape\n"
+            "    schema: {$ref: ../../outside.json}\n"  # path traversal → refused
+            "  - topic: ev3.badtype\n"
+            "    schema: 7\n"                           # not a mapping / ref
+            "  - summary: no topic here\n"              # unusable entry → skipped
+            "  - ev3.ok\n"
+        ),
+    )
+    with caplog.at_level(_logging.WARNING, logger="protoagent.plugins"):
+        m = load_manifest(d)
+    assert m is not None  # the load itself never fails
+    assert m.emits == ["ev3.missing", "ev3.escape", "ev3.badtype", "ev3.ok"]
+    # the summary survives a broken ref; the schema key is simply absent
+    assert m.emits_schemas["ev3.missing"] == {"summary": "still has a summary"}
+    assert "ev3.escape" not in m.emits_schemas
+    assert "ev3.badtype" not in m.emits_schemas
+    assert "unreadable" in caplog.text
+    assert "escapes the plugin directory" in caplog.text
+
+
+def test_emits_schemas_flow_to_runtime_status(tmp_path, monkeypatch) -> None:
+    # The loader meta carries `emits_schemas`, and /api/runtime/status passes the
+    # plugins block through verbatim — the discovery surface for consumers.
+    root = tmp_path / "plugins"
+    extra = (
+        "emits:\n"
+        "  - topic: evp.trade_executed\n"
+        "    summary: A trade completed\n"
+        "    schema: {type: object, required: [profit]}\n"
+    )
+    _make_plugin(root, "evp", enabled=True, tool="evp_tool", manifest_extra=extra)
+    _make_plugin(root, "evoff", enabled=False, tool="evoff_tool", manifest_extra=extra)
+    monkeypatch.setattr(plugin_loader, "_plugin_roots", lambda config: [root])
+    res = load_plugins(_cfg())
+    meta = {m["id"]: m for m in res.meta}
+    assert meta["evp"]["emits"] == ["evp.trade_executed"]
+    assert meta["evp"]["emits_schemas"]["evp.trade_executed"]["schema"]["required"] == ["profit"]
+    assert meta["evoff"]["emits_schemas"] == {}  # disabled → not advertised
+
+    from operator_api.runtime import build_runtime_status
+
+    status = build_runtime_status(config=None, setup_complete=True, graph_loaded=False, plugins=res.meta)
+    by_id = {p["id"]: p for p in status["plugins"]}
+    assert by_id["evp"]["emits_schemas"] == meta["evp"]["emits_schemas"]
+
+
+# ── Required-config / incomplete-plugin gate (#1719) ─────────────────────────
+
+_REQUIRED_SETTINGS = (
+    "settings:\n"
+    "  - {key: api_key, label: API Key, type: password, required: true}\n"
+    "  - {key: base_url, label: Base URL, type: text}\n"  # optional
+)
+
+
+def test_is_blank_semantics() -> None:
+    from graph.plugins.loader import _is_blank
+
+    assert _is_blank(None) and _is_blank("") and _is_blank("   ") and _is_blank([]) and _is_blank({})
+    # 0 / False are real values, not "unset".
+    assert not _is_blank("x") and not _is_blank(0) and not _is_blank(False) and not _is_blank(["a"])
+
+
+async def test_missing_required_config_flags_incomplete_and_guards_tools(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "plugins"
+    _make_plugin(root, "needy", enabled=True, tool="needy_tool", manifest_extra=_REQUIRED_SETTINGS)
+    monkeypatch.setattr(plugin_loader, "_plugin_roots", lambda config: [root])
+
+    res = load_plugins(_cfg())  # no plugin_config → api_key blank
+    meta = {m["id"]: m for m in res.meta}
+    # The plugin still loads — this is a soft gate, not requires_env.
+    assert meta["needy"]["loaded"] is True
+    assert meta["needy"]["incomplete"] is True
+    assert [n["key"] for n in meta["needy"]["needs_config"]] == ["api_key"]  # only the REQUIRED one
+
+    # Its tool is swapped for a same-name stand-in that returns a needs-setup notice.
+    tool = next(t for t in res.tools if t.name == "needy_tool")
+    out = await tool.ainvoke({"x": "ignored"})
+    assert "needs setup" in out and "API Key" in out
+
+    # Pass-through to /api/runtime/status (verbatim plugins block).
+    from operator_api.runtime import build_runtime_status
+
+    status = build_runtime_status(config=None, setup_complete=True, graph_loaded=False, plugins=res.meta)
+    by_id = {p["id"]: p for p in status["plugins"]}
+    assert by_id["needy"]["incomplete"] is True and by_id["needy"]["needs_config"][0]["label"] == "API Key"
+
+
+async def test_required_config_present_runs_normally(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "plugins"
+    _make_plugin(root, "ready", enabled=True, tool="ready_tool", manifest_extra=_REQUIRED_SETTINGS)
+    monkeypatch.setattr(plugin_loader, "_plugin_roots", lambda config: [root])
+
+    res = load_plugins(_cfg(plugin_config={"ready": {"api_key": "sk-live"}}))
+    meta = {m["id"]: m for m in res.meta}
+    assert meta["ready"]["incomplete"] is False
+    assert meta["ready"]["needs_config"] == []
+    # The real tool is registered (echoes its arg), not the stand-in.
+    tool = next(t for t in res.tools if t.name == "ready_tool")
+    assert await tool.ainvoke({"x": "hi"}) == "hi"
+
+
+def test_blank_optional_config_does_not_flag_incomplete(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "plugins"
+    optional_only = "settings:\n  - {key: base_url, label: Base URL, type: text}\n"
+    _make_plugin(root, "opt", enabled=True, tool="opt_tool", manifest_extra=optional_only)
+    monkeypatch.setattr(plugin_loader, "_plugin_roots", lambda config: [root])
+
+    res = load_plugins(_cfg())  # base_url blank, but it isn't required
+    meta = {m["id"]: m for m in res.meta}
+    assert meta["opt"]["incomplete"] is False and meta["opt"]["needs_config"] == []
+
+
 def test_public_paths_namespace_scoped(tmp_path) -> None:
     # A plugin may declare auth-exempt paths only under its OWN namespace; anything
     # else (a core path, another plugin's path) is dropped by the parser.
@@ -109,6 +345,37 @@ def test_discover_live_overrides_bundle(tmp_path, monkeypatch) -> None:
     _make_plugin(bundle, "dup", manifest_extra="description: from-bundle\n")
     _make_plugin(live, "dup", manifest_extra="description: from-live\n")
     found = {m.id: m.description for m in discover_plugins([bundle, live])}
+    assert found["dup"] == "from-live"
+
+
+def _mk_versioned(root: Path, pid: str, version: str, desc: str) -> None:
+    d = root / pid
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "protoagent.plugin.yaml").write_text(
+        f"id: {pid}\nname: {pid}\nversion: {version}\ndescription: {desc}\n", encoding="utf-8"
+    )
+
+
+def test_discover_stale_untracked_older_does_not_shadow_newer_bundle(tmp_path) -> None:
+    # The artifact-shadow bug: an UNTRACKED leftover from when the plugin was git-installed
+    # (@0.11.3) must NOT shadow the newer bundled copy (@0.14.0) — else it never updates with
+    # the app. Older + untracked → the bundle wins.
+    bundle = tmp_path / "bundle"
+    live = tmp_path / "live"
+    _mk_versioned(bundle, "dup", "0.14.0", "from-bundle")
+    _mk_versioned(live, "dup", "0.11.3", "from-live")
+    found = {m.id: (m.version, m.description) for m in discover_plugins([bundle, live], tracked_ids=set())}
+    assert found["dup"] == ("0.14.0", "from-bundle")
+
+
+def test_discover_tracked_override_wins_at_any_version(tmp_path) -> None:
+    # An INTENTIONAL install (tracked in plugins.lock) still overrides the bundle — even when
+    # it's OLDER — because it's a deliberate pin, not a stale leftover.
+    bundle = tmp_path / "bundle"
+    live = tmp_path / "live"
+    _mk_versioned(bundle, "dup", "0.14.0", "from-bundle")
+    _mk_versioned(live, "dup", "0.11.3", "from-live")
+    found = {m.id: m.description for m in discover_plugins([bundle, live], tracked_ids={"dup"})}
     assert found["dup"] == "from-live"
 
 
@@ -240,6 +507,8 @@ def test_config_round_trip() -> None:
         "disabled": ["c"],
         "dir": "/x",
         "sources": {"allow": ["github.com/protolabsai/*"]},
+        "update_policy": {},
+        "autoupdate_interval_hours": 6,
     }
 
 
@@ -271,6 +540,31 @@ def register(registry):
     registry.register_surface(_start, stop=_stop, name="surf")
     registry.register_subagent(_Sub())
 """
+
+
+def test_register_router_prefix_warning_accepts_both_canonical_prefixes(tmp_path, caplog) -> None:
+    # The documented two-router pattern (#1732): a plugin's public view lives under
+    # /plugins/<id> and its bearer-gated data router under /api/plugins/<id>. Neither
+    # should trip the #870 non-conforming-prefix warning; only a genuinely off-
+    # convention prefix should.
+    import logging
+
+    from graph.plugins.registry import PluginRegistry
+
+    class _FakeRouter:
+        routes: list = []
+
+    reg = PluginRegistry("wh", tmp_path)
+    with caplog.at_level(logging.WARNING, logger="protoagent.plugins"):
+        reg.register_router(_FakeRouter())                              # default /plugins/wh
+        reg.register_router(_FakeRouter(), prefix="/api/plugins/wh")    # gated data router
+        reg.register_router(_FakeRouter(), prefix="/api/plugins/wh/data")
+    assert "does not start with" not in caplog.text  # both canonical prefixes are silent
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="protoagent.plugins"):
+        reg.register_router(_FakeRouter(), prefix="/rogue")            # genuinely off-convention
+    assert "does not start with" in caplog.text
 
 
 def test_plugin_contributes_router_surface_subagent(tmp_path, monkeypatch) -> None:

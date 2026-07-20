@@ -22,6 +22,7 @@ Shape how the agent's loop behaves — standing goals, timers, middleware hooks,
 | [Schedule future work](/guides/scheduler) | You want the agent to defer tasks to itself ("remind me tomorrow", recurring sweeps) — bundled local sqlite |
 | [Middleware](/guides/middleware) | You want pre/post hooks on the agent turn (plugin-contributed) |
 | [Run on a coding agent (ACP runtime)](/guides/acp-runtime) | You want an external coding agent (proto/Codex/Claude/Copilot/OpenCode) to *be* the runtime brain, with protoAgent as the shell |
+| [Run on Hermes (preset)](/guides/hermes) | You already run Hermes Agent and want protoAgent's console/A2A/scheduler wrapped around it — one command |
 
 ## Skills, subagents & workflows
 
@@ -75,6 +76,7 @@ Surface the agent to people — the operator console, or no UI at all.
 |---|---|
 | [Operator console (React/Tauri)](/guides/react-tauri-ui) | You want the multi-chat React console and to package it for desktop |
 | [Command palette (⌘K)](/guides/command-palette) | You want the fast keyboard path to jump between surfaces + inline chat |
+| [Developer flags](/guides/developer-flags) | You want to merge a half-built feature behind a tiered flag (off/dev/beta/on) instead of a long-lived branch |
 | [Access from your phone (LAN / Tailscale)](/guides/phone-access) | You want to drive the agent from your phone — installable PWA over your LAN or tailnet, add-to-home-screen |
 | [Run headless (API + A2A)](/guides/headless) | You want the agent as a service — REST + A2A — with no UI |
 
@@ -85,9 +87,11 @@ Ship it, isolate it, fence it in, and watch it.
 | Guide | When to read |
 |---|---|
 | [Deploy via GHCR](/guides/deploy) | You're ready to ship and want auto-deploy wired up |
+| [Deploy on Proxmox (reusable LXC template)](/guides/deploy-proxmox) | You run Proxmox and want a clone-in-seconds template for test/fleet instances |
 | [Releasing](/guides/releasing) | You're cutting a versioned release (semver bump → image → GitHub release) |
 | [Run multiple instances](/guides/multi-instance) | You want several scoped agents (data isolation) on one host |
 | [Sandboxing & egress](/guides/sandboxing) | You want to fence the filesystem + outbound network |
+| [Expose to the world](/guides/exposing-protoagent) | You want an agent reachable from the public internet — A2A only, token-gated, console hidden |
 | [Wire Langfuse + Prometheus](/guides/observability) | You need traces and metrics in production |
 
 ## Forks & evals

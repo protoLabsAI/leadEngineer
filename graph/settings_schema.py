@@ -68,7 +68,10 @@ FIELDS: list[Field] = [
         "Agent runtime",
         "Which brain drives a turn: the built-in LangGraph loop (native), or an external "
         "coding agent over ACP (needs its CLI installed + authenticated on the host).",
-        options=["native", *ACP_MODEL_OPTIONS],
+        # "runtime" = native + every ACP agent, resolved per-request from config.acp_agents so
+        # user-registered custom agents show up too (build_schema). Dynamic source ⇒ no static
+        # enum, so validate_flat accepts a custom acp:<id> — same as the model.name select.
+        options_source="runtime",
     ),
     Field(
         "operator_mcp.tools",
@@ -136,6 +139,18 @@ FIELDS: list[Field] = [
         "Model",
         "Hard cap on the agent loop per turn.",
         minimum=1,
+    ),
+    # ── Favorite models (#1957) ──────────────────────────────────────────────
+    Field(
+        "model.favorites",
+        "model_favorites",
+        "Favorites",
+        "string_list",
+        "Favorite models",
+        "Pinned go-to models for the chat `/model` quick-switch — the inline picker offers "
+        "these, in this order, instead of the gateway's full list. Add, remove, and reorder "
+        "here; empty = /model shows every gateway model.",
+        options_source="models",
     ),
     # ── Routing ──────────────────────────────────────────────────────────────
     Field(
@@ -211,6 +226,24 @@ FIELDS: list[Field] = [
         "with a coding agent.",
         options_source="models+acp",
     ),
+    # ── Persona (self-authored SOUL) ─────────────────────────────────────────
+    # Guarded, default OFF. When on, the lead agent gets the `edit_soul` tool and can
+    # rewrite sections of its own SOUL.md (persona only — ADR 0079; every edit snapshotted
+    # + reversible via #1691). Crossing the operator-trust boundary (ADR 0066/0081) is an
+    # opt-in: settable via YAML/API, but hidden from the generic Settings UI for now — the
+    # dedicated Identity panel already owns SOUL, and this reload-live toggle can join it
+    # later. ui_hidden keeps it in FIELDS so it round-trips.
+    Field(
+        "soul.self_edit_enabled",
+        "soul_self_edit_enabled",
+        "Let the agent edit its own persona (SOUL.md)",
+        "bool",
+        "Persona",
+        "When on, the lead agent gets the `edit_soul` tool to rewrite sections of its own "
+        "SOUL.md. Persona only, never operating doctrine (ADR 0079); each edit is snapshotted "
+        "and reversible, and applies on the next turn.",
+        ui_hidden=True,
+    ),
     # ── Prompt caching ───────────────────────────────────────────────────────
     Field(
         "prompt_cache.enabled",
@@ -242,6 +275,44 @@ FIELDS: list[Field] = [
     ),
     # ── Knowledge / memory ───────────────────────────────────────────────────
     Field("knowledge.top_k", "knowledge_top_k", "Knowledge recall top-k", "number", "Knowledge", minimum=1),
+    # Scope filter for the auto-inject RAG search (ADR 0069 D3a).
+    Field(
+        "knowledge.inject_namespaces",
+        "knowledge_inject_namespaces",
+        "Auto-inject namespaces",
+        "string_list",
+        "Knowledge",
+        "Restrict per-turn auto-injected knowledge (RAG) to chunks in these namespaces — one "
+        "per line; an empty line matches un-namespaced chunks. Empty = no filter (everything "
+        "is eligible, today's behavior). Tool-driven recall (memory_recall) is not affected.",
+    ),
+    # Trust floor for the auto-inject RAG hits (ADR 0069 D8).
+    Field(
+        "knowledge.inject_min_trust",
+        "knowledge_inject_min_trust",
+        "Auto-inject trust floor",
+        "number",
+        "Knowledge",
+        "Minimum trust tier a knowledge chunk needs to be auto-injected into the prompt. "
+        "1 = everything (low-trust hits are only ranked below higher tiers); 2 = exclude "
+        "ingested/external content (web, YouTube, PDFs, media); 3 = operator-authored rows "
+        "only. Tool-driven recall (memory_recall) is never gated — excluded content stays "
+        "reachable on demand, tier visible.",
+        minimum=1,
+        maximum=3,
+    ),
+    # Hot-memory write confirm gate (ADR 0069 D8).
+    Field(
+        "knowledge.hot_write_confirm",
+        "knowledge_hot_write_confirm",
+        "Confirm agent hot-memory writes",
+        "bool",
+        "Knowledge",
+        "When on, the agent's memory_ingest tool refuses to write always-on hot memory "
+        "(domain \"hot\") and instructs the model to ask you instead — only operator "
+        "surfaces (the knowledge browser / memory inspector) can put facts in front of the "
+        "model every turn. Every hot write emits a memory.hot_written event either way.",
+    ),
     # Tier (ADR 0041 / bd-2wu) — mirrors `skills.scope`; the commons lives at `commons.path`.
     Field(
         "knowledge.scope",
@@ -498,6 +569,63 @@ FIELDS: list[Field] = [
         "secrets on every agent, so share only servers you trust box-wide.",
         options=["scoped", "layered"],
     ),
+    # ── Filesystem (ADR 0007 operator primitives) — the fenced project fs toolset,
+    # incl. the dual-use ``run_command``. Per-agent (leaf scope): an operator can
+    # fully remove run_command for one agent while siblings keep it. Hot-reloads:
+    # a save rebuilds the graph, so binding changes apply without a restart. ──────
+    Field(
+        "filesystem.enabled",
+        "filesystem_enabled",
+        "Filesystem tools",
+        "bool",
+        "Filesystem",
+        "The fenced multi-project filesystem toolset (list/read/search/write/edit + "
+        "run_command). Off = none of them are bound. With no explicit projects "
+        "configured, a default read-write `workspace` project is provided.",
+    ),
+    Field(
+        "filesystem.allow_run",
+        "filesystem_allow_run",
+        "Allow run_command",
+        "bool",
+        "Filesystem",
+        "Bind the run_command shell tool (runs arbitrary commands in a project dir as "
+        "the server user). Off = the tool is never built — the model can't see or call "
+        "it; the read/write file tools stay. The full kill switch for shell access.",
+        depends_on={"key": "filesystem.enabled"},
+    ),
+    Field(
+        "filesystem.run_requires_approval",
+        "filesystem_run_requires_approval",
+        "Require approval per command",
+        "bool",
+        "Filesystem",
+        "Pause every run_command invocation for operator approval (HITL) before it "
+        "executes. Turn off only inside a hardened container or for a trusted "
+        "autonomous deploy.",
+        depends_on={"key": "filesystem.allow_run"},
+    ),
+    Field(
+        "filesystem.bypass_allowed",
+        "filesystem_bypass_allowed",
+        "Allow /bypass",
+        "bool",
+        "Filesystem",
+        "Permit the per-tab /bypass chat toggle to skip the approval gate. Off = "
+        "approvals are enforced regardless of any caller-supplied bypass flag.",
+        depends_on={"key": "filesystem.run_requires_approval"},
+    ),
+    # ── Tools — the operator denylist over the assembled toolset ────────────────
+    Field(
+        "tools.disabled",
+        "tools_disabled",
+        "Disabled tools",
+        "string_list",
+        "Tools",
+        "Tool names removed from this agent's toolset at graph build — one per line. "
+        "Covers every contributor: core, plugin, MCP, filesystem (e.g. run_command), "
+        "and delegation tools. Applies on save (the graph rebuilds).",
+    ),
     # ── Middleware toggles ───────────────────────────────────────────────────
     Field("middleware.knowledge", "knowledge_middleware", "Knowledge middleware", "bool", "Middleware"),
     Field("middleware.memory", "memory_middleware", "Memory middleware", "bool", "Middleware"),
@@ -509,6 +637,17 @@ FIELDS: list[Field] = [
     # round-trip). See docs/reference/configuration.md `## enforcement`.
     Field("middleware.enforcement", "enforcement_enabled", "Tool enforcement", "bool", "Middleware", ui_hidden=True),
     # ── Telemetry (local cost/latency store, ADR 0006) ───────────────────────
+    Field(
+        "telemetry.fleet_trace_export",
+        "fleet_trace_export_enabled",
+        "Fleet trace export",
+        "bool",
+        "Telemetry",
+        "Write one per-turn trajectory row (OpenAI chat format) to <instance>/fleet-traces/ "
+        "for the agent-fleet flywheel. Off by default; dumps stay on this machine until you "
+        "ship them (scripts/setup_fleet_tracing.sh). Env PROTOAGENT_FLEET_TRACE_EXPORT overrides.",
+        restart=True,
+    ),
     Field(
         "telemetry.enabled",
         "telemetry_enabled",
@@ -531,6 +670,26 @@ FIELDS: list[Field] = [
         minimum=0,
         restart=True,
         scope="host",
+    ),
+    # ── Media output store (#1929) ────────────────────────────────────────────
+    Field(
+        "media.public",
+        "media_public",
+        "Serve media without auth",
+        "bool",
+        "Media",
+        "Expose /media/<file> (tool-generated images/audio/video) without any credential. "
+        "Off (default) = each file is reachable only via its signed URL or a bearer — the "
+        "default-deny gate holds. Turn on only when the whole store should be public.",
+    ),
+    Field(
+        "media.retention_days",
+        "media_retention_days",
+        "Media retention (days)",
+        "number",
+        "Media",
+        "Auto-prune generated media files older than this on each new save (0 = keep forever).",
+        minimum=0,
     ),
     # ── Identity / operator ──────────────────────────────────────────────────
     # `identity.name` stays in FIELDS so it round-trips through the YAML writer AND so it
@@ -571,6 +730,17 @@ FIELDS: list[Field] = [
     # A plugin's Settings group is declared by its manifest (ADR 0019) and rendered
     # via the plugin-fields path in build_schema — same for bundled or external
     # plugins; the generic Test button + guide link come from the manifest (ADR 0059).
+    # ── Background jobs (ADR 0050/0070) ──────────────────────────────────────
+    Field(
+        "background.auto_resume",
+        "background_auto_resume",
+        "Push-resume on completion",
+        "bool",
+        "Background",
+        "When a background job finishes, immediately run a turn in the session that "
+        "spawned it so the agent reviews the report and briefs the operator (ADR 0070). "
+        "Off = the report waits for that session's next manual turn.",
+    ),
     # ── Runtime (restart) ────────────────────────────────────────────────────
     Field(
         "runtime.autostart_on_boot",
@@ -658,8 +828,10 @@ FIELDS: list[Field] = [
         "bool",
         "Discovery",
         "Advertise + browse the _protoagent._tcp mDNS/Bonjour channel so LAN siblings "
-        "find each other automatically. Off = no mDNS (tailnet + manual register still "
-        "work); useful where multicast is noisy or blocked.",
+        "find each other automatically. Off by default (#1802) — an agent stays quiet on "
+        "the network unless you opt in (privacy/security). On = this agent announces itself "
+        "and discovers siblings on the LAN; tailnet + manual register work either way, and "
+        "the local fleet console is unaffected (it enumerates from disk, not mDNS).",
         scope="host",
     ),
     Field(
@@ -684,6 +856,157 @@ FIELDS: list[Field] = [
         minimum=0,
         scope="host",
     ),
+    Field(
+        "fleet.autostart",
+        "fleet_autostart",
+        "Autostart members",
+        "string_list",
+        "Keep-warm",
+        "Fleet members (by id or display name) the hub (re)starts on boot — so a container "
+        "recreate or host restart brings your declared crew back up automatically instead of "
+        "leaving them down until re-activated by hand. One per line. Env fallback: "
+        "PROTOAGENT_FLEET_AUTOSTART (comma-separated).",
+        restart=True,
+        scope="host",
+    ),
+    Field(
+        "developer.channel",
+        "developer_channel",
+        "Developer channel",
+        "select",
+        "Developer",
+        "Which pre-release features this instance exposes (ADR 0068). `prod` = released "
+        "features only; `beta` = opt-in previews; `dev` = everything, incl. in-progress "
+        "work. The dev sandbox instance defaults to `dev`. Env fallback: PROTOAGENT_CHANNEL.",
+        options=["prod", "beta", "dev"],
+    ),
+    # ── Secrets manager (ADR 0080) — pull env vars from an external manager ──
+    Field(
+        "secrets_manager.enabled",
+        "secrets_manager_enabled",
+        "Pull secrets from a manager",
+        "bool",
+        "Secrets manager",
+        "Fetch secrets from an external manager (Infisical) at boot, on config reload, and "
+        "on the refresh interval, and export them as environment variables. Values fill the "
+        "documented env fallback tier — an env var you set yourself still wins, and "
+        "secrets.yaml still beats everything.",
+    ),
+    Field(
+        "secrets_manager.provider",
+        "secrets_manager_provider",
+        "Provider",
+        "select",
+        "Secrets manager",
+        options=["infisical"],
+        depends_on={"key": "secrets_manager.enabled"},
+    ),
+    Field(
+        "secrets_manager.host",
+        "secrets_manager_host",
+        "Server URL",
+        "string",
+        "Secrets manager",
+        "Infisical Cloud (https://us.infisical.com / https://eu.infisical.com) or your "
+        "self-hosted instance URL.",
+        depends_on={"key": "secrets_manager.enabled"},
+    ),
+    Field(
+        "secrets_manager.project_id",
+        "secrets_manager_project_id",
+        "Project ID",
+        "string",
+        "Secrets manager",
+        depends_on={"key": "secrets_manager.enabled"},
+    ),
+    Field(
+        "secrets_manager.environment",
+        "secrets_manager_environment",
+        "Environment",
+        "string",
+        "Secrets manager",
+        "Environment slug to pull from (e.g. dev / staging / prod). The dev sandbox "
+        "instance can point at a different environment than your default instance.",
+        depends_on={"key": "secrets_manager.enabled"},
+    ),
+    Field(
+        "secrets_manager.path",
+        "secrets_manager_path",
+        "Secret path",
+        "string",
+        "Secrets manager",
+        "Folder to pull (subfolders included when recursive is on).",
+        depends_on={"key": "secrets_manager.enabled"},
+    ),
+    Field(
+        "secrets_manager.recursive",
+        "secrets_manager_recursive",
+        "Include subfolders",
+        "bool",
+        "Secrets manager",
+        depends_on={"key": "secrets_manager.enabled"},
+    ),
+    Field(
+        "secrets_manager.client_id",
+        "secrets_manager_client_id",
+        "Machine identity client ID",
+        "secret",
+        "Secrets manager",
+        "Universal-auth machine identity. Stored in secrets.yaml, never echoed back — or "
+        "set INFISICAL_CLIENT_ID in the environment instead.",
+        depends_on={"key": "secrets_manager.enabled"},
+    ),
+    Field(
+        "secrets_manager.client_secret",
+        "secrets_manager_client_secret",
+        "Machine identity client secret",
+        "secret",
+        "Secrets manager",
+        "Stored in secrets.yaml, never echoed back — or set INFISICAL_CLIENT_SECRET in the "
+        "environment instead. This bootstrap pair is the only secret that stays local; "
+        "everything else can live in the manager.",
+        depends_on={"key": "secrets_manager.enabled"},
+    ),
+    Field(
+        "secrets_manager.refresh_seconds",
+        "secrets_manager_refresh_seconds",
+        "Refresh interval (seconds)",
+        "number",
+        "Secrets manager",
+        "Re-pull on this interval so rotation lands without a restart. 0 = fetch only at "
+        "boot and on config reload.",
+        minimum=0,
+        depends_on={"key": "secrets_manager.enabled"},
+    ),
+    Field(
+        "secrets_manager.required",
+        "secrets_manager_required",
+        "Required at boot",
+        "bool",
+        "Secrets manager",
+        "Refuse to boot when the manager is unreachable, instead of the default "
+        "warn-and-continue with whatever the environment already has.",
+        depends_on={"key": "secrets_manager.enabled"},
+    ),
+    Field(
+        "secrets_manager.override_env",
+        "secrets_manager_override_env",
+        "Manager beats existing env",
+        "bool",
+        "Secrets manager",
+        "By default a pre-existing environment variable shadows the manager's value. "
+        "Turn this on to prefer the manager (rotation-wins).",
+        depends_on={"key": "secrets_manager.enabled"},
+    ),
+    Field(
+        "secrets_manager.timeout_seconds",
+        "secrets_manager_timeout_seconds",
+        "Fetch timeout (seconds)",
+        "number",
+        "Secrets manager",
+        minimum=1,
+        depends_on={"key": "secrets_manager.enabled"},
+    ),
 ]
 
 # Knowledge domain sub-sections (console grouping). The Knowledge fields are declared with
@@ -694,6 +1017,9 @@ FIELDS: list[Field] = [
 _KNOWLEDGE_SUBSECTION = {
     # Recall — what the agent retrieves into context, and how.
     "knowledge.top_k": "Recall",
+    "knowledge.inject_namespaces": "Recall",
+    "knowledge.inject_min_trust": "Recall",
+    "knowledge.hot_write_confirm": "Recall",
     "knowledge.scope": "Recall",
     "knowledge.embeddings": "Recall",
     "knowledge.embed_model": "Recall",
@@ -777,13 +1103,14 @@ def _plugin_group(sch, spec) -> str:
 # (host vs agent) is a per-field badge (ADR 0047), NOT a category. Order here is the
 # domain order the console renders. Unknown sections (notably plugin-contributed ones,
 # ADR 0019) default to "Plugins" (the Integrations surface).
-_CATEGORY_ORDER = ["Identity", "Model", "Behavior", "Capabilities", "Knowledge", "Plugins", "Box"]
+_CATEGORY_ORDER = ["Identity", "Model", "Behavior", "Capabilities", "Knowledge", "Secrets", "Plugins", "Box"]
 _SECTION_CATEGORY = {
     # Identity — who the agent is (name + persona live in the dedicated Identity panel;
     # these are the operator/org/access fields rendered beneath it).
     "Identity": "Identity",
     # Model — the LLM connection, sampling, and cache (the real "Model & Routing").
     "Model": "Model",
+    "Favorite models": "Model",  # /model quick-switch pins (#1957)
     "Routing": "Model",
     "Caching": "Model",
     # Behavior — how the agent thinks, loops, and decides.
@@ -791,15 +1118,21 @@ _SECTION_CATEGORY = {
     "Goal mode": "Behavior",
     "Compaction": "Behavior",
     "Middleware": "Behavior",
+    "Background": "Behavior",
     "Runtime": "Behavior",
     # Capabilities — the sharing/tier knobs for what the agent is wired to (the rich
     # Tools/MCP/Skills/Subagents/Delegates managers are bespoke console panels).
     "Skills": "Capabilities",
     "MCP": "Capabilities",
+    "Filesystem": "Capabilities",
+    "Tools": "Capabilities",
     # Knowledge — recall / RAG config, split into sub-sections (see _KNOWLEDGE_SUBSECTION).
     "Recall": "Knowledge",
     "Ingestion": "Knowledge",
     "History": "Knowledge",
+    # Secrets — the external secrets manager (ADR 0080); the console renders this
+    # category as its own sidenav section with a status/test/sync card.
+    "Secrets manager": "Secrets",
     # Box — box-wide operational config (host console only): the telemetry store + the
     # host box-runtime knobs (network / discovery / keep-warm, ADR 0047 D8). Host-scoped;
     # a workspace-leaf override of these is a silent no-op (consumed by the host process).
@@ -807,8 +1140,23 @@ _SECTION_CATEGORY = {
     "Network": "Box",
     "Discovery": "Box",
     "Keep-warm": "Box",
-    # Discord / Google / GitHub / other plugin sections → "Plugins" (the default), the
-    # Integrations surface.
+    # Developer — pre-release feature gating (ADR 0068). The channel this instance runs on;
+    # the flags themselves live in a device-local Developer panel, not the schema.
+    "Developer": "Behavior",
+    # Persona — the SOUL/self-edit toggle (ADR 0081). Belongs with Identity (name + persona).
+    # soul.self_edit_enabled is ui_hidden today, so this doesn't render yet — but mapping it
+    # explicitly keeps it OUT of the Plugins default (it's core, not a plugin section).
+    "Persona": "Identity",
+    # Media — the core media store (registry.save_media, #1929): tool-generated image/audio/
+    # video exposure + retention. INTERIM: mapped to Plugins so it stays reachable, because
+    # Capabilities has no schema panel yet. It moves to Capabilities under the settings-IA
+    # rework's Decision A (docs/dev/settings-ia-target.md) once that panel lands. Explicit so
+    # a CORE section is never silently swept into Integrations by the default below (D5).
+    "Media": "Plugins",
+    # Discord / Google / GitHub / other PLUGIN-contributed sections → "Plugins" (the default),
+    # the Integrations surface. Only genuinely plugin sections may rely on the default —
+    # every CORE section (declared by a FIELDS entry) must be mapped explicitly above; a test
+    # enforces this so a new core section can't strand itself under Integrations by accident.
 }
 
 
@@ -855,6 +1203,10 @@ def build_schema(
     Secrets report ``value: ""`` plus ``is_set`` rather than echoing the secret.
     """
     defaults = type(config)()
+    # ACP options are config-aware (ADR 0033): built-ins + any user-registered
+    # `acp.agents.<id>`, so a custom coding agent shows in the runtime + aux-model
+    # dropdowns. Empty config ⇒ exactly ACP_MODEL_OPTIONS (the built-in list).
+    acp_opts = acp_runtime_options(getattr(config, "acp_agents", None))
     groups: dict[str, dict[str, Any]] = {}
     for f in FIELDS:
         if f.ui_hidden:
@@ -870,8 +1222,10 @@ def build_schema(
             "options": (
                 (model_options or [])
                 if f.options_source == "models"
-                else (model_options or []) + ACP_MODEL_OPTIONS
+                else (model_options or []) + acp_opts
                 if f.options_source == "models+acp"
+                else ["native", *acp_opts]
+                if f.options_source == "runtime"
                 else list(f.options)
             ),
             "default": _jsonable(getattr(defaults, f.attr, None)),

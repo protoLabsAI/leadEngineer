@@ -25,6 +25,12 @@ jobs:
         with:
           node-version: "20"
       - name: Verify workspace config (.beads / .automaker / owned runners)
+        # Fork-friendly (#1534): the .beads/.automaker/owned-runner baseline is the
+        # protoLabs *fleet* standard, so it runs across the fleet (protoLabsAI/*) —
+        # keeping gina/protoTrader/roxy conformant — but is skipped on external forks,
+        # which are free to diverge. The job stays green either way (the server.py
+        # guard below still runs everywhere).
+        if: startsWith(github.repository, 'protoLabsAI/')
         # The npm package is still 1.0.0 (predates verify-workspace-config),
         # so run the script directly. It's zero-dependency (node builtins
         # only), so no `npm install` is needed. Switch to
@@ -83,6 +89,35 @@ jobs:
         run: |
           pip install import-linter==2.11
           lint-imports
+      - name: Third-party attribution in sync
+        # THIRD_PARTY_LICENSES.md is generated from uv.lock + package-lock.json
+        # by scripts/gen_attribution.py. This gate re-derives the dependency
+        # inventory from those committed lockfiles and fails if the manifest
+        # drifted — i.e. someone bumped a dep without regenerating attribution.
+        # Reads only committed files (stdlib-only, no `uv sync` / `npm ci`), so
+        # it's fast and can't flake on platform differences. To fix a failure:
+        # `uv sync && uv run python scripts/gen_attribution.py`.
+        run: python scripts/gen_attribution.py --check
+      - uses: astral-sh/setup-uv@v6
+        with:
+          # Pinned like ruff/import-linter above, and for a sharper reason: uv's lock
+          # OUTPUT is version-dependent. 0.11.29 and 0.11.13 disagree about how to record
+          # dependency markers (0.11.29 drops `python_full_version < '3.13'` from aiologic
+          # /culsans), so an unpinned `latest` rewrites uv.lock whenever uv ships — the
+          # file then thrashes based on whose uv ran last, and this gate is the thing that
+          # notices. 0.11.29 produced the lock currently on main.
+          # To bump: change BOTH here and in prepare-release.yml (they must match), then
+          # run `uv lock` once and commit the result.
+          version: "0.11.29"
+      - name: Lockfile in sync with pyproject
+        # uv.lock silently rotted for a full release cycle (#1998): it kept a
+        # `git+https` ref for protolabs-a2a after pyproject moved to the PyPI range,
+        # and — because that project's 0.2.0/0.2.1 ship different APIs — any
+        # `--frozen`/`--locked` install pulled a build the runtime can't call. Nothing
+        # caught it: the CI jobs install with plain `pip`, so uv.lock is only read by
+        # the attribution gate above (which tolerates a stale project version).
+        # Fails when pyproject.toml and uv.lock disagree. To fix: `uv lock`.
+        run: uv lock --check
 
   tests:
     name: Python tests
@@ -176,6 +211,11 @@ jobs:
         with:
           node-version: "20"
           cache: npm
+      # The lockfile is npm-11-shaped (PROTO.md: npm-10 arborist no-ops workspace
+      # dep bumps and disagrees with 11 about peer-stub reachability, so its `ci`
+      # rejects an 11-generated lock). Pin every root `npm ci`/`install` to 11.
+      - name: Use npm 11
+        run: npm install -g npm@11
       - name: Install dependencies
         run: npm ci
       - name: Run unit tests (vitest)

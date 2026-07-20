@@ -73,6 +73,13 @@ class TaskCloseRequest(BaseModel):
     reason: str | None = None
 
 
+class ChatFormSubmitRequest(BaseModel):
+    # A plugin composer-form's answers routed back to the plugin's on_submit (#1701 S2).
+    callback_id: str
+    session_id: str = ""
+    answers: dict = {}
+
+
 async def _sse_event_stream(
     subscribe: Callable[..., AsyncIterator[dict[str, Any]]],
     *,
@@ -244,6 +251,32 @@ def register_operator_routes(
         except Exception as exc:
             raise _http_error(exc) from exc
 
+    @app.get("/api/background/{job_id}")
+    async def _background_job(job_id: str):
+        """One background job's full row by id (ADR 0070 D4) — the console report
+        card fetches this instead of list-and-filter, and it carries the FULL result
+        (the ``background.completed`` bus event only carries a preview). Still resolves
+        after the job is dismissed from the panel (#1808): dismiss is a soft flag, so the
+        row + report are retained and the card can always reopen the full report. Job ids
+        are strictly ``bg-<12 hex>`` (background/store.py), so anything else is rejected
+        before it reaches the store."""
+        import re as _re
+
+        from runtime.state import STATE
+
+        if not _re.fullmatch(r"bg-[a-f0-9]{12}", job_id or ""):
+            raise HTTPException(status_code=400, detail="Invalid background job id.")
+        mgr = getattr(STATE, "background_mgr", None)
+        if mgr is None:
+            raise HTTPException(status_code=404, detail="Background jobs are not available.")
+        try:
+            job = await asyncio.to_thread(mgr.store.get, job_id)
+        except Exception as exc:
+            raise _http_error(exc) from exc
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"No background job {job_id}.")
+        return job.to_dict()
+
     @app.post("/api/background/{job_id}/cancel")
     async def _background_cancel(job_id: str):
         """Stop a running background job (ADR 0051) — cancels its detached A2A turn."""
@@ -259,30 +292,34 @@ def register_operator_routes(
 
     @app.delete("/api/background/{job_id}")
     async def _background_delete(job_id: str):
-        """Delete a FINISHED background job's entry (housekeeping). Running jobs are kept —
-        cancel them first. Returns ``{ok, deleted}``."""
+        """Dismiss a FINISHED background job from the panel (#1808). A SOFT dismiss, not a
+        hard delete: the row + report are retained so the chat report card can still open the
+        full report by id (ADR 0070 — the report outlives the disposable worker). Running jobs
+        are kept — cancel them first. Returns ``{ok, deleted}`` (``deleted`` = a row was
+        newly dismissed; the key is kept for API compatibility)."""
         from runtime.state import STATE
 
         mgr = getattr(STATE, "background_mgr", None)
         if mgr is None:
             return {"ok": False, "detail": "Background jobs are not available."}
         try:
-            deleted = await asyncio.to_thread(mgr.store.delete, job_id)
-            return {"ok": True, "deleted": bool(deleted)}
+            dismissed = await asyncio.to_thread(mgr.store.dismiss, job_id)
+            return {"ok": True, "deleted": bool(dismissed)}
         except Exception as exc:
             raise _http_error(exc) from exc
 
     @app.post("/api/background/clear")
     async def _background_clear(session: str = ""):
-        """Delete all FINISHED background jobs (optionally scoped to an originating
-        ``session``). Running jobs are kept. Returns ``{ok, cleared}``."""
+        """Dismiss all FINISHED background jobs from the panel (#1808), optionally scoped to an
+        originating ``session``. Soft, like the single dismiss — rows + reports are retained so
+        they stay openable by id. Running jobs are kept. Returns ``{ok, cleared}``."""
         from runtime.state import STATE
 
         mgr = getattr(STATE, "background_mgr", None)
         if mgr is None:
             return {"ok": False, "detail": "Background jobs are not available."}
         try:
-            cleared = await asyncio.to_thread(mgr.store.clear_finished, session or None)
+            cleared = await asyncio.to_thread(mgr.store.dismiss_finished, session or None)
             return {"ok": True, "cleared": int(cleared)}
         except Exception as exc:
             raise _http_error(exc) from exc
@@ -417,6 +454,18 @@ def register_operator_routes(
             except Exception as exc:
                 raise _http_error(exc) from exc
 
+    # One session's goal status under the canonical plural shape (D4 dedupe, ADR 0075)
+    # — replaces the retired singular `/api/goal/{session_id}`. Reads the controller
+    # directly, so it degrades to {enabled: False} when goals are off; no injected fn.
+    @app.get("/api/goals/{session_id}")
+    async def _goal_status(session_id: str):
+        from runtime.state import STATE
+
+        if STATE.goal_controller is None:
+            return {"enabled": False, "goal": None}
+        state = STATE.goal_controller.store.get(session_id)
+        return {"enabled": True, "goal": state.to_dict() if state else None}
+
     # Programmatic goal-set (ADR 0028 D3) — accepts ONLY a `plugin` verifier;
     # command/test/ci/data stay operator-only (/goal). 400 on a rejected verifier.
     if goal_set is not None:
@@ -474,6 +523,23 @@ def register_operator_routes(
                 return chat_commands()
             except Exception as exc:
                 raise _http_error(exc) from exc
+
+    # A plugin composer-form's answers route back to the plugin's on_submit here
+    # (#1701 Slice 2) — the form itself rode the input_required frame with a
+    # `plugin_callback_id`; the console POSTs the field values to redeem it. Not gated
+    # on `chat_commands` (a plugin can open a form even if no static commands exist).
+    @app.post("/api/chat/commands/submit")
+    async def _chat_command_submit(req: ChatFormSubmitRequest):
+        from graph.slash_commands import PluginFormRequest, submit_plugin_form
+
+        try:
+            result = await submit_plugin_form(req.callback_id, req.answers or {}, req.session_id)
+        except Exception as exc:
+            raise _http_error(exc) from exc
+        # A multi-step wizard returns the next form; anything else is a reply note.
+        if isinstance(result, PluginFormRequest):
+            return {"form": result.form, "callback_id": result.callback_id}
+        return {"reply": result if isinstance(result, str) else None}
 
     # --- Workflows -----------------------------------------------------------
     # Workflows are an opt-in plugin (plugins/workflows) — it self-registers its

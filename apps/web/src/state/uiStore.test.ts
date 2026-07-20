@@ -306,6 +306,27 @@ describe("migrateUiState — v14 domain-first settings IA", () => {
   });
 });
 
+// Rail context-menu plugin actions (#1521 / #1522): request/clear the pending Update /
+// Uninstall a right-clicked plugin icon triggers; PluginRailManage reads + consumes them.
+describe("plugin rail actions", () => {
+  beforeEach(() => useUI.setState({ pluginUpdate: undefined, pluginUninstall: undefined }));
+
+  it("records and clears a pending update", () => {
+    useUI.getState().requestPluginUpdate("board", "Board");
+    expect(useUI.getState().pluginUpdate).toEqual({ id: "board", name: "Board" });
+    useUI.getState().clearPluginUpdate();
+    expect(useUI.getState().pluginUpdate).toBeUndefined();
+  });
+
+  it("records and clears a pending uninstall independently of update", () => {
+    useUI.getState().requestPluginUninstall("doom", "Doom");
+    expect(useUI.getState().pluginUninstall).toEqual({ id: "doom", name: "Doom" });
+    expect(useUI.getState().pluginUpdate).toBeUndefined();
+    useUI.getState().clearPluginUninstall();
+    expect(useUI.getState().pluginUninstall).toBeUndefined();
+  });
+});
+
 // The v13 migration adds the `hidden` bucket to a persisted railOrder that predates it, so the
 // shape is complete (actions also fall back to [] defensively).
 describe("migrateUiState — v13 hidden bucket", () => {
@@ -321,5 +342,28 @@ describe("migrateUiState — v13 hidden bucket", () => {
       railOrder: { left: ["chat"], right: ["work"], bottom: [], hidden: ["knowledge"] },
     }) as { railOrder: { hidden: string[] } };
     expect(out.railOrder.hidden).toEqual(["knowledge"]);
+  });
+});
+
+// openToolSettings (#1803): a chat tool card's "Manage" deep-links to Capabilities ▸ Tools,
+// focused on the tool. One atomic action sets the one-shot target AND opens the settings
+// overlay on the Tools section — the Tools panel consumes `toolsTarget` on mount.
+describe("openToolSettings", () => {
+  it("targets the tool and opens the Tools settings section", () => {
+    useUI.setState({ toolsTarget: null, globalSettingsOpen: false, globalSettingsSection: undefined });
+    useUI.getState().openToolSettings("run_command");
+    const s = useUI.getState();
+    expect(s.toolsTarget).toBe("run_command");
+    expect(s.globalSettingsOpen).toBe(true);
+    expect(s.globalSettingsSection).toBe("tools");
+  });
+
+  it("setToolsTarget clears the one-shot after the panel consumes it", () => {
+    useUI.getState().openToolSettings("web_search");
+    expect(useUI.getState().toolsTarget).toBe("web_search");
+    useUI.getState().setToolsTarget(null);
+    expect(useUI.getState().toolsTarget).toBeNull();
+    // Consuming the target does NOT reopen/close the overlay — it's independent.
+    expect(useUI.getState().globalSettingsOpen).toBe(true);
   });
 });

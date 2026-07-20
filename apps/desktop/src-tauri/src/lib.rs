@@ -7,31 +7,220 @@ use tauri::{
     AppHandle, Emitter, Manager, RunEvent, Runtime, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
-use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut, ShortcutState};
+use tauri_plugin_global_shortcut::{Shortcut, ShortcutState};
+use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_shell::{
     process::{CommandChild, CommandEvent},
     ShellExt,
 };
 use tauri_plugin_updater::UpdaterExt;
 
-/// Fallback port if probing for a free one fails (matches the historical
-/// hardcoded default + the web client's last-resort base).
-const FALLBACK_PORT: u16 = 7870;
+/// The web client's zero-handoff fallback port (apps/web/src/lib/api.ts) —
+/// preferred so the no-handoff path still lands on the live server.
+const DEFAULT_PORT: u16 = 7870;
 
-/// Pick a free localhost port for the bundled sidecar, so several agents (and a
-/// pre-existing server on 7870) can coexist without a collision. We bind :0,
-/// read the OS-assigned port, then drop the listener and hand the port to the
-/// sidecar — a tiny TOCTOU window, acceptable for a single local launch.
-fn pick_free_port() -> u16 {
+/// The sidecar's port: the fixed default when it's free, else an OS-assigned free
+/// port. Launching straight at an occupied 7870 — an orphaned sidecar, a headless
+/// dev server, any unrelated app — meant the new sidecar died at bind and the
+/// webview loaded a dead/foreign server with no error (#1668). The chosen port
+/// reaches the page via `?__apiPort=` on the webview URL (primary — the URL is
+/// always visible to the page, unlike the injected global) plus the
+/// `__PROTOAGENT_API_BASE__` init script. Bind-probe-then-release has a tiny
+/// TOCTOU window — acceptable for a single local launch.
+fn choose_port() -> u16 {
+    if TcpListener::bind(("127.0.0.1", DEFAULT_PORT)).is_ok() {
+        return DEFAULT_PORT;
+    }
     TcpListener::bind("127.0.0.1:0")
         .and_then(|l| l.local_addr())
         .map(|addr| addr.port())
-        .unwrap_or(FALLBACK_PORT)
+        .unwrap_or(DEFAULT_PORT)
+}
+
+/// The shell's OS-global hotkeys (#1675): stable id → default chord, in the
+/// global-hotkey string grammar ("super+shift+p"). The quick launcher is ⌥Space on
+/// macOS (the Raycast-familiar default) and Ctrl+Alt+Space elsewhere — plain
+/// Alt+Space is the Windows window system-menu accelerator (and PowerToys Run's
+/// default), a guaranteed conflict (#1670). Operator overrides persist in
+/// `<app-config>/hotkeys.json`, edited from Settings ▸ Keyboard.
+const HOTKEY_CONSOLE: &str = "console_toggle";
+const HOTKEY_LAUNCHER: &str = "quick_launcher";
+
+fn default_hotkeys() -> Vec<(&'static str, String)> {
+    let launcher = if cfg!(target_os = "macos") {
+        "alt+space"
+    } else {
+        "ctrl+alt+space"
+    };
+    vec![
+        (HOTKEY_CONSOLE, "super+shift+p".to_string()),
+        (HOTKEY_LAUNCHER, launcher.to_string()),
+    ]
+}
+
+/// One OS-global hotkey's live status — what Settings ▸ Keyboard renders: the
+/// chord, whether it's actually registered, and the denial when it isn't
+/// (typically "already registered": another app owns the chord).
+#[derive(Clone, serde::Serialize)]
+struct HotkeyStatus {
+    id: String,
+    chord: String,
+    registered: bool,
+    error: Option<String>,
+}
+
+/// Managed registry of the shell's global hotkeys (#1675).
+#[derive(Default)]
+struct Hotkeys(Mutex<Vec<HotkeyStatus>>);
+
+fn hotkeys_file<R: Runtime>(app: &AppHandle<R>) -> Option<std::path::PathBuf> {
+    app.path()
+        .app_config_dir()
+        .ok()
+        .map(|d| d.join("hotkeys.json"))
+}
+
+/// Operator chord overrides (`{id: chord}`) — best-effort read; absent/garbled
+/// files just mean defaults.
+fn load_hotkey_overrides<R: Runtime>(
+    app: &AppHandle<R>,
+) -> std::collections::HashMap<String, String> {
+    hotkeys_file(app)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_hotkey_overrides<R: Runtime>(app: &AppHandle<R>, entries: &[HotkeyStatus]) {
+    let Some(path) = hotkeys_file(app) else {
+        return;
+    };
+    let map: std::collections::HashMap<&str, &str> = entries
+        .iter()
+        .map(|e| (e.id.as_str(), e.chord.as_str()))
+        .collect();
+    if let Ok(json) = serde_json::to_string_pretty(&map) {
+        if let Err(e) = std::fs::write(&path, json) {
+            log::warn!("desktop: could not persist hotkeys to {path:?}: {e}");
+        }
+    }
+}
+
+/// (Re)register every hotkey that isn't currently live. FALLIBLE per hotkey
+/// (#1670): a chord another app owns records `registered:false` + the error in
+/// the managed state (Settings ▸ Keyboard shows it) and the app stays fully
+/// usable via window/tray. Called at setup and again on window focus — a cheap,
+/// user-driven retry moment — so a chord freed by the other app re-acquires
+/// without a restart (#1675).
+fn sync_hotkeys<R: Runtime>(app: &AppHandle<R>) {
+    use tauri_plugin_global_shortcut::GlobalShortcutExt;
+
+    let Some(state) = app.try_state::<Hotkeys>() else {
+        return;
+    };
+    let mut entries = state.0.lock().unwrap();
+    for e in entries.iter_mut() {
+        if e.registered {
+            continue;
+        }
+        match app.global_shortcut().register(e.chord.as_str()) {
+            Ok(()) => {
+                log::info!("desktop: global hotkey {} registered ({})", e.id, e.chord);
+                e.registered = true;
+                e.error = None;
+            }
+            Err(err) => {
+                if e.error.is_none() {
+                    log::warn!(
+                        "desktop: {} hotkey ({}) unavailable ({err}) — another app may own it; \
+                         continuing without the global shortcut",
+                        e.id,
+                        e.chord
+                    );
+                }
+                e.error = Some(err.to_string());
+            }
+        }
+    }
+}
+
+/// Which registered hotkey id a fired shortcut belongs to, from the managed state.
+fn hotkey_id_for<R: Runtime>(app: &AppHandle<R>, fired: &Shortcut) -> Option<String> {
+    let state = app.try_state::<Hotkeys>()?;
+    let entries = state.0.lock().unwrap();
+    entries
+        .iter()
+        .find(|e| {
+            e.chord
+                .parse::<Shortcut>()
+                .map(|s| s == *fired)
+                .unwrap_or(false)
+        })
+        .map(|e| e.id.clone())
+}
+
+/// Settings ▸ Keyboard reads the shell globals' live status (#1675).
+#[tauri::command]
+fn hotkeys_status(state: tauri::State<'_, Hotkeys>) -> Vec<HotkeyStatus> {
+    state.0.lock().unwrap().clone()
+}
+
+/// Rebind one shell global (#1675): validate the chord, release the old one,
+/// persist, then re-register fallibly — a chord another app owns comes back as
+/// `registered:false` + error rather than an exception, matching launch behavior.
+#[tauri::command]
+fn hotkeys_set<R: Runtime>(
+    app: AppHandle<R>,
+    id: String,
+    chord: String,
+) -> Result<Vec<HotkeyStatus>, String> {
+    use tauri_plugin_global_shortcut::GlobalShortcutExt;
+
+    let chord = chord.trim().to_lowercase();
+    chord
+        .parse::<Shortcut>()
+        .map_err(|e| format!("'{chord}' is not a valid chord: {e}"))?;
+    {
+        let state = app.state::<Hotkeys>();
+        let mut entries = state.0.lock().unwrap();
+        let Some(entry) = entries.iter_mut().find(|e| e.id == id) else {
+            return Err(format!("unknown hotkey id '{id}'"));
+        };
+        if entry.registered {
+            let _ = app.global_shortcut().unregister(entry.chord.as_str());
+        }
+        entry.chord = chord;
+        entry.registered = false;
+        entry.error = None;
+        save_hotkey_overrides(&app, &entries);
+    } // drop the lock — sync_hotkeys re-locks
+    sync_hotkeys(&app);
+    Ok(app.state::<Hotkeys>().0.lock().unwrap().clone())
 }
 
 /// Holds the running sidecar so it can be killed when the app exits.
 #[derive(Default)]
 struct SidecarProcess(Mutex<Option<CommandChild>>);
+
+/// Set when the app is tearing down — a sidecar `Terminated` event during shutdown
+/// is the clean kill, not a crash to alert on.
+static QUITTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A blocking, user-visible "the server didn't come up / died" alert with the log
+/// location — a launch that silently shows a dead console is undebuggable from the
+/// UI alone (#1668: fresh Windows install, blank window, zero diagnostics).
+fn sidecar_alert<R: Runtime>(app: &AppHandle<R>, detail: &str) {
+    let log_dir = app
+        .path()
+        .app_log_dir()
+        .map(|d| d.display().to_string())
+        .unwrap_or_else(|_| "the app's log directory".to_string());
+    app.dialog()
+        .message(format!("{detail}\n\nLogs: {log_dir}"))
+        .title("protoAgent server problem")
+        .buttons(MessageDialogButtons::Ok)
+        .show(|_| {});
+}
 
 /// Split a `:`-delimited PATH string and append each new, non-empty dir to `entries`,
 /// preserving order and skipping duplicates.
@@ -98,18 +287,32 @@ fn spawn_sidecar<R: Runtime>(app: &AppHandle<R>, port: u16) {
         Ok(dir) => dir,
         Err(e) => {
             log::error!("sidecar: cannot resolve app config dir: {e}");
+            sidecar_alert(
+                app,
+                &format!("The server can't start: no app config directory ({e})."),
+            );
             return;
         }
     };
     if let Err(e) = std::fs::create_dir_all(&config_dir) {
         log::error!("sidecar: cannot create config dir {config_dir:?}: {e}");
+        sidecar_alert(
+            app,
+            &format!("The server can't start: config directory {config_dir:?} ({e})."),
+        );
         return;
     }
 
     let command = match app.shell().sidecar("protoagent-server") {
         Ok(cmd) => cmd,
         Err(e) => {
-            log::error!("sidecar: binary not found (run apps/desktop/sidecar/build_sidecar.py): {e}");
+            log::error!(
+                "sidecar: binary not found (run apps/desktop/sidecar/build_sidecar.py): {e}"
+            );
+            sidecar_alert(
+                app,
+                &format!("The bundled server binary is missing or unlaunchable ({e})."),
+            );
             return;
         }
     };
@@ -138,6 +341,7 @@ fn spawn_sidecar<R: Runtime>(app: &AppHandle<R>, port: u16) {
         Ok(pair) => pair,
         Err(e) => {
             log::error!("sidecar: spawn failed: {e}");
+            sidecar_alert(app, &format!("The server failed to launch ({e})."));
             return;
         }
     };
@@ -147,6 +351,7 @@ fn spawn_sidecar<R: Runtime>(app: &AppHandle<R>, port: u16) {
     }
 
     // Drain stdout/stderr so the OS pipe buffer never fills and stalls the child.
+    let alert_handle = app.clone();
     tauri::async_runtime::spawn(async move {
         while let Some(event) = rx.recv().await {
             match event {
@@ -155,6 +360,18 @@ fn spawn_sidecar<R: Runtime>(app: &AppHandle<R>, port: u16) {
                 }
                 CommandEvent::Terminated(payload) => {
                     log::warn!("[sidecar] terminated: {payload:?}");
+                    // A death that ISN'T our shutdown kill leaves a console with no
+                    // server behind it — say so instead of a silently dead window
+                    // (#1668). Boot crashes (port races, bad config) land here too.
+                    if !QUITTING.load(std::sync::atomic::Ordering::Relaxed) {
+                        let code = payload
+                            .code
+                            .map_or("unknown".to_string(), |c| c.to_string());
+                        sidecar_alert(
+                            &alert_handle,
+                            &format!("The server stopped unexpectedly (exit code {code})."),
+                        );
+                    }
                     break;
                 }
                 _ => {}
@@ -246,6 +463,82 @@ fn focus_main<R: Runtime>(app: AppHandle<R>) {
     show_main_window(&app);
 }
 
+
+/// Extract `auth.token` from a protoAgent `secrets.yaml`.
+///
+/// A deliberate hand-scan rather than a YAML dependency: the file is written by our own
+/// Python (ruamel) with a fixed shape, and the desktop binary shouldn't grow a parser for
+/// one two-line lookup. Kept narrow on purpose — a top-level `auth:` block, then an indented
+/// `token:` before the block ends. Anything else returns None and the console falls back to
+/// its normal token prompt.
+fn parse_auth_token(yaml: &str) -> Option<String> {
+    let mut in_auth = false;
+    for line in yaml.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.trim_start().starts_with('#') || trimmed.trim().is_empty() {
+            continue;
+        }
+        let indented = line.starts_with(' ') || line.starts_with('\t');
+        if !indented {
+            // A new top-level key ends the auth block (and starts it, if it IS auth).
+            in_auth = trimmed.trim_end_matches(':').trim() == "auth" && trimmed.ends_with(':');
+            continue;
+        }
+        if !in_auth {
+            continue;
+        }
+        let (key, value) = match trimmed.split_once(':') {
+            Some(pair) => pair,
+            None => continue,
+        };
+        if key.trim() != "token" {
+            continue;
+        }
+        // Strip an inline comment, then surrounding quotes.
+        let mut v = value.trim();
+        if let Some(hash) = v.find(" #") {
+            v = v[..hash].trim();
+        }
+        let v = v.trim_matches('"').trim_matches('\'').trim();
+        if v.is_empty() {
+            return None;
+        }
+        return Some(v.to_string());
+    }
+    None
+}
+
+/// The operator token this app's own server is configured with, if any.
+///
+/// The desktop app SPAWNS the sidecar and sets its `PROTOAGENT_HOME`, so it already has
+/// filesystem access to that server's config — it should never make the operator go hunting
+/// for a secret to unlock an app running on their own machine. The console calls this when it
+/// is running in the desktop shell and hits a 401 (issue #2055).
+///
+/// Delivered over `invoke` rather than `initialization_script`: injection proved unreliable
+/// across Tauri v2 webview contexts (see the API-base handoff above), and a token must never
+/// ride the webview URL, which is visible to the page and anything it embeds.
+///
+/// Returns None when no token is configured — the common, correct case for a loopback-only
+/// install — and the console keeps its existing behaviour.
+#[tauri::command]
+fn auth_token<R: Runtime>(app: AppHandle<R>) -> Option<String> {
+    // Env wins, mirroring the server's own precedence (a2a_impl/auth.py `configure`).
+    if let Ok(t) = std::env::var("A2A_AUTH_TOKEN") {
+        let t = t.trim().to_string();
+        if !t.is_empty() {
+            return Some(t);
+        }
+    }
+    let dir = app.path().app_config_dir().ok()?;
+    let path = dir.join("config").join("secrets.yaml");
+    let found = std::fs::read_to_string(&path).ok().and_then(|b| parse_auth_token(&b));
+    // Logged at INFO without the value: this is the one place that answers "did the shell
+    // hand the webview a token, or is the operator being asked for one the app already had?"
+    log::info!("desktop: auth_token requested — configured: {}", found.is_some());
+    found
+}
+
 /// Check the GitHub Release updater manifest (latest.json) for a newer build;
 /// prompt, download + install, then relaunch. Signatures are verified against
 /// the org minisign pubkey baked into tauri.conf.json.
@@ -262,7 +555,9 @@ fn check_for_updates<R: Runtime>(app: AppHandle<R>, interactive: bool) {
                 log::info!("updater: unavailable for this install: {e}");
                 if interactive {
                     app.dialog()
-                        .message(format!("Updates aren't managed in-app for this install.\n\n{e}"))
+                        .message(format!(
+                            "Updates aren't managed in-app for this install.\n\n{e}"
+                        ))
                         .title("protoAgent updates")
                         .show(|_| {});
                 }
@@ -408,7 +703,10 @@ async fn chat_stream(
         // Relay raw bytes; the webview accumulates + parses SSE (handles frames split
         // across chunks). Stop if the frontend dropped the channel (window closed /
         // turn cancelled via the server-side CancelTask, which ends the stream).
-        if on_event.send(String::from_utf8_lossy(&bytes).into_owned()).is_err() {
+        if on_event
+            .send(String::from_utf8_lossy(&bytes).into_owned())
+            .is_err()
+        {
             break;
         }
     }
@@ -483,9 +781,13 @@ pub fn run() {
             updater_check,
             updater_install,
             hide_launcher,
-            focus_main
+            focus_main,
+            hotkeys_status,
+            hotkeys_set,
+            auth_token
         ])
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         // In-app updates: checks the latest.json manifest on GitHub Releases,
         // verifies the minisign signature, installs, relaunches.
@@ -495,28 +797,22 @@ pub fn run() {
         // menu-bar window is hidden.
         .plugin(tauri_plugin_notification::init())
         .plugin(
-            // Two global, system-wide hotkeys (fire even when the app is unfocused or
-            // hidden in the menu bar):
-            //   ⌘⇧P    — toggle the full console window.
-            //   ⌥Space — summon the Raycast-style quick launcher (just the palette).
-            // ⌥Space is Raycast's familiar alt-default; to rebind, change `launcher_hotkey`
-            // here AND the comparison in the handler (e.g. SUPER|SHIFT + Space if you'd
-            // rather keep Option+Space free for the non-breaking space it normally types).
+            // The global-shortcut HANDLER only — registration happens fallibly in
+            // setup(). Registering here (with_shortcuts) turned a hotkey another app
+            // already owns (Discord, PowerToys, AutoHotkey…) into a
+            // PluginInitialization error that panicked the whole launch at the
+            // top-level .expect — before the window, sidecar, or even logging
+            // existed, so the app just "didn't start" (#1670).
             tauri_plugin_global_shortcut::Builder::new()
-                .with_shortcuts([
-                    Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::KeyP),
-                    Shortcut::new(Some(Modifiers::ALT), Code::Space),
-                ])
-                .expect("valid global shortcuts")
                 .with_handler(|app, shortcut, event| {
                     if event.state != ShortcutState::Pressed {
                         return;
                     }
-                    let launcher_hotkey = Shortcut::new(Some(Modifiers::ALT), Code::Space);
-                    if shortcut == &launcher_hotkey {
-                        toggle_launcher(app);
-                    } else {
-                        toggle_main_window(app);
+                    // Chords are rebindable (#1675) — resolve the fired shortcut to
+                    // its hotkey id via the managed registry, not a hardcoded compare.
+                    match hotkey_id_for(app, shortcut).as_deref() {
+                        Some(HOTKEY_LAUNCHER) => toggle_launcher(app),
+                        _ => toggle_main_window(app),
                     }
                 })
                 .build(),
@@ -534,16 +830,47 @@ pub fn run() {
             )?;
             app.manage(SidecarProcess::default());
 
-            // Pin the sidecar to the fixed port the web client falls back to in
-            // the Tauri context (apps/web/src/lib/api.ts → http://127.0.0.1:7870).
-            // The dynamic-free-port + window-injection handoff proved unreliable
-            // across Tauri v2 webview contexts: the page couldn't see the injected
-            // `__PROTOAGENT_API_BASE__`, fell back to a (then-dead) port, and every
-            // request failed ("Load failed"). A fixed port makes the fallback the
-            // live server — no handoff needed. (Trades multi-agent port
-            // coexistence for a desktop console that actually connects.)
-            let port: u16 = 7870;
+            // Two global, system-wide hotkeys (fire even when the app is unfocused or
+            // hidden in the menu bar): the console toggle and the quick launcher —
+            // defaults in default_hotkeys(), operator overrides from hotkeys.json
+            // (Settings ▸ Keyboard, #1675). FALLIBLE by design (#1670): a hotkey
+            // another app already owns records its state for the settings UI and the
+            // app stays fully usable via the window/tray — it must never abort the
+            // launch. Registered here (after logging init) so warnings land on disk;
+            // re-attempted on window focus (sync_hotkeys in the run handler).
+            {
+                let overrides = load_hotkey_overrides(app.handle());
+                let entries: Vec<HotkeyStatus> = default_hotkeys()
+                    .into_iter()
+                    .map(|(id, default_chord)| HotkeyStatus {
+                        id: id.to_string(),
+                        chord: overrides.get(id).cloned().unwrap_or(default_chord),
+                        registered: false,
+                        error: None,
+                    })
+                    .collect();
+                app.manage(Hotkeys(Mutex::new(entries)));
+                sync_hotkeys(app.handle());
+            }
+
+            // The sidecar prefers the fixed port the web client falls back to in the
+            // Tauri context (apps/web/src/lib/api.ts → http://127.0.0.1:7870) but
+            // yields to a free port when 7870 is held (an orphaned sidecar, a headless
+            // dev server — previously the new sidecar died at bind and the console
+            // showed a dead/foreign server with zero diagnostics, #1668). The chosen
+            // port travels on the webview URL as `?__apiPort=` — the handoff the web
+            // client checks FIRST, chosen over the injected global precisely because
+            // the URL is always visible to the page (the `__PROTOAGENT_API_BASE__`
+            // injection proved unreliable across Tauri v2 webview contexts; it stays
+            // as a secondary channel).
+            let port: u16 = choose_port();
+            if port != DEFAULT_PORT {
+                log::warn!(
+                    "desktop: port {DEFAULT_PORT} is in use — sidecar on {port} (handoff via ?__apiPort)"
+                );
+            }
             spawn_sidecar(app.handle(), port);
+            let app_url = || WebviewUrl::App(format!("index.html?__apiPort={port}").into());
             let init = format!(
                 "window.__PROTOAGENT_API_BASE__ = \"http://127.0.0.1:{port}\";"
             );
@@ -551,11 +878,12 @@ pub fn run() {
             // the host to spawn a child window. We don't host child windows, so without
             // a handler WKWebView silently drops the request and the click does nothing
             // — e.g. the GitHub plugin's PR/issue links were dead in the desktop app.
-            // Open external http(s) links in the system browser (shell:allow-open) and
+            // Open external http(s) links in the system browser (the opener plugin) and
             // deny the in-app window. (Browsers handle this implicitly via allow-popups;
             // the desktop shell has to do it explicitly.)
             let link_opener = app.handle().clone();
-            let mut win = WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
+            #[allow(unused_mut)] // `mut` is only used on the macOS title-bar branch below.
+            let mut win = WebviewWindowBuilder::new(app, "main", app_url())
                 .title("protoAgent")
                 .inner_size(1280.0, 820.0)
                 .min_inner_size(980.0, 640.0)
@@ -565,7 +893,7 @@ pub fn run() {
                 .on_new_window(move |url, _features| {
                     let target = url.as_str();
                     if target.starts_with("http://") || target.starts_with("https://") {
-                        if let Err(e) = link_opener.shell().open(target, None) {
+                        if let Err(e) = link_opener.opener().open_url(target, None::<&str>) {
                             log::error!("desktop: failed to open external link {target}: {e}");
                         }
                     }
@@ -585,14 +913,14 @@ pub fn run() {
 
             // The Raycast-style quick launcher: a second, frameless, always-on-top
             // window hosting ONLY the command palette (the web boots into launcher mode
-            // off `__PROTOAGENT_LAUNCHER__`). Created HIDDEN and reused — the ⌥Space
-            // global shortcut reveals/centers it; it hides on blur (see on_window_event)
-            // or Escape. Same fixed-port API base as the main window.
+            // off `__PROTOAGENT_LAUNCHER__`). Created HIDDEN and reused — the
+            // launcher_shortcut() global hotkey reveals/centers it; it hides on blur
+            // (see on_window_event) or Escape. Same API-base handoff as the main window.
             let launcher_init = format!(
                 "window.__PROTOAGENT_API_BASE__ = \"http://127.0.0.1:{port}\"; \
                  window.__PROTOAGENT_LAUNCHER__ = true;"
             );
-            WebviewWindowBuilder::new(app, "launcher", WebviewUrl::default())
+            WebviewWindowBuilder::new(app, "launcher", app_url())
                 .title("protoAgent — Quick Command")
                 .inner_size(720.0, 480.0)
                 .decorations(false)
@@ -647,9 +975,52 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| {
+            // Re-acquire any global hotkey another app owned earlier but has since
+            // released (#1675) — focus is a cheap, user-driven retry moment (no
+            // polling); sync_hotkeys is a no-op when everything is registered.
+            if let RunEvent::WindowEvent { event: WindowEvent::Focused(true), .. } = &event {
+                sync_hotkeys(app_handle);
+            }
             // Tear the bundled server down with the app rather than orphaning it.
             if let RunEvent::Exit = event {
+                // The kill below fires the sidecar's Terminated event — mark the
+                // shutdown so it isn't alerted as an unexpected server death.
+                QUITTING.store(true, std::sync::atomic::Ordering::Relaxed);
                 kill_sidecar(app_handle);
             }
         });
+}
+
+
+#[cfg(test)]
+mod auth_token_tests {
+    use super::parse_auth_token;
+
+    #[test]
+    fn reads_a_plain_token() {
+        assert_eq!(
+            parse_auth_token("auth:\n  token: abc123\n").as_deref(),
+            Some("abc123")
+        );
+    }
+
+    #[test]
+    fn tolerates_quotes_comments_and_other_blocks() {
+        let y = "model:\n  api_base: https://x\n# a comment\nauth:\n  token: \"q-tok\"  # inline\n";
+        assert_eq!(parse_auth_token(y).as_deref(), Some("q-tok"));
+    }
+
+    #[test]
+    fn ignores_a_token_outside_the_auth_block() {
+        // A `token:` under some OTHER key must not be mistaken for the operator bearer.
+        let y = "gateway:\n  token: not-the-one\n";
+        assert_eq!(parse_auth_token(y), None);
+    }
+
+    #[test]
+    fn returns_none_when_absent_or_empty() {
+        assert_eq!(parse_auth_token("model:\n  api_base: x\n"), None);
+        assert_eq!(parse_auth_token("auth:\n  token:\n"), None);
+        assert_eq!(parse_auth_token(""), None);
+    }
 }

@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { DropdownSelect, Field, FormField, Input, RadioCard, RadioCardGroup, SecretInput, Textarea } from "@protolabsai/ui/forms";
 import { Button, Callout } from "@protolabsai/ui/primitives";
 import { Alert, Spinner } from "@protolabsai/ui/data";
+import { useToast } from "@protolabsai/ui/overlays";
 import {
   Bot,
   Check,
@@ -23,6 +24,18 @@ import { errMsg } from "../lib/format";
 import { lucideIcon } from "../lib/lucideIcon";
 import { acpAgentsQuery, archetypesQuery } from "../lib/queries";
 import type { AgentConfig, Archetype, ConfigPayload } from "../lib/types";
+import { ArchetypePreviewDialog } from "./ArchetypePreviewDialog";
+import { personaSoul } from "./persona";
+
+// One row of the post-install dependency report (finish step): a just-enabled
+// plugin that declares pip deps the runtime doesn't have yet.
+type PostInstallRow = {
+  id: string;
+  name: string;
+  deps: string[];
+  state: "pending" | "busy" | "done" | "error";
+  error: string;
+};
 
 // Four steps: intro, then "who the agent is" (name + persona), then "how it thinks"
 // (the model/coding-agent runtime), then a summary. Identity + persona are one step.
@@ -153,9 +166,10 @@ export function SetupWizard({
 }) {
   const [step, setStep] = useState<Step>("welcome");
   const [state, setState] = useState<WizardState>(() => defaultState());
-  // Starter archetypes (Basic + Project Manager + installed bundles) — the same
-  // source the fleet new-agent picker uses. Each carries a base SOUL the persona
-  // step seeds when picked (ADR 0042).
+  const [previewOpen, setPreviewOpen] = useState(false);
+  // Starter archetypes (the archetype-catalog: Basic + Custom, plus any installed bundle
+  // that self-registers) — the same GET /api/archetypes source the fleet new-agent picker
+  // uses. Each carries a base SOUL the persona step seeds when picked (ADR 0042).
   const archetypes = useQuery(archetypesQuery());
   const acpAgentList = useQuery(acpAgentsQuery()).data?.agents ?? [];
   const [models, setModels] = useState<string[]>([]);
@@ -168,6 +182,13 @@ export function SetupWizard({
   // Result of the last "Test connection" probe (a real completion). null = not
   // yet tested; invalidated whenever the key/base/model changes.
   const [tested, setTested] = useState<null | { ok: boolean; error: string }>(null);
+  // Post-install dependency report: set when the archetype bundle installed fine
+  // but some members declare pip deps the runtime lacks. Non-null = the finish
+  // step stays up showing one-click installs instead of unmounting to a toast.
+  const [postInstall, setPostInstall] = useState<PostInstallRow[] | null>(null);
+  // The bundle-install outcome is surfaced as a toast (not an in-wizard Callout): finishing
+  // setup unmounts the wizard, so a Callout would vanish before it's read.
+  const toast = useToast();
 
   const index = steps.indexOf(step);
 
@@ -271,9 +292,11 @@ export function SetupWizard({
 
   // Picking an archetype card seeds the editor with that archetype's base SOUL
   // — the same archetypes the fleet new-agent picker offers. The textarea stays
-  // freely editable below; this is an explicit "load this persona" action.
+  // freely editable below; this is an explicit "load this persona" action. A bundle
+  // archetype may ship no inline persona, so fall back to the base SOUL rather than
+  // blanking the editor (see personaSoul).
   function pickArchetype(a: Archetype) {
-    update({ archetype: a.id, soul: a.soul });
+    update({ archetype: a.id, soul: personaSoul(a, archetypeList) });
   }
 
   // Pre-fill the editor once with the default archetype's base SOUL so the persona
@@ -287,12 +310,12 @@ export function SetupWizard({
     if (!loaded || seededSoul.current || !archetypeList.length || state.soul.trim()) return;
     const a = archetypeList.find((x) => x.id === state.archetype) ?? archetypeList[0];
     seededSoul.current = true;
-    update({ archetype: a.id, soul: a.soul });
+    update({ archetype: a.id, soul: personaSoul(a, archetypeList) });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loaded, archetypeList, state.soul, state.archetype]);
 
   // The picked archetype drives the finish summary AND (Plan C) the bundle install:
-  // an archetype with a bundle (e.g. Project Manager → pm-stack) installs its plugins
+  // an archetype with a bundle (e.g. Product Manager → product-stack) installs its plugins
   // into this host on finish, so the persona arrives WITH its tools.
   const pickedArchetype = archetypeList.find((a) => a.id === state.archetype);
   const personaLabel = pickedArchetype?.label ?? state.archetype;
@@ -376,34 +399,80 @@ export function SetupWizard({
       if (state.initTasks) {
         await api.initTasks();
       }
-      // Plan C: if the chosen archetype carries a plugin bundle (e.g. Project
-      // Manager → pm-stack), install it into THIS host on finish — so the new user
+      // Plan C: if the chosen archetype carries a plugin bundle (e.g. Product
+      // Manager → product-stack), install it into THIS host on finish — so the new user
       // gets the persona AND its tools/board in one shot, not just the prose.
       // installPlugin auto-enables + hot-reloads the bundle's plugins (no restart).
       // A failure is non-fatal: setup is already written, so we finish anyway and
       // point the user at Settings ▸ Plugins.
+      // Surface the outcome as a TOAST, not an in-wizard Callout: onFinished() below
+      // unmounts the wizard (setup_complete flips true), so a Callout would vanish before
+      // it's read — especially the enable/failure guidance the user needs to act on. The
+      // in-progress "Setting up…" message stays inline (the wizard is still open during the
+      // install await).
       if (pickedBundle) {
         setMessage(`Setting up the ${personaLabel} tools — this can take a few seconds…`);
         try {
           const r = await api.installPlugin(pickedBundle);
-          setMessage(
-            r.enable_error
-              ? `Setup complete. The ${personaLabel} tools installed but couldn't auto-enable (${r.enable_error}) — turn them on in Settings ▸ Plugins.`
-              : `Setup complete — ${personaLabel} tools are ready.`,
-          );
+          if (r.enable_error) {
+            toast({
+              tone: "info",
+              title: "Setup complete",
+              message: `${personaLabel} tools installed but couldn't auto-enable (${r.enable_error}) — turn them on in Settings ▸ Plugins.`,
+            });
+          } else {
+            toast({ tone: "success", title: "Setup complete", message: `${personaLabel} tools are ready.` });
+            // If any just-enabled member declares pip deps the runtime lacks, keep the
+            // wizard open on a one-click dependency report instead of unmounting —
+            // previously this was an "install manually" advisory buried in a toast.
+            try {
+              const inst = await api.installedPlugins();
+              const needy = inst.plugins.filter((p) => r.enabled.includes(p.id) && p.deps_missing?.length);
+              if (needy.length) {
+                setMessage("");
+                setPostInstall(
+                  needy.map((p) => ({
+                    id: p.id,
+                    name: p.manifest?.name || p.id,
+                    deps: p.deps_missing ?? [],
+                    state: "pending" as const,
+                    error: "",
+                  })),
+                );
+                return;
+              }
+            } catch {
+              // advisory only — a failed report check must never block finishing
+            }
+          }
         } catch (exc) {
-          setMessage(
-            `Setup complete, but installing the ${personaLabel} tools failed (${errMsg(exc)}). You can add them later in Settings ▸ Plugins.`,
-          );
+          toast({
+            tone: "error",
+            title: "Setup complete",
+            message: `Installing the ${personaLabel} tools failed (${errMsg(exc)}). Add them later in Settings ▸ Plugins.`,
+          });
         }
       } else {
-        setMessage(response.message);
+        toast({ tone: "success", title: "Setup complete", message: response.message || "Your agent is ready." });
       }
       onFinished();
     } catch (exc) {
       setError(errMsg(exc));
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function installDepsFor(id: string) {
+    setPostInstall((rows) => rows?.map((r) => (r.id === id ? { ...r, state: "busy" as const } : r)) ?? null);
+    try {
+      await api.installPluginDeps(id);
+      setPostInstall((rows) => rows?.map((r) => (r.id === id ? { ...r, state: "done" as const } : r)) ?? null);
+    } catch (exc) {
+      setPostInstall(
+        (rows) =>
+          rows?.map((r) => (r.id === id ? { ...r, state: "error" as const, error: errMsg(exc) } : r)) ?? null,
+      );
     }
   }
 
@@ -462,6 +531,14 @@ export function SetupWizard({
                   <RadioCard key={a.id} value={a.id} icon={lucideIcon(a.icon, 22)} title={a.label} blurb={a.blurb} />
                 ))}
               </RadioCardGroup>
+              {pickedArchetype ? (
+                <button type="button" className="archetype-preview-link" onClick={() => setPreviewOpen(true)}>
+                  See what&apos;s included in {pickedArchetype.label} →
+                </button>
+              ) : null}
+              {previewOpen && pickedArchetype ? (
+                <ArchetypePreviewDialog archetype={pickedArchetype} onClose={() => setPreviewOpen(false)} />
+              ) : null}
               <FormField label="SOUL.md">
                 <Textarea className="setup-editor" value={state.soul} onChange={(event) => update({ soul: event.target.value })} />
               </FormField>
@@ -565,10 +642,40 @@ export function SetupWizard({
                 )}
                 <StatusLine icon={<Sparkles size={15} />} label={`Persona · ${personaLabel}`} />
               </div>
-              <p className="setup-intro setup-intro-foot">
-                Finishing writes your config and starts the agent. Tools, knowledge, and
-                integrations are all in Settings.
-              </p>
+              {postInstall ? (
+                <div className="setup-postinstall">
+                  <p className="setup-hint">
+                    Your tools are installed. A few need Python packages before their skills can run — install them
+                    now, or later from Settings ▸ Plugins.
+                  </p>
+                  {postInstall.map((row) => (
+                    <div key={row.id} className="setup-postinstall-row">
+                      <div className="setup-postinstall-info">
+                        <strong>{row.name}</strong>
+                        <span>{row.deps.join(", ")}</span>
+                        {row.state === "error" ? <span className="setup-postinstall-error">{row.error}</span> : null}
+                      </div>
+                      <Button
+                        type="button"
+                        onClick={() => void installDepsFor(row.id)}
+                        disabled={row.state === "busy" || row.state === "done"}
+                      >
+                        {row.state === "busy" ? <Spinner size={14} /> : null}
+                        {row.state === "done" ? "Installed ✓" : row.state === "error" ? "Retry" : "Install"}
+                      </Button>
+                    </div>
+                  ))}
+                  <p className="setup-hint">
+                    Next, in Settings: add your work folders (Tools) so files land where you expect, and install
+                    plugins (Plugins).
+                  </p>
+                </div>
+              ) : (
+                <p className="setup-intro setup-intro-foot">
+                  Finishing writes your config and starts the agent. Tools, knowledge, and
+                  plugins are all in Settings.
+                </p>
+              )}
               {message ? <Callout>{message}</Callout> : null}
             </StepBody>
           ) : null}
@@ -576,15 +683,28 @@ export function SetupWizard({
           {error ? <Callout tone="error">{error}</Callout> : null}
 
           <div className="setup-actions">
-            <Button type="button" onClick={() => setStep(steps[Math.max(0, index - 1)])} disabled={index === 0 || busy}>
+            <Button
+              type="button"
+              onClick={() => setStep(steps[Math.max(0, index - 1)])}
+              disabled={index === 0 || busy || Boolean(postInstall)}
+            >
               <ChevronLeft size={15} />
               Back
             </Button>
             {step === "finish" ? (
-              <Button variant="primary" type="button" onClick={() => void finishSetup()} disabled={busy}>
-                {busy ? <Spinner size={15} /> : <Check size={15} />}
-                Finish
-              </Button>
+              postInstall ? (
+                // Setup is already written and the bundle installed — this just closes
+                // the report. Pending deps are re-installable from Settings ▸ Plugins.
+                <Button variant="primary" type="button" onClick={onFinished} disabled={postInstall.some((r) => r.state === "busy")}>
+                  <Check size={15} />
+                  Open console
+                </Button>
+              ) : (
+                <Button variant="primary" type="button" onClick={() => void finishSetup()} disabled={busy}>
+                  {busy ? <Spinner size={15} /> : <Check size={15} />}
+                  Finish
+                </Button>
+              )
             ) : (
               <Button variant="primary" type="button" onClick={() => setStep(steps[Math.min(steps.length - 1, index + 1)])} disabled={!canGoNext || busy}>
                 Next

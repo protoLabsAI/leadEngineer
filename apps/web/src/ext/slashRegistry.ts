@@ -12,7 +12,17 @@
 // Core itself registers `/new`, `/clear`, `/effort` through this seam (see
 // `chat/coreSlashCommands.ts`) — the seam is the only path, not a special case.
 
-import type { SystemNoteTone } from "../lib/types";
+import type { HitlPayload, SystemNoteTone } from "../lib/types";
+
+/** A form a CLIENT command opens in the composer (#1701). Rendered through the SAME
+ *  `HitlForm` the agent's HITL interrupt uses, but resolved LOCALLY: the host shows
+ *  `payload` and calls `onSubmit` with the answers (a values record for a `kind:"form"`
+ *  payload) — no agent round-trip. `onCancel` fires if the operator dismisses it. */
+export type ComposerFormSpec = {
+  payload: HitlPayload;
+  onSubmit: (answers: Record<string, unknown> | string) => void;
+  onCancel?: () => void;
+};
 
 /** What a client slash command's handler receives. The host (ChatSurface) builds this
  *  from its local state + the chat store when the command fires. */
@@ -28,6 +38,20 @@ export type SlashContext = {
   setDraft: (text: string) => void;
   /** Return focus to the composer textarea. */
   focusComposer: () => void;
+  /** Open a form in the composer panel (#1701) — the same `HitlForm` the agent's HITL
+   *  interrupt uses, resolved LOCALLY (host renders `spec.payload`, calls `spec.onSubmit`
+   *  with the answers, no agent round-trip). Lets a command (e.g. `/effort`) or a fork
+   *  present a picker/wizard instead of a note. Optional: a host that hasn't wired the
+   *  panel omits it, so a command must fall back gracefully when it's absent. */
+  openForm?: (spec: ComposerFormSpec) => void;
+  /** The host's developer-flag predicate (ADR 0068) — the SAME gate that hides/skips
+   *  flag-tagged commands — so a command that enumerates the registry (e.g. `/help`)
+   *  applies the host's visibility rules instead of guessing. Fail-closed when absent. */
+  flagOn?: (id: string) => boolean;
+  /** SERVER slash commands as the host fetched them (`/api/chat/commands` — `/goal`,
+   *  plugin commands…), so a registry-enumerating command reflects what's actually
+   *  installed rather than a hardcoded list. */
+  serverCommands?: { name: string; description: string; usage?: string }[];
 };
 
 export type ClientSlashCommand = {
@@ -37,6 +61,12 @@ export type ClientSlashCommand = {
   description: string;
   /** Optional usage hint. */
   usage?: string;
+  /** Optional developer-flag id (ADR 0068). When set, the host lists and dispatches the
+   *  command only while the flag resolves ON (`useFlagPredicate`) — a flag-off command
+   *  behaves as if it were never registered (the token falls through to the server /
+   *  draft path). Registration itself is unconditional, so flipping the flag needs no
+   *  re-registration. */
+  flag?: string;
   /** Run when the user picks or submits `/<name>`. Return `true` if handled (the send is
    *  short-circuited + the draft cleared); return `false` to fall through to the default
    *  (insert `/<name> ` into the draft to edit + send). Fire async work and return `true`
@@ -63,4 +93,36 @@ export function registeredSlashCommands(): ClientSlashCommand[] {
 export function findSlashCommand(token: string): ClientSlashCommand | undefined {
   const t = (token || "").trim().toLowerCase();
   return _commands.find((c) => c.name === t);
+}
+
+/** Parse the slash-command token the caret currently sits in — powers the MID-INPUT
+ *  popover (#1530), so typing "/" opens the menu at ANY cursor position, not only when
+ *  "/" is the first character. A token is a "/" at the start of the input OR immediately
+ *  after whitespace, running up to the caret with no intervening whitespace. Returns the
+ *  `query` (the text after the "/", up to the caret — what filters the popover), the token's
+ *  `start` index, and its `end` index (the token runs to the next whitespace, which may be
+ *  PAST the caret when completing mid-token — both bound a caret-anchored replace that
+ *  preserves surrounding text), or null when the caret is not inside a token. */
+export function slashTokenAt(
+  text: string,
+  caret: number,
+): { query: string; start: number; end: number } | null {
+  const pos = Math.max(0, Math.min(caret, text.length));
+  let start = pos;
+  while (start > 0 && !/\s/.test(text[start - 1])) start -= 1;
+  if (text[start] !== "/") return null;
+  // End of the token = next whitespace at/after the caret, so completing with the caret in
+  // the MIDDLE of "/token" replaces the whole token, not just up to the caret (no tail left).
+  let end = pos;
+  while (end < text.length && !/\s/.test(text[end])) end += 1;
+  return { query: text.slice(start + 1, pos), start, end };
+}
+
+/** The command name of a user message that IS a slash command (e.g. "/goal ship it" →
+ *  "goal"), or null. Used to render an issued command as a distinct user bubble (#1529).
+ *  Anchored at the start and requiring a letter-led word that ends at whitespace or EOL, so
+ *  a file path like "/home/user" (a "/" followed by more path) is NOT mistaken for one. */
+export function slashCommandName(content: string): string | null {
+  const m = /^\/([a-z][\w-]*)(?=\s|$)/i.exec(content.trim());
+  return m ? m[1] : null;
 }

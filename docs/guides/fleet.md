@@ -9,7 +9,7 @@ primitives:
 |---|---|---|
 | **Workspace** | a named agent — its own config, secrets, plugins, scoped data, port | [0041](../adr/0041-workspaces-and-tiered-stores.md) |
 | **Bundle** | a curated, pinned set of plugins installed as one | [0040](../adr/0040-plugin-bundles.md) |
-| **Archetype** | a bundle presented as a starter *agent type* (or the built-in **Basic**) | [0042](../adr/0042-fleet-supervisor-unified-console.md) |
+| **Archetype** | a starter *agent type* in the new-agent picker — the built-in **Basic**/**Custom** (from a data-driven catalog) plus any installed bundle that declares one | [0042](../adr/0042-fleet-supervisor-unified-console.md) |
 | **Tiered stores** | per-agent private data + an opt-in shared **commons** | [0041](../adr/0041-workspaces-and-tiered-stores.md) |
 | **Supervisor** | run agents as persistent background processes (start/stop/status) | [0042](../adr/0042-fleet-supervisor-unified-console.md) |
 | **Unified console** | one slug-routed console that hot-swaps between running agents (per-agent layout/theme) | [0042](../adr/0042-fleet-supervisor-unified-console.md) |
@@ -17,8 +17,8 @@ primitives:
 ## Quick start
 
 ```bash
-# an agent from the "Project Manager" archetype (the pm-stack bundle)
-python -m server workspace new pm --bundle https://github.com/protoLabsAI/pm-stack
+# an agent from a bundle archetype (the product-stack bundle: PM toolkit + generative UI)
+python -m server workspace new pm --bundle https://github.com/protoLabsAI/product-stack
 
 # a blank-slate agent (the built-in Basic archetype — core loop + tools, no plugins)
 python -m server workspace new scratch
@@ -26,7 +26,7 @@ python -m server workspace new scratch
 # run the whole fleet in the background, then look at it
 python -m server fleet up
 python -m server fleet ls
-#   ● pm        :7871  pid 12345  [pm-stack]
+#   ● pm        :7871  pid 12345  [product-stack]
 #   ● scratch   :7872  pid 12346
 ```
 
@@ -57,7 +57,7 @@ suggested enable list + config. Install one into a workspace and you skip the
 plugin-by-plugin setup:
 
 ```bash
-python -m server plugin install https://github.com/protoLabsAI/pm-stack   # fans out + pins each member
+python -m server plugin install https://github.com/protoLabsAI/product-stack   # fans out + pins each member
 ```
 
 A bundle that carries an **`archetype:`** block becomes a **starter agent type** the
@@ -65,22 +65,30 @@ new-agent picker offers — additive metadata, no change to the bundle shape:
 
 ```yaml
 # protoagent.bundle.yaml
-id: pm-stack
+id: product-stack
 plugins: [ … ]
 enabled: [ … ]
 archetype:
-  label: Project Manager
-  icon: LayoutGrid
-  blurb: Board-driven shipping agent — decomposes an idea and ships it via coding agents.
+  label: Product Manager
+  icon: Compass
+  blurb: Researches, strategizes, and specs products from evidence — renders roadmaps and personas inline.
 ```
 
-Two starter types exist today:
+The picker draws from **two** sources:
 
-- **Basic** — built-in, ships with protoAgent: the bare agent loop + built-in tools, **no
-  plugins**. It's just `workspace new <name>` with no `--bundle` (the "start from scratch").
-- **Project Manager** — the [pm-stack](https://github.com/protoLabsAI/pm-stack) bundle.
+- **The archetype catalog** — `config/archetype-catalog.json`, served by `GET /api/archetypes`.
+  It ships the two code-free personas — **Basic** (the bare loop + tools, no plugins) and
+  **Custom** (write-your-own SOUL) — and is **data-driven**: add or remove archetypes by
+  editing the JSON, no code change. A fork or instance overrides it by dropping its own
+  `archetype-catalog.json` in the live config dir (same rule as `plugin-catalog.json`). Each
+  entry names a `soul_preset` (a file under `config/soul-presets/`) or an inline `soul` for the
+  base persona.
+- **Installed bundles** — any bundle whose manifest carries an `archetype:` block
+  **self-registers** on top of the catalog (deduped by id + bundle URL). Install the bundle
+  and its starter type appears in the picker for free — no catalog edit needed.
 
-Every future bundle that adds an `archetype:` block becomes a starter type for free. See
+Picking an archetype seeds the new agent's **persona** (its `SOUL.md`) from that base, and — if
+it carries a bundle — installs the bundle's plugins into the new agent. See
 [Install & publish plugins](./plugin-registry.md).
 
 ## Tiered stores — private by default, share what should be shared
@@ -122,6 +130,55 @@ a `fleet.json` registry. Because each agent's chat history is scoped to its own
 checkpoints, a **stopped agent's session resumes** when you restart it — and a **running**
 one keeps its background work (schedules, an in-flight loop) going while you're elsewhere.
 
+## Deploying a team — config-as-code (`fleet.autostart`) {#deploying-a-team}
+
+The commands above are **imperative** — you create members and start them by hand. That's
+fine at the console, but a team you *deploy* (a lead plus the specialist members it delegates
+to) should be a **config-as-code artifact**: baked into an image, versioned, and stood up with
+one `docker compose up`. Two pieces make that real.
+
+**1. Declare the crew — `fleet.autostart`.** A container recreate (an image roll) or a host
+restart kills the members' detached processes; `fleet.json` survives in the volume with
+now-dead pids, but nothing restarts them — so a hand-assembled crew silently stays down until
+you re-activate each one. List the members the hub should keep up and it **(re)starts them on
+boot**:
+
+```yaml
+fleet:
+  autostart: [cindi, matt]   # member ids or display names
+```
+
+(or `PROTOAGENT_FLEET_AUTOSTART=cindi,matt` in the environment). It runs right after the boot
+version-reconcile: **idempotent** (an already-running member is skipped), **best-effort** (a
+missing workspace or a failed spawn is logged and skipped — never blocks boot), and **hub-only**
+(a member's own scoped config carries no roster, so it no-ops inside a member).
+
+> Autostart restarts the member **process**; it does not by itself resume the **work** that
+> process was doing. A member whose job is a long-running background loop (a trading engine, a
+> poller) needs its *plugin* to resume that loop when it boots — see
+> [surfaces that resume across reloads](./plugins.md#surface-resume). The two compose: autostart
+> brings the agent back, the surface pattern brings its work back, and a host restart recovers
+> the whole crew with no manual steps.
+
+**2. Bake the lead + personas as seeds.** The lead's own config and persona seed from
+`PROTOAGENT_SEED_CONFIG` and `PROTOAGENT_SEED_SOUL` on first boot (seed-not-force — operator
+edits persist), so the whole team ships in one image with no wizard. See
+[Deploy with Docker](./deploy-docker.md) for the seed pattern and the volume-shadow traps it
+avoids.
+
+Put together, a deployed team is **lead config seed + persona seed + `fleet.autostart` roster +
+[`delegate_to`](./delegates.md) wiring** — `docker compose up` brings up the lead, restarts the
+crew, and hands real work to them (delegation is reliable past 60s as of
+[#1788](https://github.com/protoLabsAI/protoAgent/pull/1788); a member's turn budget is its
+delegate `poll_timeout_s`).
+
+> **Reproducible-from-zero is the next step, not this one.** `fleet.autostart` reconciles members
+> that already **exist** (created via the console, `POST /api/fleet`, or `--from`/`--bundle`) and
+> references them by id/name — so a full volume wipe that must recreate them from scratch is out of
+> scope. Creating members from archetypes, auto-deriving the lead's delegates, and a shared commons
+> — a whole team from a single baked manifest — is [ADR 0072](../adr/0072-fleet-seed-team-via-config.md)'s
+> `PROTOAGENT_SEED_FLEET`; `fleet.autostart` is its first shipped slice.
+
 ## The unified console — every agent in one UI
 
 *(Shipped — ADR 0042 slices 2–5.)* The **hub** (any running agent) serves one console and
@@ -133,7 +190,24 @@ navigate to it; "+ New agent" runs the archetype picker. A plugin view served by
 that opens a **WebSocket** (e.g. `agent_browser`'s live viewport) works through the hub too:
 the slug proxy forwards WS upgrades, not just HTTP/SSE ([#883](https://github.com/protoLabsAI/protoAgent/issues/883), shipped v0.35.0). Settings → Agents is the fleet manager
 (create / start / stop / rename / remove), and **Discover** finds other protoAgents on the
-box, the LAN (mDNS) and your **tailnet** (via the Tailscale CLI).
+box, the LAN (mDNS) and your **tailnet** (via the Tailscale CLI). **mDNS is off by default**
+([#1802](https://github.com/protoLabsAI/protoAgent/issues/1802)) — an agent stays quiet on the
+network and won't announce itself over LAN Bonjour unless you enable `fleet.discovery.mdns`
+(Settings → Host → Discovery), a privacy/security-first default. Local-box and tailnet discovery
+and manual register are unaffected, and the fleet console still lists your own members (it reads
+them from disk, not mDNS). To flip a local member
+on or off without opening Settings, press **⌘K → Toggle Fleet Agent** and pick it from the
+picker (the host and remote members are never listed) — see
+[command palette](./command-palette.md).
+
+**Fleet settings are hub-only.** The topbar dropdown's **Fleet settings** item is enabled
+on the host window (and on a standalone instance — that's where you create your first
+member); in a *member* window it renders **disabled** with a tooltip pointing you at the
+host instance. That covers both a member's slug window and a spawned workspace member
+opened directly on its own port — the member self-reports `member: true` on its own
+`GET /api/fleet` host entry (its instance root carries the `workspace.yaml` spawn marker).
+A **remote** member opened at its own URL stays enabled on purpose: it's an independent
+instance that may run its own fleet, and registration is one-sided on the hub.
 
 ## Remote fleet members — the agent there, the UI here
 
@@ -172,6 +246,8 @@ vA.B.C — features may misbehave"). Upgrade the lagging side to clear it.
 
 - ADRs: [0040 bundles](../adr/0040-plugin-bundles.md) ·
   [0041 workspaces & tiered stores](../adr/0041-workspaces-and-tiered-stores.md) ·
-  [0042 fleet supervisor & unified console](../adr/0042-fleet-supervisor-unified-console.md)
-- Guides: [multi-instance scoping](./multi-instance.md) · [plugins](./plugins.md) ·
+  [0042 fleet supervisor & unified console](../adr/0042-fleet-supervisor-unified-console.md) ·
+  [0072 fleet seed / team-via-config](../adr/0072-fleet-seed-team-via-config.md)
+- Guides: [deploy with Docker](./deploy-docker.md) · [delegates](./delegates.md) ·
+  [multi-instance scoping](./multi-instance.md) · [plugins](./plugins.md) ·
   [install & publish plugins](./plugin-registry.md) · [skills](./skills.md)

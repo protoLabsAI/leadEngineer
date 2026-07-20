@@ -1,0 +1,122 @@
+[
+  {
+    "status": "Planned",
+    "items": [
+      {
+        "title": "Signed Windows installer",
+        "detail": "Authenticode-sign the desktop setup.exe — Windows leaves the notify-me gate when it ships.",
+        "refs": [
+          "#1689"
+        ]
+      },
+      {
+        "title": "Multi-window desktop chat",
+        "detail": "\"Open in New Window\" spawns a real second desktop window with its own chat surface.",
+        "refs": [
+          "#1706"
+        ]
+      },
+      {
+        "title": "Plugin Python deps in the desktop app",
+        "detail": "opt-in install of a plugin's requires_pip packages inside the frozen desktop build.",
+        "refs": [
+          "#1631"
+        ]
+      },
+      {
+        "title": "Federation token follow-ups",
+        "detail": "management UI, peer rotation, and fleet integration for ADR 0066 tokens.",
+        "refs": [
+          "#1504"
+        ]
+      },
+      {
+        "title": "Backend-agnostic tracing",
+        "detail": "generic OTLP / OpenInference trace export instead of hard-coding the Langfuse SDK.",
+        "refs": [
+          "#1884"
+        ]
+      },
+      {
+        "title": "Ollama & Hugging Face listings",
+        "detail": "register protoAgent as an Ollama community integration and a Hugging Face \"Use this model\" local app.",
+        "refs": [
+          "#1833",
+          "#1834"
+        ]
+      }
+    ]
+  },
+  {
+    "status": "In progress",
+    "items": [
+      {
+        "title": "Image generation plugin (protobanana)",
+        "detail": "generate → look → refine image workflows on the new media platform: tools save artifacts the chat renders inline, and the vision model critiques its own output.",
+        "refs": []
+      }
+    ]
+  },
+  {
+    "status": "Shipped",
+    "items": [
+      {
+        "title": "Production traces → training flywheel",
+        "detail": "per-turn trajectory export from production agents into the lab for downstream training-data collection.",
+        "refs": [
+          "#1897"
+        ]
+      },
+      {
+        "title": "Autonomous operating model",
+        "detail": "goals, tasks, scheduling, and watches compose into one self-directed OODA loop, with durable task→goal attribution.",
+        "refs": [
+          "v0.98.0"
+        ]
+      },
+      {
+        "title": "Media platform",
+        "detail": "plugin tools save generated images/audio/video the chat renders inline (signed URLs, bearer-safe), and can return images a vision model actually sees.",
+        "refs": [
+          "v0.98.0"
+        ]
+      },
+      {
+        "title": "Fleet trace export",
+        "detail": "opt-in per-turn trajectory rows (OpenAI chat format + verifiable reward) with a PII-redacting sync pipeline.",
+        "refs": [
+          "v0.97.0"
+        ]
+      },
+      {
+        "title": "Migrate from Hermes or OpenClaw",
+        "detail": "import scripts that carry an existing agent's config, memory, and history into protoAgent.",
+        "refs": [
+          "v0.96.0",
+          "v0.93.0"
+        ]
+      },
+      {
+        "title": "Rewind a chat thread",
+        "detail": "jump a conversation back to an earlier message and branch from there.",
+        "refs": [
+          "v0.90.0"
+        ]
+      },
+      {
+        "title": "Plugin management from the rail",
+        "detail": "installed version, \"update if available\", and uninstall — from the rail context menu and a settings panel.",
+        "refs": [
+          "v0.89.0"
+        ]
+      },
+      {
+        "title": "One-command install",
+        "detail": "a curl | sh bootstrap with an interactive CLI config wizard.",
+        "refs": [
+          "#1520"
+        ]
+      }
+    ]
+  }
+]

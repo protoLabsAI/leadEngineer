@@ -20,7 +20,7 @@ from graph.middleware.memory import SessionSummaryMiddleware
 from graph.middleware.message_capture import MessageCaptureMiddleware
 from graph.state import ProtoAgentState
 from graph.subagents.config import SUBAGENT_REGISTRY
-from tools.lg_tools import HITL_TOOL_NAMES, _session_id_from, get_all_tools
+from tools.lg_tools import HITL_TOOL_NAMES, _session_id_from, drop_disabled_tools, get_all_tools
 
 
 def _build_middleware(config: LangGraphConfig, knowledge_store=None, skills_index=None, extra_middleware=None):
@@ -75,6 +75,17 @@ def _build_middleware(config: LangGraphConfig, knowledge_store=None, skills_inde
         )
     )
 
+    # Fleet tracing: stamp the active Langfuse trace context onto each gateway
+    # LLM call (extra_body.metadata existing_trace_id/parent_observation_id) so
+    # the gateway's own Langfuse callback lands its generations in OUR trace.
+    # Inside ModelOverride (it must stamp the ACTUAL per-tab model) and inside
+    # PromptCache (whose locked [ModelOverride, PromptCache] wrapper order and
+    # caching decisions stay untouched — this only copies extra_body). No-op
+    # when tracing is disabled.
+    from graph.middleware.trace_context import TraceContextMiddleware
+
+    middleware.append(TraceContextMiddleware())
+
     # Enforcement gate first (outermost) so disallowed/rate-limited tool
     # calls are blocked before any execution. Opt-in via config.
     if config.enforcement_enabled and (config.enforcement_disallowed_tools or config.enforcement_rate_limits):
@@ -87,6 +98,23 @@ def _build_middleware(config: LangGraphConfig, knowledge_store=None, skills_inde
             )
         )
 
+    # Per-turn subagent tool fence for detached background runs (#1639) — sits with
+    # the enforcement gate (block before execution). Always on: it's a no-op unless
+    # the turn's state carries `subagent_fence` (stamped only by the background fire
+    # path for registry subagents), so ordinary turns pay one dict lookup.
+    from graph.middleware.subagent_fence import SubagentFenceMiddleware
+
+    middleware.append(SubagentFenceMiddleware())
+
+    # Multimodal tool results (#1930) — a tool that opts in (via the
+    # graph.multimodal sentinel envelope) can return an image the vision model
+    # SEES as ToolMessage content blocks; on a text-only model it degrades to
+    # the text part (optionally described via knowledge.image_describe_model).
+    # Always on: inert for every ordinary tool (one startswith per result).
+    from graph.middleware.multimodal_tool import build_multimodal_middleware
+
+    middleware.append(build_multimodal_middleware(config))
+
     # KnowledgeMiddleware also carries the always-on skill index (the
     # <available_skills> injection, ADR 0060). Build it when knowledge OR skills
     # is active, so skills work even on a KB-less agent (the store is None-tolerant).
@@ -98,6 +126,8 @@ def _build_middleware(config: LangGraphConfig, knowledge_store=None, skills_inde
                 top_k=config.knowledge_top_k,
                 skills_index=_skills_index,
                 skills_top_k=config.skills_top_k,
+                inject_namespaces=config.knowledge_inject_namespaces,
+                inject_min_trust=config.knowledge_inject_min_trust,
             )
         )
 
@@ -174,6 +204,36 @@ def _resolve_aux_model(config, specific: str = "") -> str | None:
         cleaned = (candidate or "").strip()
         if cleaned:
             return cleaned
+    return None
+
+
+def _incognito_from(state: Any) -> bool:
+    """Whether the CURRENT turn is incognito, read from injected graph state (the
+    same source ``_session_id_from`` uses — the tracing contextvar is not visible
+    in tool bodies). Propagated onto spawned background jobs (ADR 0070) so their
+    completions honor the no-memory-trail contract (ADR 0069 D3b)."""
+    return bool(state.get("incognito")) if isinstance(state, dict) else False
+
+
+def _turn_id_from(state: Any) -> str | None:
+    """The id of the EMITTING assistant turn — the ``AIMessage`` carrying the tool
+    calls (``messages[-1]`` at tool-execution time). Used as the fan-out batch key
+    (#1766): every background job a single turn spawns (task_batch's N specs, or a
+    lone ``task(run_in_background=True)``) shares this id, so their completions
+    coalesce into ONE push-resume when the last member settles. Best-effort — returns
+    ``None`` on any miss, so the job simply falls back to the singleton path (its own
+    push-resume), same as before."""
+    if not isinstance(state, dict):
+        return None
+    try:
+        messages = state.get("messages") or []
+        last = messages[-1] if messages else None
+        # Only the AIMessage carrying tool calls is a valid turn key; a ToolMessage or
+        # a bare AIMessage without tool_calls is not the fan-out's emitter.
+        if last is not None and getattr(last, "tool_calls", None):
+            return getattr(last, "id", None) or None
+    except Exception:  # noqa: BLE001 — batch keying is best-effort; None → singleton path
+        return None
     return None
 
 
@@ -257,13 +317,29 @@ async def _run_subagent(
         return f"Error: No tools available for subagent '{subagent_type}'."
 
     # Subagent model: per-subagent override → routing.aux_model → main model.
-    sub_llm = create_llm(config, model_name=_resolve_aux_model(config, getattr(sub_config, "model", "")))
+    sub_model = _resolve_aux_model(config, getattr(sub_config, "model", ""))
+    sub_llm = create_llm(config, model_name=sub_model)
 
     # Subagents do real work (tool calls), so the enforcement rail (ADR 0003) should
     # cover them too — not just the lead agent. Mirror the lead's gate so a disallowed/
     # rate-limited tool is blocked inside a delegation. (Per-instance limiter: each
     # subagent run gets its own window — a per-delegation cap, not a shared budget.)
-    sub_middleware = [AuditMiddleware()]
+    # TraceContextMiddleware mirrors the lead chain too: the subagent's gateway LLM
+    # calls join the SAME Langfuse trace (nested under the subagent boundary span).
+    from graph.middleware.trace_context import TraceContextMiddleware
+
+    # Multimodal tool results (#1930) mirror the lead chain too — otherwise an
+    # opt-in tool called inside a delegation would leak its raw base64 envelope
+    # into the subagent's context. Vision only when the delegation runs on the
+    # MAIN model (`sub_model is None`): `model.vision` describes that model, and
+    # an aux/per-subagent override may be text-only — those degrade to text.
+    from graph.middleware.multimodal_tool import build_multimodal_middleware
+
+    sub_middleware = [
+        TraceContextMiddleware(),
+        AuditMiddleware(),
+        build_multimodal_middleware(config, vision=(sub_model is None and getattr(config, "model_vision", False))),
+    ]
     if getattr(config, "enforcement_enabled", False) and (
         config.enforcement_disallowed_tools or config.enforcement_rate_limits
     ):
@@ -294,10 +370,36 @@ async def _run_subagent(
         sub_run_config["metadata"] = {"parent_task_id": parent_task_id}
 
     try:
-        result = await subagent.ainvoke(
-            {"messages": [{"role": "user", "content": prompt}]},
-            config=sub_run_config,
-        )
+        # Stream values (not ainvoke) so the last state survives a recursion-limit
+        # stop: every subagent prompt promises "hard stop at max_turns: return what
+        # you have", but ainvoke() RAISES GraphRecursionError and loses the run —
+        # a finder that read one file too many failed its whole panel step (seen
+        # live: ADR 0078 shadow reviews on protoContent, GRAPH_RECURSION_LIMIT).
+        # max_turns is a budget, not a bomb: on the limit, salvage the transcript.
+        from langgraph.errors import GraphRecursionError
+
+        from observability import tracing
+
+        result: dict[str, Any] = {}
+        hard_stop = False
+        # Boundary span (fleet tracing): the subagent's tool/LLM observations
+        # nest under one `subagent:<type>` node in the current trace instead of
+        # scattering across the session span. No-op when tracing is disabled;
+        # exceptions (incl. GraphRecursionError salvage) pass through unchanged.
+        with tracing.trace_span(
+            f"subagent:{subagent_type}",
+            metadata={"description": description, "parent_task_id": parent_task_id or ""},
+            as_type="agent",
+        ):
+            try:
+                async for state in subagent.astream(
+                    {"messages": [{"role": "user", "content": prompt}]},
+                    config=sub_run_config,
+                    stream_mode="values",
+                ):
+                    result = state
+            except GraphRecursionError:
+                hard_stop = True
 
         messages = result.get("messages", [])
 
@@ -313,11 +415,21 @@ async def _run_subagent(
                 break
 
         if body is None:
+            if hard_stop:
+                return (
+                    f"[{subagent_type} hard-stopped at max_turns: {description}] -- no salvageable "
+                    "output; treat this lane as a Gap, not a verdict."
+                )
             return f"[{subagent_type} completed: {description}] -- no output produced."
 
         if truncate is not None and len(body) > truncate:
             body = body[:truncate] + f"\n\n…[truncated to {truncate} chars]"
 
+        if hard_stop:
+            return (
+                f"[{subagent_type} hard-stopped at max_turns: {description} — PARTIAL output; "
+                f"unverified remainder is a Gap]\n\n{body}"
+            )
         return f"[{subagent_type} completed: {description}]\n\n{body}"
     except Exception as e:
         # Surface a hard subagent failure as a tool ERROR (X) rather than a green
@@ -366,6 +478,10 @@ async def run_manual_subagent(
     )
     if extra_tools:
         all_tools = all_tools + list(extra_tools)
+    # Operator denylist over the extras (get_all_tools filtered the core set) — the
+    # out-of-graph runner must not see tools the lead graph dropped (parity, see
+    # create_agent_graph).
+    all_tools = drop_disabled_tools(all_tools)
     tool_map = {t.name: t for t in all_tools}
     available_subagents = ", ".join(SUBAGENT_REGISTRY.keys()) or "(none configured)"
 
@@ -496,11 +612,19 @@ def _build_task_tools(config: LangGraphConfig, all_tools: list[BaseTool], backgr
             # Resolve the originating session from injected graph state, not the
             # tracing contextvar — the contextvar reads empty in a tool body, so
             # the completion could never drain back to the spawning chat (ADR 0050).
+            # The state's incognito flag rides along (ADR 0070): a job spawned from
+            # an incognito thread must leave no memory trail at completion (no
+            # push-resume, no knowledge indexing) — the report still drains here.
             job_id = await background_mgr.spawn(
                 origin_session=_session_id_from(state),
                 subagent_type=subagent_type,
                 description=description,
                 prompt=prompt,
+                origin_incognito=_incognito_from(state),
+                # Tag the job with the emitting turn's id (#1766) so a fan-out — several
+                # task(run_in_background=True) in one turn — coalesces into one push-resume.
+                # A lone task → batch_size 1 → the unchanged singleton path.
+                batch_id=_turn_id_from(state),
             )
             return job_id
 
@@ -648,6 +772,11 @@ def _build_task_tools(config: LangGraphConfig, all_tools: list[BaseTool], backgr
         # how many run at once. Degrades to the foreground batch below when no manager exists.
         if run_in_background and background_mgr is not None:
             session_id = _session_id_from(state)
+            # All N specs are spawned by THIS one turn → they share the emitting turn's id
+            # as their batch key (#1766), so their completions coalesce into ONE push-resume
+            # instead of N drip-fed briefings; the real cross-report synthesis happens once.
+            batch_id = _turn_id_from(state)
+            incognito = _incognito_from(state)
             lines: list[str] = []
             started = 0
             for i, spec in enumerate(tasks, start=1):
@@ -668,6 +797,8 @@ def _build_task_tools(config: LangGraphConfig, all_tools: list[BaseTool], backgr
                     subagent_type=st,
                     description=desc,
                     prompt=prm,
+                    origin_incognito=incognito,
+                    batch_id=batch_id,
                 )
                 started += 1
                 lines.append(f"Task {i}: {job_id} ({st}: {desc})")
@@ -715,38 +846,14 @@ def _build_task_tools(config: LangGraphConfig, all_tools: list[BaseTool], backgr
 
     # Background-job control tools (ADR 0051) — only when a background manager exists
     # (so a no-background build doesn't advertise dead controls).
+    #
+    # There is deliberately NO pull/wait tool here (the former ``task_output`` was
+    # removed): its only real capability was blocking-to-wait, which is the exact
+    # anti-pattern to fire-and-forget delegation — agents polled it instead of ending
+    # their turn, producing duplicate, out-of-order delivery. Push (``drain_pending``)
+    # is the sole, exactly-once, in-order delivery path; only cancellation is a tool.
     bg_tools: list[BaseTool] = []
     if background_mgr is not None:
-
-        @tool
-        async def task_output(job_id: str, block: bool = True, timeout: float = 30.0) -> str:
-            """Check a background job's status and result (the ``bg-…`` id from
-            ``task(run_in_background=True)``).
-
-            You normally do NOT need this — you're notified automatically when a job
-            finishes. Use it only when you deliberately want to wait for or inspect a
-            specific job now.
-
-            Args:
-                job_id: the ``bg-…`` job id.
-                block: if True (default), wait until the job finishes or ``timeout``
-                    elapses; if False, return the current state immediately.
-                timeout: max seconds to wait when ``block`` is True (capped at 600).
-            """
-            job = background_mgr.store.get(job_id)
-            if job is None:
-                return f"No background job {job_id}."
-            if block and job.status == "running":
-                cap = max(1.0, min(float(timeout or 0), 600.0))
-                waited = 0.0
-                while job.status == "running" and waited < cap:
-                    await asyncio.sleep(1.0)
-                    waited += 1.0
-                    job = background_mgr.store.get(job_id) or job
-            head = f"Job {job_id} ({job.subagent_type}: {job.description}) — {job.status}"
-            if job.status == "running":
-                return head + " (still running)."
-            return f"{head}.\n\n{job.result or '(no output)'}"
 
         @tool
         async def stop_task(job_id: str) -> str:
@@ -756,7 +863,7 @@ def _build_task_tools(config: LangGraphConfig, all_tools: list[BaseTool], backgr
             res = await background_mgr.cancel(job_id)
             return res.get("detail", "Done.")
 
-        bg_tools = [task_output, stop_task]
+        bg_tools = [stop_task]
 
     # Declarative multi-step workflows (ADR 0002) are now an opt-in plugin
     # (plugins/workflows) — its run_workflow/save_workflow tools come in via the
@@ -778,12 +885,19 @@ def create_agent_graph(
     inbox_store=None,
     tasks_store=None,
     background_mgr=None,
+    reload_callback=None,
 ):
     """Create the protoAgent LangGraph agent.
 
     ``extra_tools`` are additional LangChain tools to expose to the lead agent
     (e.g. MCP-server tools discovered at startup). Appended before subagent /
     middleware assembly so they're in the tool map and visible to the model.
+
+    ``reload_callback`` is the server-owned graph reload (``_reload_langgraph_agent``),
+    injected — not imported — so ``tools/`` stays clear of ``server/``. It's handed to the
+    guarded ``edit_soul`` tool (ADR 0079/0081) so a persona self-edit goes live on the
+    agent's next turn. ``None`` (subagent / eval / script builds) degrades gracefully: the
+    edit still saves and applies on the next natural reload.
 
     ``checkpointer`` persists conversation state per ``thread_id``: pass one so
     multi-turn chats keep their history (the agent sees prior turns instead of
@@ -796,6 +910,19 @@ def create_agent_graph(
                       config={"configurable": {"thread_id": "..."}})
     """
     llm = create_llm(config)
+
+    # Sync the operator denylist from THIS config — the server boot/reload path already
+    # set it, but out-of-server builders (eval sweeps, scripts) pass a config directly
+    # and would otherwise silently keep whatever the process global last held.
+    from tools.lg_tools import set_disabled_tools
+
+    set_disabled_tools(getattr(config, "tools_disabled", []))
+
+    # Everything the denylist drops, across every assembly seam below. Stamped on the
+    # graph (like bound_tools) so the operator Tools tab can render disabled tools as
+    # toggled-off rows — without this a disabled tool vanishes from the catalog and
+    # can never be re-enabled from the console.
+    disabled_tools: list = []
 
     all_tools = get_all_tools(
         knowledge_store,
@@ -813,10 +940,21 @@ def create_agent_graph(
         graph_config=config,
         # Lets knowledge_ingest detach a slow URL/media ingest as a background job (ADR 0050).
         background_mgr=background_mgr,
+        dropped=disabled_tools,
+        # Guarded self-authored persona (ADR 0079/0081). Lead-only: subagent builds omit
+        # both, so edit_soul never binds on a bounded subagent. reload_callback is the
+        # server-owned graph reload (injected, not imported) that makes an edit live next turn.
+        soul_edit_enabled=getattr(config, "soul_self_edit_enabled", False),
+        reload_callback=reload_callback,
     )
 
     if extra_tools:
         all_tools.extend(extra_tools)
+    # Operator denylist (config ``tools.disabled``) over the plugin/MCP extras too —
+    # get_all_tools already filtered the core set, but extra_tools bypassed it. Applied
+    # BEFORE the subagent tool_map snapshot below so a disabled tool can't ride into a
+    # subagent via an allowlist either.
+    all_tools = drop_disabled_tools(all_tools, disabled_tools)
 
     if include_subagents:
         all_tools.extend(
@@ -851,6 +989,13 @@ def create_agent_graph(
         if _produced:
             all_tools.extend(_produced if isinstance(_produced, list) else [_produced])
 
+    # Operator denylist, final pass — covers the tools appended since the extra_tools
+    # filter above (task/task_batch, the filesystem tools incl. ``run_command``, late-seam
+    # tools). Sits before the deferred build so search_tools never advertises a dropped
+    # name. This is what makes ``tools.disabled: [run_command]`` actually work (#1527-era
+    # gap: the filter used to live only inside get_all_tools, which fs tools bypass).
+    all_tools = drop_disabled_tools(all_tools, disabled_tools)
+
     # Deferred tools (ADR 0005 #3) — opt-in progressive disclosure. The
     # search_tools meta-tool is built over the full set (so it can surface any
     # of them) and ToolDeferralMiddleware trims the per-call schemas to base +
@@ -860,6 +1005,12 @@ def create_agent_graph(
 
         keep = resolve_deferred_keep(config.tools_deferred_keep)
         all_tools.append(build_search_tools_tool(all_tools, keep))
+        # The meta-tool is denylistable like everything else — without this pass,
+        # ``tools.disabled: [search_tools]`` silently re-binds it (it's appended after
+        # the final filter above), which a Tools-tab row toggle would surface as a
+        # switch that snaps back on. Everything else was already filtered, so only
+        # search_tools can drop here.
+        all_tools = drop_disabled_tools(all_tools, disabled_tools)
 
     middleware = _build_middleware(
         config, knowledge_store, skills_index=skills_index, extra_middleware=extra_middleware
@@ -891,6 +1042,9 @@ def create_agent_graph(
     # and drifting from it (set_goal advertised-but-unbound bd-2aa; task /
     # filesystem / execute_code under-reported bd-67j).
     agent.bound_tools = list(all_tools)
+    # The denylist's complement — what ``tools.disabled`` dropped, kept as tool objects
+    # so /api/tools can list them (name/description/category) as toggle-off rows.
+    agent.disabled_tools = list(disabled_tools)
     return agent
 
 

@@ -39,6 +39,31 @@ deliberately as more plugins tap core; this is the seam we lean on going forward
 > to answer a prompt — first consumer: the artifact plugin's interactive
 > `window.protoArtifact.ask()` bridge (artifacts call back to the agent, the
 > `window.claude.complete` analog).
+>
+> `spawn_background(prompt, *, subagent_type, origin_session, label=None)` +
+> `background_status(task_id)` (#1635) — the background channel: spawn a **detached**
+> subagent job (ADR 0050) that rides the full ADR 0070 results pipeline (push-resume
+> nudge, KB-indexed report, report card), and poll its jobs-store row in between. Closes
+> the hole where a plugin with campaign-scale work had to reach into
+> `STATE.background_mgr` directly. First consumer: spacetraders exploration campaigns.
+>
+> `react_on(topic, *, prompt, job_id, session=…, debounce_s=0)` (#1633) — reactive-rule
+> sugar over `registry.on` + `run_in_session` (ADR 0039): prompt-from-payload
+> (`None`/empty skips the event), idempotent replace via `job_id`, thread-safe
+> trailing-edge debounce (a burst coalesces into ONE turn; the last event's prompt wins).
+> Returns an unsubscribe fn. First consumer: spacetraders engine-event → turn rules.
+>
+> `knowledge_search(query, *, k=5, domain=None, epoch=None)` /
+> `knowledge_add(content, *, domain="general", heading=None, epoch=None)` (#1089) +
+> `knowledge_purge(domain, *, before=None)` (#1634) — the knowledge channel and its
+> **lifecycle** half. Add-and-search alone let a long-running plugin's knowledge go
+> actively wrong with no way to retire it (spacetraders: weekly universe wipes → recalled
+> routes reference dead markets). `knowledge_purge` hard-deletes a domain (optionally only
+> rows older than an ISO timestamp), consistently across every index (rows, FTS, vectors;
+> layered = private tier only — the commons stays curated); the optional `epoch` tag scopes
+> a chunk to the era it was learned in, and an epoch-filtered search excludes other eras
+> *and* untagged chunks from both rankings — a wipe becomes a new tag, not a delete.
+> First consumer: spacetraders route/lesson memory.
 
 **2. Workflows becomes an opt-in plugin (`plugins/workflows`, `enabled: false`).**
 

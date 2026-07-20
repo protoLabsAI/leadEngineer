@@ -100,6 +100,20 @@ def test_disabling_a_plain_plugin_does_not_recommend_restart(monkeypatch):
     assert body["restart_recommended"] is False
 
 
+def test_disabling_a_surface_only_plugin_does_not_recommend_restart(monkeypatch):
+    # A surface-ONLY plugin (a gateway with no view/router) now STOPS live on the reload
+    # reconcile (ADR 0018), so disabling it no longer needs a restart. (A real comms plugin
+    # also registers a router for its Test route, so that path still recommends one.)
+    _wire(
+        monkeypatch,
+        enabled=["pager"],
+        disabled=[],
+        meta=[{"id": "pager", "views": [], "routers": 0, "surfaces": 1}],
+    )
+    body = _client().post("/api/plugins/pager/enabled", json={"enabled": False}).json()
+    assert body["restart_recommended"] is False
+
+
 # ── auto-enable on install (trust-by-default; install = enabled + running) ────────
 def test_install_auto_enables_and_runs(monkeypatch):
     from graph.plugins import installer
@@ -353,3 +367,133 @@ def test_update_route_flags_restart_for_disabled_lingering_router(monkeypatch):
     body = _client().post("/api/plugins/boardy/update").json()
     assert body["reloaded"] is False  # disabled → nothing to reload
     assert body["restart_recommended"] is True
+
+
+# ── uninstall teardown (#1955) ────────────────────────────────────────────────
+
+
+def test_uninstall_enabled_plugin_purges_reloads_and_scrubs_enabled_list(monkeypatch):
+    from graph.plugins import installer, loader
+
+    captured = _wire(monkeypatch, enabled=["github", "discord"], disabled=[], meta=[{"id": "github", "views": []}])
+    purged: list[str] = []
+    monkeypatch.setattr(loader, "purge_plugin_modules", lambda pid: purged.append(pid))
+    monkeypatch.setattr(installer, "uninstall", lambda pid, purge=False: {"id": pid, "removed": True})
+    body = _client().delete("/api/plugins/github").json()
+    assert body["ok"] is True and body["reloaded"] is True
+    assert purged == ["github"]
+    assert captured["config"]["plugins"]["enabled"] == ["discord"]
+    assert "github" not in captured["config"]["plugins"]["disabled"]
+    assert body["restart_recommended"] is False  # plain plugin: no views, never mounted
+
+
+def test_uninstall_enabled_view_plugin_recommends_restart(monkeypatch):
+    from graph.plugins import installer, loader
+
+    _wire(monkeypatch, enabled=["boardy"], disabled=[], meta=[{"id": "boardy", "views": [{"id": "b"}]}])
+    monkeypatch.setattr(loader, "purge_plugin_modules", lambda pid: None)
+    monkeypatch.setattr(installer, "uninstall", lambda pid, purge=False: {"id": pid, "removed": True})
+    body = _client().delete("/api/plugins/boardy").json()
+    assert body["reloaded"] is True and body["restart_recommended"] is True
+
+
+def test_uninstall_disabled_plugin_skips_reload_but_flags_lingering_router(monkeypatch):
+    # Previously-enabled-then-disabled: no reload to run, but stale modules are
+    # still purged and the lingering mounted router still needs a restart.
+    from graph.plugins import installer, loader
+
+    captured = _wire(
+        monkeypatch, enabled=[], disabled=["boardy"], meta=[], router_keys={("boardy", "/plugins/boardy")}
+    )
+    purged: list[str] = []
+    monkeypatch.setattr(loader, "purge_plugin_modules", lambda pid: purged.append(pid))
+    monkeypatch.setattr(installer, "uninstall", lambda pid, purge=False: {"id": pid, "removed": True})
+    body = _client().delete("/api/plugins/boardy").json()
+    assert body["ok"] is True and body["reloaded"] is False
+    assert "config" not in captured
+    assert purged == ["boardy"]
+    assert body["restart_recommended"] is True
+
+
+def test_uninstall_error_maps_to_400_before_any_teardown(monkeypatch):
+    from graph.plugins import installer, loader
+
+    _wire(monkeypatch, enabled=[], disabled=[], meta=[])
+    purged: list[str] = []
+    monkeypatch.setattr(loader, "purge_plugin_modules", lambda pid: purged.append(pid))
+
+    def _boom(pid, purge=False):
+        raise installer.InstallError("not installed")
+
+    monkeypatch.setattr(installer, "uninstall", _boom)
+    resp = _client().delete("/api/plugins/ghost")
+    assert resp.status_code == 400
+    assert purged == []  # failed uninstall leaves modules alone
+
+
+# ── the two previously-untested GET routes (#1955) ────────────────────────────
+
+
+def test_installed_route_merges_loader_meta(monkeypatch):
+    from pathlib import Path
+
+    from graph.plugins import installer
+
+    _wire(
+        monkeypatch,
+        enabled=["github"],
+        disabled=[],
+        meta=[{"id": "github", "enabled": True, "incomplete": False, "needs_config": ["token"]}],
+    )
+    monkeypatch.setattr(installer, "live_plugins_dir", lambda: Path("/nonexistent-plugins-dir"))
+    monkeypatch.setattr(
+        installer,
+        "list_installed",
+        lambda: [{"id": "github", "present": False}, {"id": "ghosty", "present": False}],
+    )
+    body = _client().get("/api/plugins/installed").json()
+    by_id = {p["id"]: p for p in body["plugins"]}
+    assert by_id["github"]["enabled"] is True and by_id["github"]["needs_config"] == ["token"]
+    assert by_id["ghosty"]["enabled"] is False and by_id["ghosty"]["incomplete"] is False
+    assert "manifest" not in by_id["github"]  # present=False → manifest never loaded
+
+
+def test_updates_route_returns_check_results(monkeypatch):
+    from graph.plugins import installer
+
+    _wire(monkeypatch, enabled=[], disabled=[], meta=[])
+    monkeypatch.setattr(installer, "check_updates", lambda: [{"id": "github", "update_available": True}])
+    body = _client().get("/api/plugins/updates").json()
+    assert body == {"plugins": [{"id": "github", "update_available": True}]}
+
+
+# ── install-deps route + deps_missing (wizard post-install report) ────────────
+
+
+def test_install_deps_route_runs_installer(monkeypatch):
+    from graph.plugins import installer
+
+    calls: list[str] = []
+
+    def _fake_install_deps(pid):
+        calls.append(pid)
+        return ["python-docx", "openpyxl"]
+
+    monkeypatch.setattr(installer, "install_deps", _fake_install_deps)
+    body = _client().post("/api/plugins/install-deps", json={"id": "cowork"}).json()
+    assert body == {"ok": True, "installed": ["python-docx", "openpyxl"]} and calls == ["cowork"]
+
+
+def test_install_deps_route_requires_id():
+    assert _client().post("/api/plugins/install-deps", json={}).status_code == 400
+
+
+def test_install_deps_route_maps_install_error(monkeypatch):
+    from graph.plugins import installer
+
+    def _boom(pid):
+        raise installer.InstallError("pip install failed")
+
+    monkeypatch.setattr(installer, "install_deps", _boom)
+    r = _client().post("/api/plugins/install-deps", json={"id": "cowork"})
+    assert r.status_code == 400 and "pip install failed" in r.json()["detail"]

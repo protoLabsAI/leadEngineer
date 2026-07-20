@@ -26,6 +26,9 @@ concurrency:
 jobs:
   deploy:
     name: Build & deploy to Cloudflare Pages
+    # Fork-friendly (#1534): deploys to protoLabs' Cloudflare Pages project and needs
+    # CLOUDFLARE_* secrets no fork has — so only the canonical repo runs it.
+    if: github.repository == 'protoLabsAI/protoAgent'
     runs-on: ubuntu-latest  # workspace-config: allow-hosted-runner public repo — GH-hosted is free
     steps:
       - uses: actions/checkout@v5
@@ -44,6 +47,7 @@ jobs:
       # --- Docs (VitePress) served at /docs ---
       - name: Build docs (base /docs/)
         run: |
+          npm install -g npm@11  # npm-11-shaped lockfile — npm 10's `ci` rejects it (see PROTO.md)
           npm ci
           DOCS_BASE=/docs/ npm run docs:build
 

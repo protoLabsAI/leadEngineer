@@ -77,6 +77,7 @@ def _init_langgraph_agent(headless_setup: bool = False):
     from graph.config_io import (
         config_yaml_path,
         ensure_live_config,
+        ensure_live_soul,
         is_setup_complete,
         mark_setup_complete,
         validate_for_headless,
@@ -97,10 +98,24 @@ def _init_langgraph_agent(headless_setup: bool = False):
     if _dv_warn:
         log.warning("[data-version] %s", _dv_warn)
 
+    # Make a provisioned Node runtime (`protoagent runtime install-node`) visible to
+    # every subprocess we spawn — the npx-based ACP coding agents + MCP servers — when
+    # the user has no Node of their own. No-op if Node is already on PATH or none is
+    # provisioned. One seam covers ACP, MCP, delegates, and gh (ADR 0085).
+    from infra.node_runtime import augment_path_with_managed_node
+
+    _node_dir = augment_path_with_managed_node()
+    if _node_dir:
+        log.info("[node] managed Node runtime on PATH: %s", _node_dir)
+
     # Seed the untracked live config from the .example template on first run.
     # config_yaml_path() resolves to <instance_root>/config/langgraph-config.yaml
     # (env-driven via PROTOAGENT_HOME / PROTOAGENT_INSTANCE), so load through it.
     ensure_live_config()
+    # Seed the live SOUL.md the same way (seed-not-force) — and heal a lingering
+    # starter placeholder so a persona baked into the bundle actually takes effect
+    # instead of being shadowed forever by "Replace this file". No-op once authored.
+    ensure_live_soul()
     STATE.graph_config = LangGraphConfig.from_yaml(config_yaml_path())
     # Fork tool denylist (config ``tools.disabled``) — applied before any
     # get_all_tools() call so dropped tools never reach the graph.
@@ -124,6 +139,13 @@ def _init_langgraph_agent(headless_setup: bool = False):
     # history survives restarts), else in-memory. Bound into the graph at
     # compile time below — a checkpointer in the invoke config is ignored.
     STATE.checkpointer = _build_checkpointer(STATE.graph_config)
+
+    # Plugin metric timeseries (#1632) — sdk.record_metric / metric_history / metric_last.
+    # Wired BEFORE any plugin load (including the pre-setup routes/surfaces load below)
+    # so a plugin's register() can already record. Not config-dependent, so it survives
+    # hot-reloads untouched (like tasks_store / background_mgr) — and it is never
+    # threaded into the graph build, so the #1630 reload-drop class doesn't apply.
+    STATE.metrics_store = _build_metrics_store()
 
     if not is_setup_complete():
         if headless_setup:
@@ -201,19 +223,17 @@ def _init_langgraph_agent(headless_setup: bool = False):
     # graph compiles below with STATE.knowledge_store). Default built-in store stays
     # the collision-check binding + the degrade-safe fallback.
     STATE.knowledge_store = _apply_plugin_knowledge_backend(STATE.graph_config, STATE.knowledge_store, _plugins)
-    # Register plugin-contributed goal verifiers (ADR 0028) — re-set on each
-    # (re)load so a config change refreshes the available `plugin` verifiers.
-    from graph.goals import hooks as _goal_hooks
-    from graph.goals import verifiers as _goal_verifiers
-    from graph.watches import hooks as _watch_hooks
-
-    _goal_verifiers.set_plugin_verifiers(_plugins.goal_verifiers)
-    _goal_hooks.set_goal_hooks(_plugins.goal_hooks)
-    _watch_hooks.set_watch_hooks(_plugins.watch_hooks)  # ADR 0067
-    # Surfaces / routes / subagents (ADR 0018). Routers + surfaces are captured
-    # here and consumed once by _main (mount) + the startup hook (start) — they
-    # don't hot-reload. Subagents register into SUBAGENT_REGISTRY before the graph
-    # build below so the first compile (and every reload) can delegate to them.
+    # Register plugin-contributed goal verifiers + goal/watch hooks (ADR 0028/0067) into
+    # their live module registries — re-applied on every (re)load via _apply_plugin_registries
+    # so a config/plugin change refreshes the available `plugin` verifiers and hooks.
+    _apply_plugin_registries(_plugins)
+    # Surfaces / routes / subagents (ADR 0018). Both are captured here and consumed
+    # by _main (mount) + the startup hook (start). Routers DO hot-reload now — the
+    # reload commit re-mounts newly-enabled plugins' routers (#1752/#1890) — but
+    # SURFACES do not: the startup hook has already fired, so a surface only (re)starts
+    # on a full restart (the reload path just fires each running surface's `reload`
+    # callback). Subagents register into SUBAGENT_REGISTRY before the graph build below
+    # so the first compile (and every reload) can delegate to them.
     # (`global STATE.plugin_routers, STATE.plugin_surfaces` is declared at the top of the fn.)
     STATE.plugin_routers, STATE.plugin_surfaces = _plugins.routers, _plugins.surfaces
     STATE.plugin_public_paths = _plugins.public_paths
@@ -264,6 +284,9 @@ def _init_langgraph_agent(headless_setup: bool = False):
         inbox_store=STATE.inbox_store,
         tasks_store=STATE.tasks_store,
         background_mgr=STATE.background_mgr,
+        # Lets the guarded edit_soul tool (ADR 0079/0081) reload the graph so a persona
+        # self-edit is live on the next turn — injected, so tools/ never imports server/.
+        reload_callback=_reload_langgraph_agent,
     )
 
     # Cache-warming heartbeat — off by default; start() no-ops unless enabled
@@ -350,7 +373,7 @@ def _build_knowledge_store(config):
             if embed_fn is not None and not force_plain:
                 from knowledge.hybrid_store import HybridKnowledgeStore
 
-                return HybridKnowledgeStore(
+                store = HybridKnowledgeStore(
                     db_path=db_path, scoped=scoped, embed_fn=embed_fn, embed_batch_fn=embed_batch_fn,
                     vector_k=config.knowledge_vector_k, rrf_k=config.knowledge_rrf_k,
                     min_score=config.knowledge_min_score,
@@ -361,6 +384,10 @@ def _build_knowledge_store(config):
                     chunk_overlap_chars=config.knowledge_chunk_overlap_chars,
                     chunk_min_chars=config.knowledge_chunk_min_chars, context_fn=context_fn,
                 )
+                # Off-thread route probe (#1681): a dead embedding route opens the
+                # breaker BEFORE the first chat turn instead of freezing it.
+                store.warm_probe()
+                return store
             return KnowledgeStore(
                 db_path=db_path, scoped=scoped,
                 preview_chars=config.knowledge_recall_preview_chars,
@@ -536,6 +563,10 @@ def _build_mcp(config, plugin_servers=None):
     Best-effort and per-server isolated (see tools/mcp_tools.build_mcp_tools):
     a bad/unreachable server is logged and skipped, never fatal. Returns empty
     lists when MCP is disabled.
+
+    ``clients`` may include a persistent-session pool holding live subprocesses
+    — whenever a build's clients are discarded (reload swap, failed rebuild),
+    release them via ``_close_mcp_clients``.
     """
     try:
         from tools.mcp_tools import build_mcp_tools
@@ -547,6 +578,16 @@ def _build_mcp(config, plugin_servers=None):
     except Exception as exc:  # noqa: BLE001 — MCP is optional, never fatal
         log.warning("[mcp] init failed: %s; running without MCP tools", exc)
         return [], [], []
+
+
+def _close_mcp_clients(clients) -> None:
+    """Release MCP connection handles (persistent session pools). Never raises."""
+    try:
+        from tools.mcp_tools import close_mcp_clients
+
+        close_mcp_clients(clients)
+    except Exception:  # noqa: BLE001 — teardown must never break a reload
+        log.warning("[mcp] client teardown failed", exc_info=True)
 
 
 _plugin_subagent_names: set[str] = set()
@@ -864,6 +905,211 @@ async def _retire_thread(thread_id: str, *, harvest: bool | None = None, cascade
     return chunk_id
 
 
+# ── Opt-in plugin auto-update (#1720) ────────────────────────────────────────
+# Only plugins the operator lists in ``plugins.update_policy`` are ever touched;
+# a pinned-to-SHA plugin is never auto-updated. ``when: idle`` defers a plugin's
+# update while a chat turn is (or was just) in flight — the reload rebuilds
+# tools/routers, safe between turns but disruptive during one.
+_AUTOUPDATE_IDLE_QUIET_S = 300.0  # "idle" = no chat turn started in this window
+
+
+def _server_is_idle() -> bool:
+    """True when no chat turn is in flight AND none finished within the quiet window
+    (the ``when: idle`` gate). Reads the beacon ``server.chat`` maintains around
+    every turn; if that import fails we conservatively report NOT idle so we never
+    reload mid-turn."""
+    try:
+        from server.chat import active_turns, seconds_since_last_turn
+
+        return active_turns() == 0 and seconds_since_last_turn() >= _AUTOUPDATE_IDLE_QUIET_S
+    except Exception:
+        return False
+
+
+async def _autoupdate_one_plugin(plugin_id: str, entry: dict, status: dict, cfg, enabled: list[str]) -> None:
+    """Pull + hot-reload one plugin, mirroring the console Update route
+    (``operator_api/plugin_routes.py``): resolve the target ref (a release-tag pin
+    moves to the newest tag; a branch pulls its head), re-install with ``force``,
+    then — if the plugin is enabled — purge its modules and reload through the
+    enable path so the fresh code mounts. Emits ``plugin.updated`` on the bus. Reads
+    the allowlist / disabled set off the SAME ``cfg`` the sweep was handed."""
+    import asyncio
+
+    from graph.plugins import installer
+    from graph.plugins.loader import purge_plugin_modules
+
+    source_url = entry.get("source_url", "")
+    if not source_url:
+        return
+
+    ref = entry.get("requested_ref", "") or None
+    if ref and installer.is_release_tag(ref):
+        # A release-tag pin is immutable — the update target is the newest semver
+        # tag (the check's latest_ref), not the recorded one.
+        ref = status.get("latest_ref") or ref
+
+    allow = list(getattr(cfg, "plugins_sources_allow", []) or []) or None
+    try:
+        summary = await asyncio.to_thread(
+            installer.install, source_url, ref, force=True, by="autoupdate", allow=allow
+        )
+    except installer.InstallError as exc:
+        log.warning("[plugin-autoupdate] install failed for %s: %s", plugin_id, exc)
+        return
+    except Exception:
+        log.exception("[plugin-autoupdate] install crashed for %s", plugin_id)
+        return
+
+    reloaded = False
+    if plugin_id in enabled:
+        # Force a genuinely fresh import of the just-pulled code, then reload
+        # through the enable route's path (router re-mount, tools/MCP rebuild, #822).
+        # Guard the whole block: the code + lock are already updated on disk, so a
+        # reload crash must not abort the rest of the sweep (a bare raise here would
+        # unwind past the per-plugin loop) — the new code mounts on the next
+        # boot/enable regardless.
+        try:
+            purge_plugin_modules(plugin_id)
+            disabled = list(getattr(cfg, "plugins_disabled", []) or [])
+            ok, messages = _apply_settings_changes(
+                config={"plugins": {"enabled": list(enabled), "disabled": disabled}},
+            )
+            reloaded = bool(ok)
+            if not ok:
+                log.error("[plugin-autoupdate] reload failed for %s: %s", plugin_id, "; ".join(messages))
+        except Exception:
+            log.exception(
+                "[plugin-autoupdate] reload crashed for %s (update is on disk; next boot/enable mounts it)",
+                plugin_id,
+            )
+
+    try:
+        from server import _event_bus
+
+        _event_bus.publish(
+            "plugin.updated",
+            {
+                "id": plugin_id,
+                "version": summary.get("version"),
+                "resolved_sha": summary.get("resolved_sha"),
+                "reloaded": reloaded,
+                "by": "autoupdate",
+            },
+        )
+    except Exception:
+        log.exception("[plugin-autoupdate] event publish failed for %s", plugin_id)
+
+    log.info(
+        "[plugin-autoupdate] updated %s → %s (reloaded=%s)",
+        plugin_id,
+        (summary.get("resolved_sha") or "")[:8],
+        reloaded,
+    )
+
+
+async def _plugin_autoupdate_sweep(cfg, policy: dict) -> int:
+    """One pass over the update policy. For each opted-in, non-pinned, behind plugin
+    at a safe moment, pull + reload it. Returns the number of plugins updated. Each
+    plugin is guarded independently — one failure never blocks the rest."""
+    import asyncio
+
+    from graph.plugins import installer
+
+    installed = {e.get("id"): e for e in installer.list_installed()}
+    enabled = list(getattr(cfg, "plugins_enabled", []) or [])
+    updated = 0
+    for plugin_id, raw in policy.items():
+        pol = raw if isinstance(raw, dict) else {}
+        # ``track`` opts the plugin in (the ref itself comes from the lock); an
+        # empty/missing track means the entry is present but not armed.
+        if not str(pol.get("track") or "").strip():
+            continue
+        entry = installed.get(plugin_id)
+        if entry is None:
+            log.info("[plugin-autoupdate] %s in policy but not installed — skipping", plugin_id)
+            continue
+        when = str(pol.get("when") or "idle").strip().lower()
+        if when != "always" and not _server_is_idle():
+            log.info("[plugin-autoupdate] %s deferred — server busy (when=%s)", plugin_id, when)
+            continue
+        try:
+            status = await asyncio.to_thread(installer.check_plugin_update, entry)
+        except Exception:
+            log.exception("[plugin-autoupdate] update check failed for %s", plugin_id)
+            continue
+        if status.get("error"):
+            log.info("[plugin-autoupdate] %s check error: %s", plugin_id, status["error"])
+            continue
+        if status.get("pinned") or not status.get("behind"):
+            continue
+        await _autoupdate_one_plugin(plugin_id, entry, status, cfg, enabled)
+        updated += 1
+    return updated
+
+
+async def _plugin_autoupdate_loop() -> None:
+    """Periodically pull opt-in plugins that declare an update policy (#1720).
+
+    Reads ``plugins.update_policy`` + ``plugins.autoupdate_interval_hours`` from the
+    live config each pass, so a config reload takes effect without restarting the
+    loop. Interval ``0`` or an empty policy map = idle (the default — nothing is
+    touched). Failures are logged, never fatal."""
+    import asyncio
+
+    await asyncio.sleep(120)  # let boot settle past the first turn before sweeping
+    while True:
+        cfg = STATE.graph_config
+        interval_h = getattr(cfg, "plugins_autoupdate_interval_hours", 0) if cfg else 0
+        policy = getattr(cfg, "plugins_update_policy", {}) if cfg else {}
+        if cfg and interval_h > 0 and policy:
+            try:
+                n = await _plugin_autoupdate_sweep(cfg, policy)
+                if n:
+                    log.info("[plugin-autoupdate] sweep updated %d plugin(s)", n)
+            except Exception:
+                log.exception("[plugin-autoupdate] sweep failed")
+        # Re-read the interval each pass so a config change re-paces the loop; a
+        # disabled loop still wakes hourly to notice a re-enable.
+        await asyncio.sleep((interval_h if interval_h > 0 else 1) * 3600)
+
+
+async def _secrets_refresh_loop() -> None:
+    """Re-pull env vars from the external secrets manager on its interval (ADR 0080
+    D5) so rotation lands without a restart. Reads the live config each pass — a
+    reload re-paces or en/disables the loop without restarting it; while disabled it
+    idles on 5-minute checks. ``force=True`` bypasses the hydrator's TTL gate (this
+    loop IS the TTL). ``required: true`` is a boot gate only — a refresh failure
+    here warns and keeps the last-applied values."""
+    import asyncio
+
+    def _live() -> tuple[bool, int]:
+        cfg = STATE.graph_config
+        if cfg is None:
+            return False, 0
+        return (
+            bool(getattr(cfg, "secrets_manager_enabled", False)),
+            int(getattr(cfg, "secrets_manager_refresh_seconds", 0) or 0),
+        )
+
+    while True:
+        enabled, refresh = _live()
+        await asyncio.sleep(float(max(30, refresh)) if (enabled and refresh > 0) else 300.0)
+        enabled, refresh = _live()  # re-read after the sleep — config may have changed
+        if not (enabled and refresh > 0):
+            continue
+        from graph.config import load_config_docs
+        from graph.config_io import config_yaml_path
+        from infra.secrets import SecretsRequiredError, hydrate_from_docs
+
+        try:
+            merged, secrets_doc = load_config_docs(config_yaml_path())
+            await asyncio.to_thread(hydrate_from_docs, merged, secrets_doc, force=True)
+        except SecretsRequiredError as e:
+            log.warning("[secrets] refresh failed (required source): %s", e)
+        except Exception:
+            log.exception("[secrets] refresh failed")
+
+
 def _build_inbox_store(config):
     """Durable inbound inbox (ADR 0003), namespaced by agent name. ``inbox_db_path``
     config (a dir) is used verbatim; else the per-instance ``instance_root/inbox`` store."""
@@ -880,6 +1126,37 @@ def _build_inbox_store(config):
     except Exception:
         log.exception("[inbox] failed to build store at %s; inbox disabled", path)
         return None
+
+
+def _on_work_terminal(job) -> None:
+    """Deliver a deterministic ``spawn_work`` job's completion (``knowledge_ingest``,
+    ``delegate_to``) the SAME way the A2A terminal hook delivers a subagent-turn job
+    (``server.a2a._handle_background_terminal``, ADR 0050 Phase 2 / ADR 0070 D1):
+    push-resume the job's ORIGIN session when the D1 guards allow it (not disabled,
+    not canceled, has a real chat origin, not incognito), so the origin agent runs a
+    turn there and briefs the operator; fall back to the Activity-thread idle-wake
+    otherwise. Module-level (not a nested closure) so it's independently testable.
+
+    Before this, a ``spawn_work`` job only ever fired the Activity-thread wake — never
+    a turn in the chat session that actually requested it — so a promise like
+    ``knowledge_ingest``'s "I'll report back when it's ready" never fired (#1840).
+    Lazy import keeps the manager off ``server`` and avoids a server.a2a ↔ agent_init
+    import cycle. Best-effort — never raises into the manager's terminal callback."""
+    try:
+        from server.a2a import (
+            _background_wake_enabled,
+            _should_auto_resume,
+            _spawn_background_resume,
+            _spawn_background_wake,
+        )
+
+        mgr = getattr(STATE, "background_mgr", None)
+        if mgr is not None and _should_auto_resume(job):
+            _spawn_background_resume(mgr, job)
+        elif _background_wake_enabled():
+            _spawn_background_wake(job)
+    except Exception:  # noqa: BLE001 — the wake/resume is best-effort
+        log.exception("[background] work-job terminal hook failed for %s", getattr(job, "id", "?"))
 
 
 def _build_background_manager(config):
@@ -927,18 +1204,6 @@ def _build_background_manager(config):
         publish = _event_bus.publish
     except Exception:  # noqa: BLE001
         publish = None
-
-    def _on_work_terminal(job) -> None:
-        """Give a deterministic ``spawn_work`` job the SAME idle-wake the A2A terminal
-        hook gives a subagent-turn job (ADR 0050 Phase 2). Lazy import keeps the
-        manager off ``server`` and avoids a server.a2a ↔ agent_init cycle."""
-        try:
-            from server.a2a import _background_wake_enabled, _spawn_background_wake
-
-            if _background_wake_enabled():
-                _spawn_background_wake(job)
-        except Exception:  # noqa: BLE001 — the wake is best-effort
-            log.exception("[background] work-job terminal hook failed for %s", getattr(job, "id", "?"))
 
     try:
         return BackgroundManager(
@@ -993,6 +1258,25 @@ def _build_telemetry_store(config):
         return store
     except Exception:
         log.exception("[telemetry] failed to build store at %s; telemetry disabled", path)
+        return None
+
+
+def _build_metrics_store():
+    """Plugin metric timeseries store (#1632) — behind ``sdk.record_metric`` /
+    ``metric_history`` / ``metric_last``. Always on, no config gate: unlike the turn
+    telemetry store (an observability preference), metric series are *functional*
+    plugin state — history-dependent watch verifiers go blind without them — so they
+    get their own per-instance ``metrics.db`` (retention is capped per series inside
+    the store). Best-effort: a build failure degrades the SDK calls to no-ops."""
+    from observability.metrics_store import MetricsStore
+
+    db = instance_paths().store("metrics.db")
+    try:
+        store = MetricsStore(str(db))
+        log.info("[metrics] plugin metric store ready at %s", db)
+        return store
+    except Exception:
+        log.exception("[metrics] failed to build plugin metric store at %s; sdk metrics disabled", db)
         return None
 
 
@@ -1153,35 +1437,54 @@ def _mount_plugin_routers(routers: list[dict]) -> None:
     app = STATE.fastapi_app
     if app is None:
         return
+    from graph.plugins.registry import _prefix_conforms
+
+    # Every call re-passes the full live router list (boot AND each reload rebuilds
+    # it from scratch), so most "key already in plugin_router_keys" hits are just
+    # the routine hot-reload no-op — not a misconfiguration. Only warn when the
+    # SAME key shows up twice within THIS call: that's a plugin genuinely handing
+    # us two distinct routers for one prefix (the projectBoard /board 404 case).
+    seen_this_call: set[tuple[str, str]] = set()
     for r in routers:
         plugin_id = r.get("plugin_id", "")
         prefix = r.get("prefix") or ""
         key = (plugin_id, prefix)
         if key in STATE.plugin_router_keys:
-            # A plugin registered a SECOND router at the SAME prefix — the first
-            # already won the slot, so this one is silently dropped and its routes
-            # never serve (projectBoard's /board 404'd for exactly this reason).
-            # Mount distinct prefixes for distinct route groups (e.g. a public
-            # /plugins/<id> view router + a gated /api/plugins/<id> data router).
-            log.warning(
-                "[plugins] %s registered a second router at prefix %s — dropped "
-                "(its routes won't be served; mount each router at a distinct prefix)",
-                plugin_id,
-                prefix or "/",
-            )
+            if key in seen_this_call:
+                # A plugin registered a SECOND router at the SAME prefix — the first
+                # already won the slot, so this one is silently dropped and its routes
+                # never serve (projectBoard's /board 404'd for exactly this reason).
+                # Mount distinct prefixes for distinct route groups (e.g. a public
+                # /plugins/<id> view router + a gated /api/plugins/<id> data router).
+                log.warning(
+                    "[plugins] %s registered a second router at prefix %s — dropped "
+                    "(its routes won't be served; mount each router at a distinct prefix)",
+                    plugin_id,
+                    prefix or "/",
+                )
+            else:
+                seen_this_call.add(key)
+                log.debug(
+                    "[plugins] %s: router at %s already mounted — hot-reload no-op",
+                    plugin_id,
+                    prefix or "/",
+                )
             continue
+        seen_this_call.add(key)
         # Warn for non-conforming prefixes (#870 plugin prefix enforcement).
-        # The convention is /plugins/<id>/...; routes under other prefixes are
-        # still mounted (existing plugins use /api/... for data routes) but
-        # the warning surfaces mis-configurations. The default-deny middleware
-        # guards all non-public paths regardless of prefix.
-        if plugin_id and prefix and not prefix.startswith(f"/plugins/{plugin_id}"):
+        # The two canonical prefixes are /plugins/<id>/... (public view) and
+        # /api/plugins/<id>/... (bearer-gated data router) — the documented
+        # two-router pattern (#1732). Routes under any other prefix are still
+        # mounted (mounted as-is; the default-deny middleware guards non-public
+        # paths regardless) but the warning surfaces genuine mis-configurations.
+        if plugin_id and prefix and not _prefix_conforms(prefix, plugin_id):
             log.warning(
-                "[plugins] %s: router prefix %r does not start with /plugins/%s/ "
-                "— plugin routes SHOULD live under /plugins/<id>/ (mounted as-is; "
-                "the default-deny auth middleware guards it)",
+                "[plugins] %s: router prefix %r does not start with /plugins/%s or "
+                "/api/plugins/%s — plugin routes SHOULD live under /plugins/<id>/ "
+                "(public) or /api/plugins/<id>/ (gated data; mounted as-is)",
                 plugin_id,
                 prefix,
+                plugin_id,
                 plugin_id,
             )
         try:
@@ -1190,6 +1493,27 @@ def _mount_plugin_routers(routers: list[dict]) -> None:
             log.info("[plugins] mounted router from %s at %s", plugin_id, prefix or "/")
         except Exception:  # noqa: BLE001
             log.exception("[plugins] failed to mount router from %s", plugin_id)
+
+
+def _apply_plugin_registries(plugins) -> None:
+    """Push a freshly (re)built plugin bundle's goal verifiers + goal/watch hooks into their
+    LIVE module registries (``graph.goals.verifiers`` / ``graph.goals.hooks`` /
+    ``graph.watches.hooks``). Called at full init AND in the hot-reload commit — without the
+    reload call, a plugin update/enable that adds or changes a verifier or hook leaves the live
+    registry holding the PRE-reload mapping, so a newly-shipped watch/goal verifier resolves as
+    "unknown plugin verifier" (armed but blind) until a full server restart (#1752).
+
+    Not itself serialized: each set_* is a single GIL-atomic global rebind, and the reload
+    caller already holds the config-write lock (init runs once at boot, uncontended)."""
+    from graph.goals import hooks as _goal_hooks
+    from graph.goals import verifiers as _goal_verifiers
+    from graph.lifecycle import hooks as _lifecycle_hooks
+    from graph.watches import hooks as _watch_hooks
+
+    _goal_verifiers.set_plugin_verifiers(plugins.goal_verifiers)  # ADR 0028
+    _goal_hooks.set_goal_hooks(plugins.goal_hooks)
+    _watch_hooks.set_watch_hooks(plugins.watch_hooks)  # ADR 0067
+    _lifecycle_hooks.set_lifecycle_hooks(plugins.lifecycle_hooks)  # ADR 0074
 
 
 @_serialized_config_write
@@ -1302,12 +1626,24 @@ def _reload_langgraph_agent() -> tuple[bool, str]:
                 late_tool_factories=new_late_tool_factories,
                 checkpointer=STATE.checkpointer,
                 inbox_store=new_inbox_store,
+                # The tasks store survives reloads like the checkpointer (its path isn't
+                # reloadable config). It was missing here, so ANY settings hot-reload
+                # silently dropped task_create/task_list/task_update/task_close from the
+                # rebuilt graph until the next full restart.
+                tasks_store=STATE.tasks_store,
                 # The background manager (ADR 0050) survives reloads unchanged — its
                 # store path + self-invoke URL/auth don't depend on reloadable config.
                 background_mgr=STATE.background_mgr,
+                # Re-thread the reload hook so the rebuilt graph's edit_soul can reload again
+                # (self-referential: this IS the reload path). Missing it would make the
+                # persona editor a one-shot after the first hot-reload.
+                reload_callback=_reload_langgraph_agent,
             )
         except Exception as e:
             log.exception("[reload] graph rebuild failed")
+            # The freshly-built MCP clients were never committed — close them or
+            # their persistent sessions (subprocesses) leak on every failed reload.
+            _close_mcp_clients(new_mcp_clients)
             # Scheduler state hasn't been committed yet — caller's
             # running scheduler keeps polling, no orphaned tasks.
             return False, f"graph rebuild failed: {e}"
@@ -1326,7 +1662,14 @@ def _reload_langgraph_agent() -> tuple[bool, str]:
     STATE.graph_config = new_config
     STATE.knowledge_store = new_store
     STATE.skills_index = new_skills
+    # Swap in the new MCP clients, then release the old ones — persistent session
+    # pools hold live subprocesses that would otherwise leak on every reload. A
+    # turn still mid-flight on the OLD graph sees its next MCP call degrade to a
+    # recoverable tool-error string (never a hang) — same shape as a server crash.
+    old_mcp_clients = STATE.mcp_clients
     STATE.mcp_clients, STATE.mcp_tools, STATE.mcp_meta = new_mcp_clients, new_mcp_tools, new_mcp_meta
+    if old_mcp_clients and old_mcp_clients is not new_mcp_clients:
+        _close_mcp_clients(old_mcp_clients)
     STATE.plugin_tools, STATE.plugin_skill_dirs, STATE.plugin_meta = (
         new_plugin_tools,
         new_plugin_skill_dirs,
@@ -1367,9 +1710,14 @@ def _reload_langgraph_agent() -> tuple[bool, str]:
     if pending_start is not None:
         _start_scheduler_async(pending_start)
 
-    # Plugin surfaces with a reload hook (ADR 0018/0019) reconnect on a config
-    # change without a restart — this is how the Discord plugin live-reconnects
-    # when its token/admin/enabled changes (was a bespoke discord_changed block).
+    # Publish the reloaded surface spec set so the reconcile below (and any
+    # introspection) sees the CURRENT wanted surfaces — this is what lets a reload
+    # hot-start a newly-enabled plugin's surface and stop a disabled one. Was
+    # boot-only before, so surface enable/disable needed a restart.
+    STATE.plugin_surfaces = new_plugins.surfaces
+    # Reconcile running surfaces against that set (ADR 0018/0019): stop surfaces whose
+    # plugin was disabled/removed, hot-start newly-enabled ones, and fire each survivor's
+    # reload hook so a Discord/Google-style gateway live-reconnects on a token/admin change.
     _reload_plugin_surfaces(new_config)
 
     # Hot-mount routes from newly-enabled plugins (e.g. delegates) — already-mounted
@@ -1378,6 +1726,27 @@ def _reload_langgraph_agent() -> tuple[bool, str]:
     if is_setup_complete():
         _mount_plugin_routers(new_plugins.routers)
         STATE.plugin_routers = new_plugins.routers
+        # Refresh the live plugin verifier/hook registries too (#1752) — same as full init.
+        # Without this a plugin update/enable that ships a new verifier leaves the watch/goal
+        # controllers resolving it as "unknown" until a full restart.
+        _apply_plugin_registries(new_plugins)
+        # Re-push the auth-exempt public prefixes too (#1890 — same rule as #1752: any
+        # init-time registry wiring must re-apply on reload). Without this a hot-enabled
+        # plugin's view page stays 401 under a token gate until a full restart.
+        STATE.plugin_public_paths = new_plugins.public_paths
+        from a2a_impl import auth as _a2a_auth
+
+        _a2a_auth.set_public_prefixes(new_plugins.public_paths)
+        # Re-publish the remaining boot-time plugin wiring that consumers read fresh from
+        # STATE (same #1752/#1890 rule). Each was assigned only at init, so a hot
+        # enable/update left it stale until a full restart: the thread_id resolver
+        # (server/chat.py memory scoping), the A2A card skills (server/a2a.py card build),
+        # and the workflow recipe dirs (the workflows plugin's lazy _reg() rescans on a
+        # dir-set change — its own docstring promises "hot install, config reload", which
+        # only holds once this list actually updates).
+        STATE.thread_id_resolver = new_plugins.thread_id_resolver
+        STATE.plugin_a2a_skills = new_plugins.a2a_skills
+        STATE.plugin_workflow_dirs = new_plugins.workflow_dirs
 
     if new_graph is None:
         log.info("[reload] setup not complete — config reloaded, graph not compiled")
@@ -1410,30 +1779,95 @@ def _populate_plugin_host() -> None:
         log.exception("[plugins] failed to populate plugin host")
 
 
-def _reload_plugin_surfaces(new_config) -> None:
-    """Notify started plugin surfaces of a config change (ADR 0018/0019).
+def _surface_key(spec_or_handle) -> tuple:
+    """The identity of a surface for reconcile: ``(plugin_id, name)``. Keyed on both so
+    two plugins may share a surface name without colliding."""
+    return (spec_or_handle.get("plugin_id"), spec_or_handle.get("name"))
 
-    Each surface that registered a ``reload`` callback gets it called with the new
-    ``LangGraphConfig`` on the server loop, so a migrated Discord/Google-style
-    surface can reconnect on a Settings save without a restart. Best-effort.
+
+def _plan_surface_reconcile(handles: list, wanted: list) -> tuple[list, list, list]:
+    """Pure diff for surface hot-reload — no I/O, so it's unit-testable.
+
+    ``handles`` is the live ``STATE.plugin_surface_handles`` (running surfaces); ``wanted``
+    is the reloaded plugin surface spec set. Returns ``(to_stop, to_start, to_reload)``:
+
+    - ``to_stop`` — running handles whose ``(plugin_id, name)`` is no longer wanted
+      (its plugin was disabled/uninstalled).
+    - ``to_start`` — wanted specs not currently running (a newly-enabled plugin).
+    - ``to_reload`` — handles present in both (fire the ``reload(cfg)`` callback; leave
+      the surface running so a live gateway connection isn't dropped).
     """
-    for h in STATE.plugin_surface_handles:
-        reload_cb = h.get("reload")
-        if not callable(reload_cb):
-            continue
+    running = {_surface_key(h): h for h in handles}
+    wanted_by = {_surface_key(s): s for s in wanted}
+    to_stop = [h for k, h in running.items() if k not in wanted_by]
+    to_start = [s for k, s in wanted_by.items() if k not in running]
+    to_reload = [running[k] for k in wanted_by if k in running]
+    return to_stop, to_start, to_reload
 
-        def _make(cb=reload_cb, name=h.get("name")):
-            async def _run():
+
+def _reload_plugin_surfaces(new_config) -> None:
+    """Reconcile running plugin surfaces against the reloaded plugin set (ADR 0018/0019).
+
+    On a config reload: **stop** surfaces whose plugin was disabled/uninstalled,
+    **hot-start** newly-enabled plugins' surfaces, and fire each survivor's ``reload(cfg)``
+    callback so a Discord/Google-style gateway reconnects on a token/admin change without a
+    restart. Before this, a reload only fired reload callbacks — a newly-enabled surface
+    stayed dead and a disabled one leaked (kept running) until a full restart.
+
+    A no-op until the startup hook has started surfaces (``plugin_surfaces_started``): a
+    reload before boot's surface loop would double-start (here AND there). The whole
+    reconcile runs as ONE coroutine on the server loop, so every read/write of
+    ``plugin_surface_handles`` is serialized on the loop thread (the start/stop I/O is
+    async, and back-to-back reloads enqueue sequential tasks). Best-effort per surface: a
+    failure logs, never breaks the reload.
+    """
+    if not STATE.plugin_surfaces_started:
+        return  # the pending startup hook will start the already-updated STATE.plugin_surfaces
+    wanted = list(STATE.plugin_surfaces)
+
+    async def _run():
+        to_stop, to_start, to_reload = _plan_surface_reconcile(STATE.plugin_surface_handles, wanted)
+        for h in to_stop:
+            stop_cb = h.get("stop")
+            if callable(stop_cb):
                 try:
-                    res = cb(new_config)
+                    res = stop_cb()
                     if asyncio.iscoroutine(res):
                         await res
                 except Exception:
-                    log.exception("[plugins] surface %s reload failed", name)
+                    log.exception("[plugins] surface %s stop-on-reload failed", h.get("name"))
+            if h in STATE.plugin_surface_handles:
+                STATE.plugin_surface_handles.remove(h)
+            log.info("[plugins] stopped surface %s — its plugin was disabled/removed", h.get("name"))
+        for s in to_start:
+            try:
+                res = s["start"]()
+                if asyncio.iscoroutine(res):
+                    res = await res
+                STATE.plugin_surface_handles.append(
+                    {
+                        "plugin_id": s.get("plugin_id"),
+                        "name": s.get("name"),
+                        "stop": s.get("stop"),
+                        "reload": s.get("reload"),
+                        "handle": res,
+                    }
+                )
+                log.info("[plugins] hot-started surface %s — its plugin was enabled", s.get("name"))
+            except Exception:
+                log.exception("[plugins] surface %s failed to hot-start", s.get("name"))
+        for h in to_reload:
+            reload_cb = h.get("reload")
+            if not callable(reload_cb):
+                continue
+            try:
+                res = reload_cb(new_config)
+                if asyncio.iscoroutine(res):
+                    await res
+            except Exception:
+                log.exception("[plugins] surface %s reload failed", h.get("name"))
 
-            return _run()
-
-        _run_on_server_loop(_make, f"surface reload ({h.get('name')})")
+    _run_on_server_loop(lambda: _run(), "surface reconcile")
 
 
 def _sync_autostart_with_config(config: dict | None) -> str | None:
@@ -1549,6 +1983,101 @@ def _prune_shadowing_agent_keys(host_only: dict) -> list[str]:
     return removed
 
 
+def _config_files_to_snapshot() -> list[Path]:
+    """Every file a settings write can touch — the agent leaf, the untracked secrets
+    sibling, and the box-shared host layer. Resolved at call time (each honours an
+    instance repoint / test monkeypatch). A path that can't resolve is skipped, not fatal:
+    the snapshot is a safety net, and half a net still catches the file that changed."""
+    import graph.config_io as _cio
+
+    out: list[Path] = []
+    for resolve in (
+        _cio.config_yaml_path,
+        _cio.secrets_yaml_path,
+        lambda: __import__("infra.paths", fromlist=["host_config_path"]).host_config_path(),
+    ):
+        try:
+            p = Path(resolve())
+        except Exception:  # noqa: BLE001 — an unresolvable layer just isn't snapshotted
+            log.debug("[config] snapshot: a config path did not resolve", exc_info=True)
+            continue
+        if p not in out:
+            out.append(p)
+    return out
+
+
+def _snapshot_config_files() -> dict[Path, tuple[bytes, int] | None]:
+    """Byte+mode snapshot of the config files, for rolling back a write whose reload fails.
+
+    ``None`` records "this file did not exist" so a restore deletes a file the write
+    created (e.g. a first-ever secrets.yaml). Mode is captured so restoring the 0600
+    secrets file can't silently widen its permissions.
+    """
+    snaps: dict[Path, tuple[bytes, int] | None] = {}
+    for p in _config_files_to_snapshot():
+        try:
+            st = p.stat()
+            snaps[p] = (p.read_bytes(), st.st_mode)
+        except FileNotFoundError:
+            snaps[p] = None
+        except OSError:
+            # Unreadable → we can't promise to restore it, so don't pretend we can.
+            log.warning("[config] snapshot: %s unreadable; not covered by rollback", p)
+    return snaps
+
+
+def _restore_config_files(snaps: dict[Path, tuple[bytes, int] | None]) -> list[str]:
+    """Put the config files back exactly as ``_snapshot_config_files`` found them.
+
+    Returns the paths actually rewritten (empty = the write never landed, nothing to undo).
+    Best-effort per file: a restore that itself fails is logged loudly rather than raised —
+    the caller is already on a failure path, and one unrestorable file must not stop the
+    others going back.
+    """
+    restored: list[str] = []
+    for p, snap in snaps.items():
+        try:
+            if snap is None:
+                if p.exists():
+                    p.unlink()
+                    restored.append(str(p))
+                continue
+            data, mode = snap
+            if p.exists() and p.read_bytes() == data:
+                continue  # untouched by this write
+            p.write_bytes(data)
+            os.chmod(p, mode & 0o7777)  # a restored secrets.yaml keeps its 0600
+            restored.append(str(p))
+        except OSError:
+            log.exception("[config] ROLLBACK FAILED for %s — disk may not match the running agent", p)
+    return restored
+
+
+# A reload that returns False has committed NOTHING (see _reload_langgraph_agent: both of its
+# failure exits — "config load failed" and "graph rebuild failed" — return before
+# `STATE.graph = new_graph`, and the rebuild path closes the MCP clients it built). The old
+# graph is still serving. So the honest response to a failed reload is to put the YAML back:
+# otherwise disk says one thing, the running agent does another, and the NEXT restart boots the
+# config the rebuild just rejected. That is not theoretical — an ACP-only instance (no gateway
+# key: create_llm's ACP fallback covers acp:*, but `native` needs a real key) could be made
+# unbootable by one dropdown change, recoverable only by hand-editing YAML.
+_ROLLBACK_NOTE = "rolled back — your config and the running agent are unchanged"
+
+# Messages that a rollback makes retroactively false: the write they announce has been undone,
+# so reporting "config saved · rebuild failed · rolled back" tells the operator their config
+# both did and didn't save. Dropped from the response when the undo lands.
+_WRITE_ANNOUNCEMENTS = ("config saved", "host config saved")
+
+
+def _drop_undone_write_messages(messages: list[str]) -> list[str]:
+    """Strip the now-false "saved" lines after a rollback, keeping the failure reason."""
+    return [
+        m
+        for m in messages
+        if not (m in _WRITE_ANNOUNCEMENTS or m.startswith("reset ") and m.endswith("to inherited"))
+    ]
+
+
 @_serialized_config_write
 def _apply_settings_changes(
     config: dict | None = None,
@@ -1581,6 +2110,12 @@ def _apply_settings_changes(
     )
 
     messages: list[str] = []
+    # Snapshot BEFORE the first write so a failed reload can undo it (see _ROLLBACK_NOTE).
+    # Only when there's a config write to undo: a pure reload / SOUL-only save has no YAML
+    # change to revert, and SOUL is deliberately outside the rollback — it's authored prose,
+    # and silently reverting an operator's persona edit because a plugin failed to rebuild
+    # would destroy work to fix a mismatch that the persona didn't cause.
+    snaps = _snapshot_config_files() if config is not None else None
 
     if config is not None:
         ok, err = validate_config_dict(config)
@@ -1646,6 +2181,22 @@ def _apply_settings_changes(
 
     ok, reload_msg = _reload_langgraph_agent()
     messages.append(reload_msg)
+    if not ok and snaps is not None:
+        if _restore_config_files(snaps):
+            messages = _drop_undone_write_messages(messages)
+            messages.append(_ROLLBACK_NOTE)
+            # _sync_autostart_with_config already ran against the now-reverted patch, so a
+            # rejected save could otherwise leave a LaunchAgent plist installed (or removed)
+            # for a config that no longer exists on disk. Re-sync to the value we rolled back
+            # TO — STATE.graph_config is still the old config precisely because the rebuild
+            # never committed. Only when this save actually touched runtime.*.
+            if layer != "host" and config and "runtime" in config:
+                try:
+                    _sync_autostart_with_config(
+                        {"runtime": {"autostart_on_boot": bool(getattr(STATE.graph_config, "runtime_autostart_on_boot", False))}}
+                    )
+                except Exception:  # noqa: BLE001 — never mask the original failure
+                    log.exception("[config] autostart re-sync after rollback failed")
     return ok, messages
 
 
@@ -1661,6 +2212,11 @@ def _reset_settings_keys(keys: list[str]) -> tuple[bool, list[str]]:
     from graph.config_io import load_yaml_doc, pop_keys_from_yaml, save_yaml_doc
 
     messages: list[str] = []
+    # Same contract as _apply_settings_changes: a reload that fails committed nothing, so the
+    # popped keys go back rather than leaving disk ahead of the running agent. Dropping an
+    # override can make a graph unbuildable just as easily as setting one (the inherited value
+    # is what gets rebuilt against).
+    snaps = _snapshot_config_files() if keys else None
     if keys:
         try:
             leaf = _cio.config_yaml_path()  # resolved at call time (honors a repoint)
@@ -1674,6 +2230,9 @@ def _reset_settings_keys(keys: list[str]) -> tuple[bool, list[str]]:
 
     ok, reload_msg = _reload_langgraph_agent()
     messages.append(reload_msg)
+    if not ok and snaps is not None and _restore_config_files(snaps):
+        messages = _drop_undone_write_messages(messages)
+        messages.append(_ROLLBACK_NOTE)
     return ok, messages
 
 

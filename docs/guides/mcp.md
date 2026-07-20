@@ -151,8 +151,42 @@ existing configs are unchanged.
 | `streamable_http` | Remote, production servers | `url` (`headers` optional) |
 | `sse` | Legacy SSE servers | `url` (`headers` optional) |
 
-Each tool invocation opens a fresh MCP session and cleans up (the client is
-stateless), so there's no long-lived connection to manage.
+::: tip `npx`/`node` not installed? (desktop)
+Many stdio servers launch via `command: npx`. A desktop machine with no Node
+toolchain has none to launch. Provision a managed one once —
+`protoagent runtime install-node` (ADR 0085) — and every `npx`-based server (and
+the [ACP coding agents](/guides/coding-agents)) can start. A Node you install
+yourself always wins; this only fills the gap.
+:::
+
+## Sessions
+
+Each server keeps **one long-lived MCP session** that every tool call reuses
+(the default). This is how other MCP hosts (Claude Desktop, Cursor) drive
+servers too, and it's what makes stdio servers fast: the stateless alternative
+spawns a fresh subprocess **per call** (~1s of pure overhead for a typical
+`npx`-launched server — an agent turn making ten calls would pay ten seconds).
+Sessions open lazily on first use, and a server that dies mid-call is
+reconnected **once** automatically; if that also fails the call returns a
+recoverable tool-error string to the model instead of failing the turn.
+Config reloads close the old sessions and open fresh ones.
+
+If a specific server misbehaves when kept alive (leaks memory, caches stale
+state), opt it out alone with `persistent: false` on its `servers` entry, or
+set `mcp.persistent_sessions: false` to restore fresh-session-per-call
+behavior globally:
+
+```yaml
+mcp:
+  enabled: true
+  persistent_sessions: true    # default — one live session per server
+  servers:
+    - name: flaky
+      transport: stdio
+      command: npx
+      args: ["-y", "some-server"]
+      persistent: false        # this server alone gets a fresh session per call
+```
 
 ## Try it locally
 
@@ -184,6 +218,32 @@ operator_mcp:
   enabled: true
   tools: [memory_recall, memory_ingest, task_list, task_create, notes_read, run_workflow]
 ```
+
+### Profiles (ADR 0075)
+
+Instead of enumerating tools, pick a **profile** — a curated preset over the same allowlist:
+
+```yaml
+operator_mcp:
+  profile: read-only        # reads/queries only, no state change
+  # profile: full           # everything (≡ tools: ["*"])
+  tools: [show_component]   # optional — a profile UNIONs with any explicit names
+```
+
+- **`read-only`** — a stable, principled set (recall/list/search/status; no writes).
+- **`full`** — everything (`"*"`), minus the danger set below.
+- **unset** (default) — deny-by-default: a foreign client gets *only* what `tools` names.
+- The safe middle tier **`safe-operator`** (reads + non-destructive writes) lands with the ops
+  layer (ADR 0075 D2), which carries per-op read/write metadata so it isn't a hand-maintained list.
+
+**Env override:** `PROTOAGENT_MCP_TRUST=full` forces the `full` profile — for a trusted or
+headless box where you vouch for the client (CI, your own machine). Per-op grants stay the
+`tools` allowlist.
+
+**Two tools are never exposed over MCP, even when named or via `"*"`:** `ask_human` and
+`request_user_input` are HITL tools that pause the turn via an interrupt only the lead runner
+resumes — over a foreign MCP client they'd hang it. (`execute_code` is dropped from `"*"` but
+can be re-added by name — a coding-agent brain already has its own.)
 
 Run it standalone:
 

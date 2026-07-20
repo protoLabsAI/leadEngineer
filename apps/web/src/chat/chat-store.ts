@@ -22,6 +22,11 @@ export type ChatSession = {
   // metadata.bypass_permissions so the server auto-approves run_command (no HITL gate). A
   // deliberately dangerous escape hatch — default OFF; the composer shows a loud chip while on.
   bypassPermissions?: boolean;
+  // Per-tab incognito mode (ADR 0069 D3b): while ON, EVERY message sent from this tab
+  // carries metadata.incognito — the server skips memory persistence AND injection for
+  // that turn. The flag is per-MESSAGE server-side, so it must ride every send: a mixed
+  // thread would leak earlier incognito content into a later non-incognito turn's summary.
+  incognito?: boolean;
 };
 
 // Reasoning is ON by default in the console (auto-enable) — a fresh tab thinks at
@@ -70,20 +75,26 @@ function id(prefix: string) {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+/** The title a session carries until its first user message renames it (or the operator
+ *  does). Load-bearing beyond display: `unusedSession` treats it as "never used", and the
+ *  auto-title on first reply only fires while the title is still this. */
+export const DEFAULT_SESSION_TITLE = "New chat";
+
 function titleFromMessages(messages: ChatMessage[]) {
   const text = messages.find((message) => message.role === "user")?.content.trim();
-  if (!text) return "New chat";
+  if (!text) return DEFAULT_SESSION_TITLE;
   return text.length > 52 ? `${text.slice(0, 49)}...` : text;
 }
 
-function createSession(): ChatSession {
+function createSession(opts: { incognito?: boolean } = {}): ChatSession {
   const now = Date.now();
   return {
     id: id("chat"),
-    title: "New chat",
+    title: DEFAULT_SESSION_TITLE,
     messages: [],
     createdAt: now,
     updatedAt: now,
+    ...(opts.incognito ? { incognito: true } : {}),
   };
 }
 
@@ -119,7 +130,12 @@ export function sanitizePersisted(parsed: unknown): PersistedChatState | null {
   const p = parsed as Partial<PersistedChatState>;
   const sessions = (Array.isArray(p.sessions) ? p.sessions : [])
     .filter(isValidSession)
-    .slice(0, MAX_SESSIONS);
+    .slice(0, MAX_SESSIONS)
+    // A duplicate entry that made it into a persisted blob (#1938) collapses on load.
+    .map((s) => {
+      const messages = dedupeMessages(s.messages);
+      return messages === s.messages ? s : { ...s, messages };
+    });
   if (!sessions.length) return null;
   return {
     version: 1,
@@ -168,6 +184,20 @@ export function mergeSessions(
     seen.add(s.id);
   }
   return out.slice(0, MAX_SESSIONS);
+}
+
+/** Collapse duplicate message entries by id, keeping the LAST occurrence (the
+ *  freshest write wins — a finalize/reconcile rewrite supersedes the copy it was
+ *  derived from). Id-less legacy entries pass through untouched. This is the
+ *  store-boundary guarantee behind #1938: whatever interleaving produced a
+ *  duplicate entry upstream, it can never persist or render. */
+export function dedupeMessages(messages: ChatMessage[]): ChatMessage[] {
+  if (!messages.some((m, i) => m.id && messages.findIndex((o) => o.id === m.id) !== i)) return messages;
+  const lastIndexById = new Map<string, number>();
+  messages.forEach((m, i) => {
+    if (m.id) lastIndexById.set(m.id, i);
+  });
+  return messages.filter((m, i) => !m.id || lastIndexById.get(m.id) === i);
 }
 
 function streamingIds(state: ChatState): Set<string> {
@@ -270,6 +300,29 @@ try {
   // non-browser context (tests without a full window)
 }
 
+/**
+ * A session that has never been used, and so is interchangeable with a freshly created
+ * one: no messages and still carrying the default title. Drives both the reuse guard in
+ * `chatStore.createSession` and the disabled state of every "new chat" affordance.
+ *
+ * A RENAMED empty session is deliberately excluded — naming it is intent ("Ideas"), and
+ * silently landing the operator there when they asked for a new chat would be a surprise.
+ * Incognito must match too: an incognito request is a different kind of session, so a
+ * plain blank can't satisfy it (ADR 0069 D3b — incognito threads leave no memory).
+ */
+export function unusedSession(
+  state: ChatState,
+  opts: { incognito?: boolean } = {},
+): ChatSession | undefined {
+  const wantIncognito = Boolean(opts.incognito);
+  return state.sessions.find(
+    (s) =>
+      s.messages.length === 0 &&
+      s.title === DEFAULT_SESSION_TITLE &&
+      Boolean(s.incognito) === wantIncognito,
+  );
+}
+
 export function ensureActiveSessions(state: ChatState, sessionId: string | null): string[] {
   if (!sessionId) return state.activeSessions;
   if (state.activeSessions.includes(sessionId)) return state.activeSessions;
@@ -351,8 +404,28 @@ export const chatStore = {
     return state;
   },
 
-  createSession() {
-    const session = createSession();
+  createSession(opts: { incognito?: boolean } = {}) {
+    // Don't pile up blanks. A pristine session is byte-for-byte what this call would
+    // produce, so hand it back instead — otherwise tapping "+" repeatedly (easy to do
+    // now that it's a primary action in the mobile header) spawns identical empty tabs
+    // that the operator then has to close one by one.
+    const reusable = unusedSession(state, opts);
+    if (reusable) {
+      // Switching is the visible feedback: if the blank lives on another tab, "+" takes
+      // you there. When it IS the current tab the call is a genuine no-op, and the
+      // callers disable their button so it never looks like a dead tap.
+      setState((current) =>
+        current.currentSessionId === reusable.id
+          ? current
+          : {
+              ...current,
+              currentSessionId: reusable.id,
+              activeSessions: ensureActiveSessions(current, reusable.id),
+            },
+      );
+      return reusable;
+    }
+    const session = createSession(opts);
     setState((current) => {
       // New tabs append to the RIGHT; cap at MAX_SESSIONS by dropping the oldest (left).
       const sessions = [...current.sessions, session].slice(-MAX_SESSIONS);
@@ -427,6 +500,7 @@ export const chatStore = {
     // Fires per streamed SSE frame (~24 chars) — debounce the localStorage
     // write. The stream-done path flushes via setSessionStatus right after the
     // final updateMessages, so the terminal state always lands immediately.
+    const deduped = dedupeMessages(messages);
     setState(
       (current) => ({
         ...current,
@@ -434,8 +508,8 @@ export const chatStore = {
           session.id === sessionId
             ? {
                 ...session,
-                title: session.title === "New chat" ? titleFromMessages(messages) : session.title,
-                messages,
+                title: session.title === DEFAULT_SESSION_TITLE ? titleFromMessages(deduped) : session.title,
+                messages: deduped,
                 updatedAt: Date.now(),
               }
             : session,
@@ -449,7 +523,7 @@ export const chatStore = {
     setState((current) => ({
       ...current,
       sessions: current.sessions.map((session) =>
-        session.id === sessionId ? { ...session, title: title.trim() || "New chat" } : session,
+        session.id === sessionId ? { ...session, title: title.trim() || DEFAULT_SESSION_TITLE } : session,
       ),
     }));
   },
@@ -489,6 +563,17 @@ export const chatStore = {
       ...current,
       sessions: current.sessions.map((session) =>
         session.id === sessionId ? { ...session, bypassPermissions: on || undefined } : session,
+      ),
+    }));
+  },
+
+  // Per-tab incognito toggle (ADR 0069 D3b). Persisted with the session so the mode
+  // survives reload — every send while ON carries metadata.incognito.
+  setSessionIncognito(sessionId: string, on: boolean) {
+    setState((current) => ({
+      ...current,
+      sessions: current.sessions.map((session) =>
+        session.id === sessionId ? { ...session, incognito: on || undefined } : session,
       ),
     }));
   },

@@ -11,7 +11,15 @@ from graph.plugins import installer
 
 
 def _git(cwd: Path, *args: str) -> None:
-    subprocess.run(["git", *args], cwd=str(cwd), check=True, capture_output=True)
+    # maintenance.auto=false / gc.auto=0: `git commit` spawns a DETACHED
+    # `git maintenance run --auto` in the fixture repo, whose pack-file churn can
+    # race a subsequent clone of that repo (#1600). Fixture repos stay inert.
+    subprocess.run(
+        ["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0", *args],
+        cwd=str(cwd),
+        check=True,
+        capture_output=True,
+    )
 
 
 def _make_plugin_repo(root: Path, pid: str = "demo_ext", manifest_extra: str = "", tag: str | None = None) -> Path:
@@ -66,17 +74,85 @@ def test_install_pins_a_tag(env):
     assert summary["requested_ref"] == "v1" and len(summary["resolved_sha"]) == 40
 
 
-def test_duplicate_requires_force(env):
+def test_reinstall_same_source_same_commit_is_up_to_date(env):
+    """Re-install from the plugin's own origin at the same commit = converge, not
+    conflict — a bundle re-install must not die on already-installed members."""
+    repo = _make_plugin_repo(env)
+    first = installer.install(str(repo))
+    again = installer.install(str(repo))  # no force needed
+    assert again["up_to_date"] is True
+    assert again["resolved_sha"] == first["resolved_sha"]
+    # lock unchanged — one entry, original provenance kept
+    lock = installer._read_lock()
+    assert [e["id"] for e in lock["plugins"]] == ["demo_ext"]
+
+
+def test_reinstall_same_source_new_commit_updates_without_force(env):
+    repo = _make_plugin_repo(env)
+    first = installer.install(str(repo))
+    (repo / "extra.py").write_text("x = 1\n")
+    _git(repo, "add", "-A")
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "update")
+    updated = installer.install(str(repo))  # a moved ref from the same origin: update
+    assert updated["resolved_sha"] != first["resolved_sha"]
+    assert not updated.get("up_to_date")
+    assert (installer.live_plugins_dir() / "demo_ext" / "extra.py").exists()
+    lock = installer._read_lock()
+    assert [e["resolved_sha"] for e in lock["plugins"] if e["id"] == "demo_ext"] == [updated["resolved_sha"]]
+
+
+def test_same_id_from_different_source_requires_force(env):
     repo = _make_plugin_repo(env)
     installer.install(str(repo))
-    with pytest.raises(installer.InstallError, match="already installed"):
+    other = _make_plugin_repo(env / "elsewhere", pid="demo_ext")  # same id, different origin
+    with pytest.raises(installer.InstallError, match="different source|already installed"):
+        installer.install(str(other))
+    installer.install(str(other), force=True)  # explicit clobber still works
+
+
+def test_untracked_dir_requires_force(env):
+    """A dir the lock doesn't know (working-tree / hand-copied plugin) must not be
+    silently clobbered by a git install of the same id."""
+    repo = _make_plugin_repo(env)
+    tree = installer.live_plugins_dir() / "demo_ext"
+    tree.mkdir(parents=True)
+    (tree / "protoagent.plugin.yaml").write_text("id: demo_ext\nname: local\nversion: 0.0.1\ndescription: wip\n")
+    with pytest.raises(installer.InstallError, match="untracked"):
         installer.install(str(repo))
-    installer.install(str(repo), force=True)  # ok with force
+    installer.install(str(repo), force=True)
 
 
 def test_refuses_to_shadow_a_builtin(env):
     # `hello` is a real built-in plugin in the repo — must not be installable over.
     repo = _make_plugin_repo(env, pid="hello")
+    with pytest.raises(installer.InstallError, match="built-in"):
+        installer.install(str(repo))
+
+
+def test_ghost_dir_without_manifest_does_not_block_install(env, tmp_path, monkeypatch):
+    # A manifest-less leftover under plugins/<id> (e.g. a __pycache__ dir orphaned
+    # when a plugin was extracted core→standalone, #1731) is NOT a built-in and
+    # must not block installing the standalone successor of the same id.
+    builtins = tmp_path / "builtins"
+    ghost = builtins / "ghost_ext" / "__pycache__"
+    ghost.mkdir(parents=True)
+    (ghost / "loader.cpython-312.pyc").write_bytes(b"\x00")
+    monkeypatch.setattr(installer, "bundled_plugins_dir", lambda: builtins)
+
+    repo = _make_plugin_repo(env, pid="ghost_ext")
+    summary = installer.install(str(repo))  # must not raise "is a built-in"
+    assert summary["id"] == "ghost_ext"
+
+
+def test_manifest_dir_is_treated_as_builtin(env, tmp_path, monkeypatch):
+    # A directory that DOES hold a manifest is a real built-in and still blocks.
+    builtins = tmp_path / "builtins"
+    real = builtins / "real_ext"
+    real.mkdir(parents=True)
+    (real / "protoagent.plugin.yaml").write_text("id: real_ext\nname: R\nversion: 0.1.0\ndescription: x\n")
+    monkeypatch.setattr(installer, "bundled_plugins_dir", lambda: builtins)
+
+    repo = _make_plugin_repo(env, pid="real_ext")
     with pytest.raises(installer.InstallError, match="built-in"):
         installer.install(str(repo))
 
@@ -205,6 +281,77 @@ def test_install_deps_rejects_non_pep508_requires_pip(env, bad):
         installer.install_deps("demo_ext")
 
 
+@pytest.mark.parametrize("bad", ["--index-url=https://evil.example/simple", "git+https://evil.example/pkg.git"])
+def test_install_deps_rejects_bad_optional_specs(env, bad):
+    """The _validate_pip_specs rails cover the optional tier too (#1953)."""
+    repo = _make_plugin_repo(env, manifest_extra=f"requires_pip: [{{pkg: '{bad}', optional: true}}]\n")
+    installer.install(str(repo))
+    with pytest.raises(installer.InstallError):
+        installer.install_deps("demo_ext")
+
+
+# ── optional dep tier (#1953) — install-deps installs optional deps best-effort ──
+
+
+class _PipResult:
+    def __init__(self, returncode: int = 0):
+        self.returncode = returncode
+        self.stderr = "boom" if returncode else ""
+        self.stdout = ""
+
+
+def test_install_deps_includes_optional_in_own_pip_call(env, monkeypatch):
+    repo = _make_plugin_repo(
+        env,
+        manifest_extra="requires_pip: [requests>=2, {pkg: 'pillow>=10', optional: true}]\n",
+    )
+    installer.install(str(repo))
+    calls = []
+    monkeypatch.setattr(installer.subprocess, "run", lambda cmd, **kw: calls.append(cmd) or _PipResult())
+    deps = installer.install_deps("demo_ext")
+    assert deps == ["requests>=2", "pillow>=10"]
+    # hard deps first (fail-hard), then the optional tier best-effort — both behind `--`
+    assert [c[4:] for c in calls] == [["--", "requests>=2"], ["--", "pillow>=10"]]
+
+
+def test_install_deps_optional_pip_failure_warns_not_fails(env, monkeypatch, caplog):
+    """A failed optional install must not fail the command — the hard deps landed."""
+    import logging as _logging
+
+    repo = _make_plugin_repo(
+        env,
+        manifest_extra="requires_pip: [requests>=2, {pkg: 'pillow>=10', optional: true}]\n",
+    )
+    installer.install(str(repo))
+    # hard pip call succeeds; the optional one fails
+    monkeypatch.setattr(
+        installer.subprocess, "run", lambda cmd, **kw: _PipResult(returncode=1 if "pillow>=10" in cmd else 0)
+    )
+    with caplog.at_level(_logging.WARNING):
+        deps = installer.install_deps("demo_ext")  # no raise
+    assert deps == ["requests>=2"]  # only what actually installed
+    assert "optional dep install failed" in caplog.text
+
+
+def test_install_deps_only_optional_failure_still_succeeds(env, monkeypatch):
+    repo = _make_plugin_repo(env, manifest_extra="requires_pip: [{pkg: 'pillow>=10', optional: true}]\n")
+    installer.install(str(repo))
+    monkeypatch.setattr(installer.subprocess, "run", lambda cmd, **kw: _PipResult(returncode=1))
+    assert installer.install_deps("demo_ext") == []  # warned, not raised
+
+
+def test_install_deps_hard_pip_failure_still_raises(env, monkeypatch):
+    """Hard-dep failure keeps today's behavior even when an optional tier exists."""
+    repo = _make_plugin_repo(
+        env,
+        manifest_extra="requires_pip: [requests>=2, {pkg: 'pillow>=10', optional: true}]\n",
+    )
+    installer.install(str(repo))
+    monkeypatch.setattr(installer.subprocess, "run", lambda cmd, **kw: _PipResult(returncode=1))
+    with pytest.raises(installer.InstallError, match="pip install failed"):
+        installer.install_deps("demo_ext")
+
+
 def test_uninstall_removes_enabled_ref_keeps_config(env):
     cfg = env / "cfg" / "langgraph-config.yaml"
     cfg.write_text("plugins:\n  enabled: [demo_ext, other]\ndemo_ext:\n  greeting: hi\n")
@@ -298,6 +445,27 @@ def test_install_bundle_fans_out_and_records_provenance(env):
     assert bundles[0]["config"] == {"demo_a": {"k": "v"}}
 
 
+def test_bundle_reinstall_converges_instead_of_erroring(env):
+    """Re-running a bundle install over an already-provisioned host must converge:
+    unchanged members report up-to-date, a member whose repo moved gets updated —
+    never an 'already installed' abort mid-fan-out."""
+    a = _make_plugin_repo(env, pid="demo_a")
+    b = _make_plugin_repo(env, pid="demo_b")
+    bundle = _make_bundle_repo(env, [a, b])
+    installer.install(str(bundle))
+
+    # advance one member's repo (a moved pin)
+    (a / "extra.py").write_text("x = 1\n")
+    _git(a, "add", "-A")
+    _git(a, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "update")
+
+    summary = installer.install(str(bundle))  # no force
+    by_id = {p["id"]: p for p in summary["installed"]}
+    assert not by_id["demo_a"].get("up_to_date")  # updated to the new commit
+    assert by_id["demo_b"].get("up_to_date") is True  # unchanged — converged
+    assert (installer.live_plugins_dir() / "demo_a" / "extra.py").exists()
+
+
 def test_bundle_config_overlay_fills_only_unset_keys():
     """Defaults overlay: a key the operator already set is left untouched; only the
     unset keys are filled, and a fully-set section is dropped (#1350)."""
@@ -333,3 +501,124 @@ def test_install_bundle_member_missing_url_errors(env):
     _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init")
     with pytest.raises(installer.InstallError):
         installer.install(str(repo))
+
+
+# ── private-repo clone auth (github HTTPS token) ──────────────────────────────
+# A runtime `plugin install` of a PRIVATE github repo used to fail on the default git
+# path ("could not read Username for 'https://github.com'") — git got no credential in a
+# container with only a token env. `_git_auth_env` hands git a scoped http.extraheader via
+# GIT_CONFIG_* so the private clone authenticates, off-argv and off-.git/config.
+
+
+def test_git_auth_env_github_https_with_token(monkeypatch):
+    import base64
+
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.setenv("GH_TOKEN", "tok")
+    e = installer._git_auth_env("https://github.com/org/repo")
+    assert e["GIT_CONFIG_COUNT"] == "1"
+    assert e["GIT_CONFIG_KEY_0"] == "http.https://github.com/.extraheader"
+    scheme, b64 = e["GIT_CONFIG_VALUE_0"].removeprefix("Authorization: ").split()
+    assert scheme == "Basic"
+    assert base64.b64decode(b64).decode() == "x-access-token:tok"
+
+
+def test_git_auth_env_prefers_github_token_over_gh_token(monkeypatch):
+    import base64
+
+    monkeypatch.setenv("GITHUB_TOKEN", "gh")
+    monkeypatch.setenv("GH_TOKEN", "alt")
+    e = installer._git_auth_env("https://github.com/o/r")
+    assert base64.b64decode(e["GIT_CONFIG_VALUE_0"].split()[-1]).decode() == "x-access-token:gh"
+
+
+def test_git_auth_env_empty_for_ssh_nongithub_or_no_token(monkeypatch):
+    monkeypatch.setenv("GH_TOKEN", "tok")
+    assert installer._git_auth_env("git@github.com:o/r.git") == {}       # ssh → git's own auth
+    assert installer._git_auth_env("https://gitlab.com/o/r") == {}       # non-github
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    assert installer._git_auth_env("https://github.com/o/r") == {}       # no token
+
+
+def test_clone_authenticates_private_github_via_scoped_env(monkeypatch, tmp_path):
+    """_clone passes the auth env to the network `clone` (not to local checkout/rev-parse),
+    the token never appears in argv, and the header is scoped to github.com HTTPS."""
+    import base64
+
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.setenv("GH_TOKEN", "s3cr3t")
+    calls = []
+
+    def fake_git(*args, cwd=None, timeout=None, env=None):
+        calls.append({"args": args, "env": env})
+        return "b" * 40  # stands in for `rev-parse HEAD`
+
+    monkeypatch.setattr(installer, "_git", fake_git)
+    installer._clone("https://github.com/protoLabsAI/frontend-bundle", None, tmp_path / "dest")
+
+    clone = next(c for c in calls if c["args"][0] == "clone")
+    env = clone["env"]
+    assert env and env["GIT_CONFIG_KEY_0"] == "http.https://github.com/.extraheader"
+    assert base64.b64decode(env["GIT_CONFIG_VALUE_0"].split()[-1]).decode() == "x-access-token:s3cr3t"
+    assert not any("s3cr3t" in str(a) for a in clone["args"])  # off-argv: no `ps` leak
+    rev = next(c for c in calls if c["args"][0] == "rev-parse")
+    assert rev["env"] is None  # local op inherits os.environ, no auth injected
+
+
+def test_clone_no_auth_env_without_token(monkeypatch, tmp_path):
+    """No token → clone runs with env=None (git's own auth), unchanged behavior."""
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    calls = []
+    monkeypatch.setattr(installer, "_git", lambda *a, cwd=None, timeout=None, env=None: calls.append({"args": a, "env": env}) or "b" * 40)
+    installer._clone("https://github.com/o/r", None, tmp_path / "dest")
+    clone = next(c for c in calls if c["args"][0] == "clone")
+    assert clone["env"] is None
+
+
+# ── private-repo auth for the update CHECK (ls-remote), not just install (#1805 follow-up) ──
+# check_updates ls-remotes each plugin's repo; for a PRIVATE repo the plain ls-remote failed
+# auth → "check failed" in the panel even though the plugin works. Same _git_auth_env, applied
+# to the update-check path.
+
+
+def test_ls_remote_sha_authenticates_private_github(monkeypatch):
+    import base64
+
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.setenv("GH_TOKEN", "s3cr3t")
+    cap = {}
+
+    def fake_git(*args, cwd=None, timeout=None, env=None):
+        cap["args"], cap["env"] = args, env
+        return "abc1230000000000000000000000000000000000\trefs/heads/main"
+
+    monkeypatch.setattr(installer, "_git", fake_git)
+    installer._lsremote_cache.clear()
+    installer._ls_remote_sha("https://github.com/protoLabsAI/private-plugin", "main")
+
+    assert cap["args"][0] == "ls-remote"
+    env = cap["env"]
+    assert env and env["GIT_CONFIG_KEY_0"] == "http.https://github.com/.extraheader"
+    assert base64.b64decode(env["GIT_CONFIG_VALUE_0"].split()[-1]).decode() == "x-access-token:s3cr3t"
+
+
+def test_ls_remote_tags_authenticates_private_github(monkeypatch):
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.setenv("GH_TOKEN", "tok")
+    cap = {}
+    monkeypatch.setattr(installer, "_git", lambda *a, cwd=None, timeout=None, env=None: (cap.update(args=a, env=env) or "sha\trefs/tags/v0.1.0"))
+    installer._lstags_cache.clear()
+    installer._ls_remote_tags("https://github.com/protoLabsAI/private-plugin")
+    assert cap["env"] and cap["env"]["GIT_CONFIG_KEY_0"] == "http.https://github.com/.extraheader"
+
+
+def test_ls_remote_no_auth_env_without_token(monkeypatch):
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    cap = {}
+    monkeypatch.setattr(installer, "_git", lambda *a, cwd=None, timeout=None, env=None: (cap.update(env=env) or "sha\tHEAD"))
+    installer._lsremote_cache.clear()
+    installer._ls_remote_sha("https://github.com/protoLabsAI/public-plugin", "")
+    assert cap["env"] is None  # no token → plain env, unchanged behavior

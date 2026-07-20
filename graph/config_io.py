@@ -13,7 +13,10 @@ Three jobs:
 2. **SOUL.md persona.** The live persona lives at the instance's
    ``<instance_root>/config/SOUL.md`` (``instance_paths().soul_path``);
    drawer edits write there and ``read_soul`` falls back to the bundled
-   ``config/SOUL.md`` seed when the instance has none yet.
+   ``config/SOUL.md`` seed when the instance has none yet. ``ensure_live_soul``
+   seeds that live file on first run (seed-not-force, like ``ensure_live_config``)
+   from ``PROTOAGENT_SEED_SOUL`` or the bundle — and heals a lingering starter
+   placeholder so a baked persona isn't shadowed forever.
 
 3. **Gateway introspection.** ``list_gateway_models`` hits
    ``{api_base}/models`` so the drawer's model dropdown reflects
@@ -23,12 +26,15 @@ Three jobs:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from graph.config import LangGraphConfig
+from graph.config import LangGraphConfig, _deep_merge_dicts
 from infra.paths import instance_paths
 
 log = logging.getLogger("protoagent.config_io")
@@ -90,6 +96,10 @@ def presets_dir() -> Path:
 SECRET_PATHS: tuple[tuple[str, str], ...] = (
     ("model", "api_key"),
     ("auth", "token"),
+    # Secrets-manager bootstrap machine identity (ADR 0080) — the one credential pair
+    # that can't come from the manager itself, routed to secrets.yaml like the API key.
+    ("secrets_manager", "client_id"),
+    ("secrets_manager", "client_secret"),
     # Plugin secrets (e.g. discord's `discord.bot_token`) are declared by their
     # plugin manifests and added dynamically via secret_paths() (ADR 0019).
 )
@@ -392,16 +402,6 @@ def save_yaml_doc(doc: Any, path: Path | None = None) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _deep_merge(dst: dict[str, Any], src: dict[str, Any]) -> dict[str, Any]:
-    """Recursively merge ``src`` into ``dst`` (src wins on leaf conflicts)."""
-    for k, v in src.items():
-        if isinstance(v, dict) and isinstance(dst.get(k), dict):
-            _deep_merge(dst[k], v)
-        else:
-            dst[k] = v
-    return dst
-
-
 def config_to_dict(config: LangGraphConfig) -> dict[str, Any]:
     """Serialize a LangGraphConfig into the nested dict shape the UI works with.
 
@@ -433,9 +433,13 @@ def config_to_dict(config: LangGraphConfig) -> dict[str, Any]:
     # doesn't expose. Their attrs still round-trip via from_yaml; they're just not
     # in FIELDS, so they stay explicit.
     r = config.researcher
-    _deep_merge(
+    _deep_merge_dicts(
         d,
         {
+            # System lifecycle reactions (ADR 0074) — a top-level list of
+            # {event, prompt?, webhook?, session?} dicts, so it round-trips here (like
+            # filesystem.projects / mcp.servers) rather than through the string_list FIELDS.
+            "lifecycle_hooks": list(config.lifecycle_hooks),
             # background_keep is an operational knob (not a settings-schema field),
             # so emit it here for round-trip completeness like the breaker knobs.
             "checkpoint": {
@@ -453,11 +457,18 @@ def config_to_dict(config: LangGraphConfig) -> dict[str, Any]:
                 # contextual_enrichment is a settings field; its doc cap is config-only.
                 "context_max_doc_chars": config.knowledge_context_max_doc_chars,
             },
+            # The filesystem toggles are settings-schema fields (§A); the projects
+            # REGISTRY (list of {name,path,write} dicts) is config-only, so emit it
+            # here or a consumer treating this dict as the complete config loses it.
+            "filesystem": {
+                "projects": list(config.filesystem_projects),
+            },
             "mcp": {
                 "enabled": config.mcp_enabled,
                 "servers": list(config.mcp_servers),
                 "timeout_seconds": config.mcp_timeout_seconds,
                 "denylist": list(config.mcp_denylist),
+                "persistent_sessions": config.mcp_persistent_sessions,
             },
             "skills": {
                 "enabled": config.skills_enabled,
@@ -475,6 +486,8 @@ def config_to_dict(config: LangGraphConfig) -> dict[str, Any]:
                 "disabled": list(config.plugins_disabled),
                 "dir": config.plugins_dir,
                 "sources": {"allow": list(config.plugins_sources_allow)},
+                "update_policy": dict(config.plugins_update_policy),
+                "autoupdate_interval_hours": config.plugins_autoupdate_interval_hours,
             },
             "subagents": {
                 "researcher": {
@@ -611,14 +624,58 @@ def split_secret_updates(config: dict[str, Any]) -> tuple[dict[str, Any], dict[s
 
 
 def strip_secrets_from_doc(doc: Any) -> Any:
-    """Remove any secret keys already present in the main YAML document.
+    """Relocate any secret keys still present in the main YAML document to the
+    ``secrets.yaml`` overlay, then remove them from the doc.
 
     Belt-and-suspenders alongside ``split_secret_updates``: even if an older
     YAML still carries an ``api_key`` (or a hand-edit reintroduces one), every
-    save scrubs it so the tracked file converges to secret-free.
+    save scrubs it so the tracked file converges to secret-free. Stripping is
+    only safe once the value is preserved, though — a hand-seeded key on a
+    fresh instance (no ``secrets.yaml`` yet) used to be scrubbed with no
+    overlay write, losing the credential outright (#1645). So: a non-blank
+    inline value the overlay doesn't already hold is written to ``secrets.yaml``
+    first (an existing overlay value is never clobbered by a stale inline copy —
+    the overlay wins at load time, so the inline copy was shadowed anyway), and
+    if that write fails the key is left inline rather than dropped.
     """
+
+    def _blank(v: Any) -> bool:
+        return v is None or (isinstance(v, str) and not v.strip())
+
+    # Pass 1: find every inline secret; queue the ones whose value would be
+    # LOST by stripping (non-blank, and not already stored in the overlay).
+    stored = load_secrets()
+    present: list[tuple[str, str]] = []
+    pending: dict[str, dict[str, Any]] = {}
     for section, key in secret_paths():
         sect = doc.get(section) if hasattr(doc, "get") else None
+        if not isinstance(sect, dict) or key not in sect:
+            continue
+        present.append((section, key))
+        value = sect.get(key)
+        overlay = stored.get(section)
+        held = overlay.get(key) if isinstance(overlay, dict) else None
+        if not _blank(value) and _blank(held):
+            pending.setdefault(section, {})[key] = value.strip() if isinstance(value, str) else value
+
+    relocated = True
+    if pending:
+        try:
+            save_secrets(pending)
+        except Exception:
+            relocated = False
+            log.warning(
+                "[config] secrets overlay write failed — leaving %s inline in the main "
+                "YAML rather than dropping the value(s) (#1645)",
+                ", ".join(f"{s}.{k}" for s, vals in pending.items() for k in vals),
+                exc_info=True,
+            )
+
+    # Pass 2: strip. A key whose relocation failed stays inline (recoverable).
+    for section, key in present:
+        if not relocated and key in pending.get(section, {}):
+            continue
+        sect = doc.get(section)
         if isinstance(sect, dict) and key in sect:
             del sect[key]
         if isinstance(sect, dict) and not sect:
@@ -735,15 +792,237 @@ def read_soul() -> str:
     return ""
 
 
+def soul_revision() -> str:
+    """A short, stable fingerprint (8-char SHA-1) of the CURRENT effective persona (SOUL.md,
+    seed-fallback included) — so a run's telemetry can be tagged with which persona was live
+    (#1691). Empty string when there's no persona text. Matches the content-hash suffix of the
+    soul-history version ids, so a tagged run can be lined up with an archived version."""
+    text = read_soul()
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:8] if text else ""
+
+
 def write_soul(text: str) -> list[Path]:
     """Write persona text to the instance's live ``SOUL.md`` (mkdir parents).
 
-    Returns the path(s) written for UI feedback.
+    Before overwriting, the OUTGOING persona is archived to the soul-history dir (#1691) so
+    prompt iterations can be reviewed and rolled back — deduped against the newest snapshot and
+    capped; a history failure never blocks the save. Returns the path(s) written for UI feedback.
     """
     target = instance_paths().soul_path
     target.parent.mkdir(parents=True, exist_ok=True)
+    # Archive the effective outgoing persona — the instance file, or the bundled SEED the agent
+    # was actually running on the very first edit (read_soul falls back to it). Capturing the
+    # seed matters: that first save is exactly the iteration you'd otherwise lose. Best-effort:
+    # reading the old text (or archiving it) must never block the actual save.
+    try:
+        old = read_soul()
+    except (OSError, ValueError):
+        old = ""
+    if old and old != text:
+        snapshot_soul(old)
     target.write_text(text, encoding="utf-8")
     return [target]
+
+
+# The distinctive sentence in the shipped starter ``config/SOUL.md``. It's the
+# whole point of that file to be replaced, so a live SOUL still carrying this
+# marker was never authored by anyone — it's an un-seeded default we may heal.
+_SOUL_PLACEHOLDER_MARKER = "Replace this file."
+
+
+def _is_placeholder_soul(text: str) -> bool:
+    """True when ``text`` is the shipped starter placeholder (still un-authored)."""
+    return _SOUL_PLACEHOLDER_MARKER in text
+
+
+def ensure_live_soul() -> bool:
+    """Seed the instance's live ``SOUL.md`` on first run — the persona analogue of
+    :func:`ensure_live_config`.
+
+    ``read_soul`` already falls back to the bundled seed when the live SOUL is
+    *absent*, so a fresh agent shows its baked persona. But an older boot (or a
+    finished setup wizard) can materialise the **starter placeholder** into the
+    live path, and that never-absent placeholder then permanently shadows a
+    persona baked into the bundle afterwards — the agent runs "Replace this file"
+    forever. This bridges that gap: it seeds the live SOUL when it is absent
+    **or still the shipped placeholder**, from ``PROTOAGENT_SEED_SOUL`` (a baked
+    persona-as-code file) when set, else the bundled ``soul_source_path()``.
+
+    Seed-not-force, exactly like ``ensure_live_config``: a real (non-placeholder)
+    live SOUL is never touched, and a placeholder is never written *over* another
+    placeholder. Returns ``True`` only when it wrote the file.
+    """
+    live = instance_paths().soul_path
+    if live.exists():
+        try:
+            current = live.read_text(encoding="utf-8")
+        except OSError:
+            return False
+        if not _is_placeholder_soul(current):
+            return False  # a real persona already lives here — never clobber
+
+    seed_override = os.environ.get("PROTOAGENT_SEED_SOUL", "").strip()
+    seed_path = Path(seed_override).expanduser() if seed_override else None
+    if seed_path is not None and seed_path.is_file():
+        source = seed_path
+    else:
+        if seed_override:
+            log.warning(
+                "[soul] PROTOAGENT_SEED_SOUL=%r is not a readable file — falling back to the bundled seed",
+                seed_override,
+            )
+        source = soul_source_path()
+    if not source.exists():
+        return False
+
+    try:
+        source_text = source.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    if _is_placeholder_soul(source_text):
+        return False  # nothing real to seed — don't replace a placeholder with one
+
+    live.parent.mkdir(parents=True, exist_ok=True)
+    live.write_text(source_text, encoding="utf-8")
+    log.info("[soul] seeded live SOUL.md %s from %s", live, source.name)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# SOUL.md version history (#1691)
+# ---------------------------------------------------------------------------
+# Every persona save archives the OUTGOING text (see write_soul) into the
+# instance's soul-history dir. Versions are plain .md files named
+# ``<YYYYMMDDThhmmss.ffffffZ>-<8-char content hash>`` — lexical sort ==
+# chronological (microsecond precision), the hash disambiguates same-instant
+# saves. The console surfaces them as a restorable list; restore just re-saves
+# the chosen text (which snapshots the current one first, so rolling back is
+# itself reversible).
+
+_SOUL_VERSION_RE = re.compile(r"^\d{8}T\d{6}\.\d{6}Z-[0-9a-f]{8}$")
+_SOUL_HISTORY_CAP = 50  # keep the most recent N snapshots per instance
+
+
+def _soul_version_id(text: str, when: datetime) -> str:
+    # Microsecond precision so a lexical filename sort stays chronological even for rapid
+    # saves — two saves in the same second would otherwise order by hash, not time.
+    stamp = when.strftime("%Y%m%dT%H%M%S.%fZ")
+    digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:8]
+    return f"{stamp}-{digest}"
+
+
+def _prune_soul_history(hist: Path, cap: int | None = None) -> None:
+    """Keep only the most-recent ``cap`` snapshots (lexical filename sort == chronological).
+    ``cap`` is resolved at call time (not bound as a default) so it honors a patched module cap."""
+    cap = _SOUL_HISTORY_CAP if cap is None else cap
+    try:
+        files = sorted(hist.glob("*.md"))
+    except OSError:
+        return
+    for stale in files[:-cap] if len(files) > cap else []:
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+
+
+def snapshot_soul(text: str) -> Path | None:
+    """Archive ``text`` (an outgoing persona) into the soul-history dir, unless it's identical
+    to the newest existing snapshot (so repeat no-op saves don't pile up). Returns the snapshot
+    path, or None when skipped/unwritable. Never raises — history is best-effort."""
+    text = text or ""
+    try:
+        hist = instance_paths().soul_history_dir
+        hist.mkdir(parents=True, exist_ok=True)
+        existing = sorted(hist.glob("*.md"))
+        try:
+            if existing and existing[-1].read_text(encoding="utf-8") == text:
+                return None  # already the latest recorded version — dedupe
+        except (OSError, ValueError):
+            pass  # a corrupt/unreadable newest snapshot must not stop us archiving THIS one
+        path = hist / f"{_soul_version_id(text, datetime.now(timezone.utc))}.md"
+        path.write_text(text, encoding="utf-8")
+        _prune_soul_history(hist)
+        return path
+    except (OSError, ValueError) as exc:  # non-utf8/other read error must never block the save
+        log.warning("[soul] history snapshot failed: %s", exc)
+        return None
+
+
+def _soul_history_files() -> list[Path]:
+    try:
+        return sorted(instance_paths().soul_history_dir.glob("*.md"), reverse=True)  # newest first
+    except OSError:
+        return []
+
+
+def _soul_version_saved_at(version_id: str) -> str:
+    """The ISO-8601 UTC timestamp encoded in a version id, or "" if unparseable."""
+    m = re.match(r"^(\d{8}T\d{6}\.\d{6})Z", version_id)
+    if not m:
+        return ""
+    try:
+        return datetime.strptime(m.group(1), "%Y%m%dT%H%M%S.%f").replace(tzinfo=timezone.utc).isoformat()
+    except ValueError:
+        return ""
+
+
+def _soul_preview(text: str, limit: int) -> str:
+    return " ".join((text or "").split())[:limit]
+
+
+def list_soul_versions(preview_chars: int = 140) -> list[dict]:
+    """Recorded SOUL.md snapshots, newest first: ``{id, saved_at, size, preview, is_current}``.
+    ``saved_at`` is ISO-8601 UTC; ``preview`` is the leading text with whitespace collapsed for a
+    one-line UI summary; ``is_current`` marks the NEWEST snapshot whose text matches the live
+    persona (true right after a restore — so a version panel can flag which one is active without a
+    separate config fetch). Unreadable files are skipped."""
+    try:
+        current = read_soul()
+    except (OSError, ValueError):
+        current = ""
+    out: list[dict] = []
+    current_seen = False
+    for path in _soul_history_files():  # newest first
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, ValueError):  # a corrupt history file is skipped, never 500s the list
+            continue
+        # Several archived copies can be byte-identical — dedup only collapses CONSECUTIVE repeats,
+        # so a persona saved, changed, and saved again lands twice. Flag only the FIRST (newest)
+        # match as current, else a restored-to persona lights up every identical row (#1691).
+        is_current = bool(current) and not current_seen and text == current
+        current_seen = current_seen or is_current
+        out.append(
+            {
+                "id": path.stem,
+                "saved_at": _soul_version_saved_at(path.stem),
+                "size": len(text),
+                "preview": _soul_preview(text, preview_chars),
+                "is_current": is_current,
+            }
+        )
+    return out
+
+
+def read_soul_version(version_id: str) -> str | None:
+    """Full text of a recorded snapshot, or None if the id is invalid/missing/unreadable. The id
+    is validated against the generated format so it can never be a caller-controlled path (no
+    traversal), with a resolved-parent check as defense in depth.
+
+    None (absent) is intentionally distinct from "" (a legitimately archived empty persona) —
+    the restore route's 404 relies on that distinction, so don't collapse them to "" for
+    symmetry with read_soul_preset."""
+    if not _SOUL_VERSION_RE.match(version_id or ""):
+        return None
+    hist = instance_paths().soul_history_dir
+    path = hist / f"{version_id}.md"
+    try:
+        if hist.resolve() not in path.resolve().parents:
+            return None
+        return path.read_text(encoding="utf-8")
+    except (OSError, ValueError):  # missing / unreadable / non-utf8 → absent, never raise
+        return None
 
 
 # ---------------------------------------------------------------------------

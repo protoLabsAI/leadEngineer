@@ -11,6 +11,57 @@ export OPENAI_API_KEY=sk-... A2A_AUTH_TOKEN=$(openssl rand -hex 24)
 docker compose up -d --build
 ```
 
+## One-command install
+
+For a fresh machine you just SSH'd into — no clone, no Python, no hand-written
+`docker run`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/protoLabsAI/protoAgent/main/scripts/install.sh | sh
+```
+
+[`scripts/install.sh`](https://github.com/protoLabsAI/protoAgent/blob/main/scripts/install.sh)
+is versioned in the repo (so it tracks the agent) and:
+
+1. **Checks prerequisites** — Docker (+ a running daemon) and curl.
+2. **Pulls** `ghcr.io/protolabsai/protoagent:latest`.
+3. **Runs** it — published to **loopback** (`127.0.0.1:7870`), a named data
+   volume (`protoagent-sandbox`), `--restart unless-stopped`, and `PROTOAGENT_UI=console`
+   so the console serves at `/app`.
+4. **Runs a CLI wizard** that drives the **same `/api/config/*` endpoints as the
+   browser setup wizard** — provider gateway URL, API key (silent), model
+   (fetched + validated live), and agent name — so it stays in parity for free.
+5. **Prints** where the agent is running.
+
+It's **idempotent**: re-running pulls the latest image, keeps the data volume,
+and offers to re-run the wizard. Over a **plain SSH session with no TTY** it
+starts the container and points you at `/app` to finish setup in a browser.
+
+**Serving the vanity URL.** The one-liner above uses the GitHub-raw URL, which
+works today. To serve it from `https://agent.protolabs.studio/install.sh`
+instead, point that path at the raw file (a CDN/redirect or a one-line reverse
+proxy) — the script content is identical.
+
+**Overrides** (all optional env vars):
+
+| Var | Default | Purpose |
+|-----|---------|---------|
+| `PROTOAGENT_PORT` | `7870` | Host port |
+| `PROTOAGENT_BIND` | `127.0.0.1` | Host bind address (widen only with `A2A_AUTH_TOKEN`) |
+| `PROTOAGENT_VOLUME` | `protoagent-sandbox` | Data volume name |
+| `PROTOAGENT_IMAGE` | `ghcr.io/protolabsai/protoagent:latest` | Image ref |
+| `PROTOAGENT_INSTALL_URL` | — | Configure an **already-running** instance (skips Docker) |
+| `PROTOAGENT_INSTALL_NONINTERACTIVE` | — | `1` = start only, never prompt |
+| `A2A_AUTH_TOKEN` | — | Bearer required to widen the bind past loopback |
+
+> **Architecture note.** The published image is currently **linux/amd64**. On
+> Apple Silicon / arm64 the installer targets amd64 explicitly so Docker Desktop
+> runs it under emulation (a slower first boot); native-ARM performance needs a
+> multi-arch image or a local build. On amd64 hosts it runs natively.
+
+For a **pre-configured, config-as-code** deploy (bake settings into your own
+image, no wizard) use the seed pattern below instead.
+
 ## The one trap to avoid
 
 The image declares `VOLUME /opt/protoagent/config`. That's deliberate — it persists wizard/console edits — but it means a config **volume** holds the live `langgraph-config.yaml`. So if you bake your config **as the live file** (`COPY my-config.yaml /opt/protoagent/config/langgraph-config.yaml`), the volume freezes your first-boot copy and **silently shadows every later image update**: enabling a plugin in a new image just… does nothing. Don't bake the live file.
@@ -39,6 +90,28 @@ Console/settings edits write here and survive reboots + image rolls.
 **3. Skip the wizard on a fresh instance** with `PROTOAGENT_HEADLESS_SETUP=1` — protoAgent validates the seed and auto-marks setup complete, so the instance comes up configured. Omit it if you'd rather complete setup interactively in the wizard.
 
 **4. Keep secrets in the env, not the seed.** The model key is read from `OPENAI_API_KEY`; the seed (and your image) carry no credentials. In the console the api-key field shows blank (`api_key_configured: false`) — that's expected, the key is env-sourced.
+
+## Baking a persona (SOUL.md)
+
+The persona has the **same** seed/live split as the config — and the same trap. The live `SOUL.md` sits under the config volume (`<instance_root>/config/SOUL.md`), and `read_soul` only falls back to the bundled `config/SOUL.md` when the live file is **absent**. So a placeholder materialised into the live path on an early boot (e.g. by a finished setup wizard) will **silently shadow** any persona you bake into the image later — the agent runs "Replace this file" forever, even after you `COPY` a real `SOUL.md` into the bundle.
+
+`ensure_live_soul` closes that gap on boot, seed-not-force like the config:
+
+- **Absent** live SOUL → seed it (so it's present and console-editable).
+- **Still the shipped starter placeholder** → heal it — replace with your baked persona.
+- **A real, authored SOUL** → never touched.
+
+Two ways to bake the persona, pick one:
+
+```dockerfile
+# a) Overwrite the bundled seed the agent falls back to:
+COPY SOUL.md /opt/protoagent/config/SOUL.md
+# b) Or point at a persona-as-code seed on a plain path (wins over the bundle):
+COPY persona.seed.md /opt/agent/seed/SOUL.md
+ENV PROTOAGENT_SEED_SOUL=/opt/agent/seed/SOUL.md
+```
+
+To **repair a running instance** whose live SOUL is already a stale placeholder without a redeploy, write the live file directly: `POST /api/config {"soul": "<persona text>"}` (writes the live `SOUL.md` and hot-reloads the graph, no restart).
 
 ## Binding & auth
 
@@ -123,6 +196,7 @@ control (Cloudflare Access, an ngrok OAuth policy, or a fronting auth proxy) —
 ## Reference
 
 - `PROTOAGENT_SEED_CONFIG` — file to seed the live config from on first boot (config-as-code).
+- `PROTOAGENT_SEED_SOUL` — file to seed the live `SOUL.md` persona from (persona-as-code); also heals a lingering starter placeholder. Falls back to the bundled `config/SOUL.md`.
 - `PROTOAGENT_CONFIG_DIR` — where the live config + setup marker live (default `/opt/protoagent/config`).
 - `PROTOAGENT_HEADLESS_SETUP` — validate the seed + auto-complete setup (no wizard).
 - `PROTOAGENT_UI` — `console` (default) serves the operator console at `/app`.

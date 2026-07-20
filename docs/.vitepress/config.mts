@@ -83,10 +83,12 @@ export default defineConfig({
           items: [
             { text: "Goal mode", link: "/guides/goal-mode" },
             { text: "Watches", link: "/guides/watches" },
+            { text: "System lifecycle events", link: "/guides/lifecycle-events" },
             { text: "File GitHub issues (/issue)", link: "/guides/file-github-issues" },
             { text: "Schedule future work", link: "/guides/scheduler" },
             { text: "Middleware", link: "/guides/middleware" },
             { text: "Run on a coding agent (ACP runtime)", link: "/guides/acp-runtime" },
+            { text: "Run on Hermes (preset)", link: "/guides/hermes" },
           ],
         },
         {
@@ -136,6 +138,7 @@ export default defineConfig({
           items: [
             { text: "Operator console (React/Tauri)", link: "/guides/react-tauri-ui" },
             { text: "Command palette (⌘K)", link: "/guides/command-palette" },
+            { text: "Developer flags (gate pre-release features)", link: "/guides/developer-flags" },
             { text: "Access from your phone (LAN / Tailscale)", link: "/guides/phone-access" },
             { text: "Run headless (API + A2A)", link: "/guides/headless" },
           ],
@@ -146,9 +149,11 @@ export default defineConfig({
           items: [
             { text: "Deploy via GHCR", link: "/guides/deploy" },
             { text: "Deploy in Docker (seed + UI override)", link: "/guides/deploy-docker" },
+            { text: "Deploy on Proxmox (reusable LXC template)", link: "/guides/deploy-proxmox" },
             { text: "Releasing", link: "/guides/releasing" },
             { text: "Run multiple instances", link: "/guides/multi-instance" },
             { text: "Sandboxing & egress", link: "/guides/sandboxing" },
+            { text: "Expose to the world", link: "/guides/exposing-protoagent" },
             { text: "Wire Langfuse + Prometheus", link: "/guides/observability" },
           ],
         },
