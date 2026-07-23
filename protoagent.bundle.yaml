@@ -1,7 +1,8 @@
 # A protoAgent plugin BUNDLE (ADR 0040) — the Lead Engineer tier of the
 # portfolio→team hierarchy. This repo is the BUNDLE and its REFERENCE HOST: the
-# manifest pins the plugin set, config/SOUL.md gives it the tech-lead persona, and
-# config/coding/ enables it on the headless :7872 instance.
+# manifest pins the plugin set and config/SOUL.md carries the frozen Lead Engineer
+# persona (dogfooded on the protoAgent repo itself, 2026-07, then frozen as the
+# shipped archetype — see protoAgent's archetype-catalog.json `lead-engineer` row).
 #
 # Install (onto any host):  python -m server plugin install <this-repo-url>
 #
@@ -11,6 +12,18 @@
 # subset of the old pm-stack: project_board (runs the board + spawn loop) WITHOUT
 # portfolio (that's the manager-of-teams, a separate bundle).
 #
+# CODER SETUP (required, per-host): the archetype deliberately ships with NO coder
+# binding — coding delegates are host-installed binaries, and a wrong default is
+# worse than none. After install, register at least one `acp` delegate (Settings ▸
+# Delegates, ABSOLUTE command paths — GUI hosts don't inherit your shell PATH) and
+# set `project_board.coder` (single) or the `coders:` tier ladder to its name(s).
+# Example ladder (uncomment in your live config):
+#   project_board:
+#     coders: { smart: claude-code, reasoning: opus }   # small→smart, medium/large→reasoning
+# Then bind the repo: the `onboard-project` skill scans it, declares the local gate
+# command, and writes the grounding doc. Pin `db_path` to a private store if the
+# target repo commits its own .beads/.
+#
 # PIN LIFECYCLE (ADR 0049): members are pinned to release TAGS and only move through
 # a passing verify (scripts/ + .github/workflows/verify-bundle.yml install this
 # manifest into a scratch agent and probe every declared console view). Keep member
@@ -19,34 +32,51 @@
 id: lead-engineer
 name: Lead Engineer
 description: >-
-  A single-repo technical lead. It owns one codebase and a set of coding agents:
-  decomposes an idea into board features, dispatches a coder (`acp` delegate, e.g.
-  proto) into a disposable per-feature git worktree, opens a PR, and reports
-  completion as features merge to done. The project-team counterpart of the
-  Portfolio Manager (ADR 0055) — built to be delegated to, and to report back.
-  Composes the delegates spine + project_board (the board + spawn loop) + a browser
-  for verification. Portfolio orchestration is intentionally NOT bundled here.
+  A single-repo technical lead — the bridge between an operator's intent and the
+  team that ships it. It reads code deeply but never holds the keyboard: its file
+  tools are read-only, and every change ships through the board — decomposed into
+  features, dispatched to a coding agent in a disposable per-feature git worktree,
+  opened as a PR, walked through review, and reported as it merges to done. The
+  project-team counterpart of the Portfolio Manager (ADR 0055) — built to be
+  delegated to, and to report back. Composes the delegates spine + project_board
+  (the board + spawn loop) + a read-only GitHub rail + a browser for verification.
+  Portfolio orchestration is intentionally NOT bundled here.
 
 # The core version this exact pin set was last verified against (ADR 0049). The
 # verify workflow checks out this protoAgent ref for the smoke — bump on re-verify.
-verified_against: 0.94.0
+verified_against: 0.108.0
 
 plugins:
   - { id: delegates, builtin: true }                                                  # ACP/A2A spawn spine — ships with protoAgent
-  - { id: project_board, url: https://github.com/protoLabsAI/projectBoard-plugin,  ref: v0.32.0 }
+  - { id: project_board, url: https://github.com/protoLabsAI/projectBoard-plugin,  ref: v0.34.0 }
   - { id: agent_browser, url: https://github.com/protoLabsAI/agent-browser-plugin, ref: v0.5.1 }
+  - { id: github,        url: https://github.com/protoLabsAI/github-plugin,        ref: v0.3.0 }
 
-enabled: [delegates, project_board, agent_browser]   # suggested turn-on list (you apply it)
+enabled: [delegates, project_board, agent_browser, github]   # suggested turn-on list (you apply it)
 config:                                              # recommended defaults (you apply them)
+  # The lead reads, the pipeline writes (the PM-archetype invariant): file-mutation
+  # tools are removed from the lead's palette entirely — investigation stays
+  # (list/read/find/search), every change ships through the board. This is what
+  # makes "fix the brief, not the file" structural instead of aspirational.
+  tools:
+    disabled: [write_file, edit_file, delete_file]
+  # Guarded self-persona editor (ADR 0081): every edit_soul is snapshotted to
+  # config/soul-history and reversible — the same trail this archetype was frozen from.
+  soul:
+    self_edit_enabled: true
   project_board:
-    coder: proto          # the acp delegate the board's spawn loop dispatches builds to
+    # NO coder default — see CODER SETUP above. Set `coder:` or `coders:` after
+    # registering your host's delegates.
+    loop_enabled: true
     # Blocking adversarial review (board v0.30.0, plan M5): after each PR opens, the
     # loop runs the host's `code-review` workflow (protoAgent ADR 0077) and bounces
-    # blocking findings back to the coder — the CI-bounce loop, for review. On a host
-    # whose core predates the findings convention the gate goes loudly inert (never a
-    # silent pass), so this default is safe to ship ahead of the core release.
+    # blocking findings back to the coder. Self-contained review out of the box; a
+    # host with an external PR-review fleet can turn this off and drive fix rounds
+    # through `POST /features/{fid}/review` (board v0.34.0) instead.
     review_gate: true
     review_fix_max: 2
+  github:
+    write: false          # read-only rail: the lead views issues/PRs; writes stay with the operator + coders
   agent_browser:
     panel_mode: full
 
@@ -55,4 +85,4 @@ config:                                              # recommended defaults (you
 archetype:
   label: Lead Engineer
   icon: Wrench
-  blurb: Single-repo technical lead — decomposes work and ships it through coding agents, reporting back as it merges.
+  blurb: Single-repo technical lead — reads deeply, never holds the keyboard; ships every change through a board of coding agents and reports back as it merges.
